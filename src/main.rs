@@ -19,19 +19,27 @@ use grpc::{FleetIdentityService, FleetSecretService, FleetStateService};
 use openraft::Config;
 use redb::Database;
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{Level, info};
+use tracing_subscriber::FmtSubscriber;
 
 use crate::raft::{FleetRaft, Network, RedbStore};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Failed to set global tracing subscriber");
+
+    info!("Initializing FleetOS Control Plane...");
 
     let addr: SocketAddr = "127.0.0.1:50051".parse()?;
     info!("Starting FleetOS Control Plane gRPC server on {}...", addr);
 
     // 1. Initialize Redb persistent storage
-    let db_path = std::env::var("FLEETOS_DB_PATH").unwrap_or_else(|_| "fleetos.redb".to_string());
+    let db_path =
+        std::env::var("FLEETOS_DB_PATH").unwrap_or_else(|_| "/tmp/fleetos.redb".to_string());
     let db = Arc::new(Database::create(&db_path)?);
 
     // 2. Initialize Redb Raft storage adapter (returns log_store & state_machine)

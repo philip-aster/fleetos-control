@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::grpc::state_service::{FleetStateService, StateChangeEvent};
 use crate::storage::models::{PodSpec, RuntimeEngine};

@@ -2,7 +2,6 @@ pub mod dispatcher;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{info, warn};
 
 use crate::grpc::state_service::FleetStateService;
 use crate::storage::models::{PodSpec, RuntimeEngine};

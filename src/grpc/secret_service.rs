@@ -1,4 +1,4 @@
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
