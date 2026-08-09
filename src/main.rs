@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
     // 4. Instantiate gRPC services
     let identity_service = FleetIdentityService::new();
     // Pass raft directly into FleetStateService
-    let state_service = FleetStateService::new(raft.clone());
+    let state_service = FleetStateService::new(raft.clone(), db.clone());
     let secret_service = FleetSecretService::new();
 
     // 5. Start gRPC server
