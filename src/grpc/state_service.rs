@@ -1,3 +1,4 @@
+use crate::raft::{ClientRequest, FleetRaft};
 use fleetos_core::proto::state::{
     EventType, GetRequest, GetResponse, PutRequest, PutResponse, WatchRequest, WatchResponse,
     state_service_server::StateService,
@@ -7,12 +8,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-#[derive(Default)]
-pub struct FleetStateService;
+pub struct FleetStateService {
+    raft: FleetRaft,
+}
 
 impl FleetStateService {
-    pub fn new() -> Self {
-        Self
+    pub fn new(raft: FleetRaft) -> Self {
+        Self { raft }
     }
 }
 
@@ -58,7 +60,32 @@ impl StateService for FleetStateService {
         }))
     }
 
-    async fn put(&self, _request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
-        Ok(Response::new(PutResponse { revision: 1 }))
+    async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        let req = request.into_inner();
+        let key_str = String::from_utf8_lossy(&req.key).to_string();
+
+        let client_req = if key_str.starts_with("/policies/") {
+            ClientRequest::PutPolicy {
+                key: key_str.trim_start_matches("/policies/").to_string(),
+                data: req.value,
+            }
+        } else {
+            let pod_id = key_str.trim_start_matches("/pods/").to_string();
+            ClientRequest::PutPod {
+                id: pod_id,
+                data: req.value,
+            }
+        };
+
+        match self.raft.client_write(client_req).await {
+            Ok(client_write_response) => {
+                let revision = client_write_response.log_id.index;
+                Ok(Response::new(PutResponse { revision }))
+            }
+            Err(e) => Err(Status::internal(format!(
+                "Failed to commit transaction to Raft cluster: {:?}",
+                e
+            ))),
+        }
     }
 }
