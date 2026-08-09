@@ -1,3 +1,4 @@
+use crate::storage::models::PodRole;
 use fleetos_core::SpiffeId;
 use fleetos_core::attestor::HardwareAttestor;
 use fleetos_core::attestor::mock::MockHardwareAttestor;
@@ -5,10 +6,9 @@ use fleetos_core::proto::identity::{
     AttestNodeRequest, AttestNodeResponse, MintWorkloadRequest, MintWorkloadResponse,
     identity_service_server::IdentityService,
 };
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct FleetIdentityService {
     mock_attestor: MockHardwareAttestor,
@@ -25,6 +25,28 @@ impl FleetIdentityService {
         Self {
             mock_attestor: MockHardwareAttestor::new(),
         }
+    }
+
+    /// Verifies if a given SPIFFE ID matches the expected PodRole constraints
+    pub fn authorize_role(&self, spiffe_id: &str, role: &PodRole) -> Result<(), Status> {
+        if let Some(ref required_spiffe) = role.spiffe_id {
+            if spiffe_id != required_spiffe {
+                warn!(
+                    "Role authorization failed: Expected SPIFFE ID '{}', got '{}'",
+                    required_spiffe, spiffe_id
+                );
+                return Err(Status::permission_denied(format!(
+                    "Unauthorized: SPIFFE ID '{}' does not match role requirements for '{}'",
+                    spiffe_id, role.role_name
+                )));
+            }
+        }
+
+        info!(
+            "SPIFFE ID '{}' successfully authorized for role '{}'",
+            spiffe_id, role.role_name
+        );
+        Ok(())
     }
 }
 
@@ -87,8 +109,8 @@ impl IdentityService for FleetIdentityService {
 
         Ok(Response::new(AttestNodeResponse {
             spiffe_id,
-            svid_certificate_pem: vec![0x30; 64], // DER-encoded x509 SVID cert
-            private_key_pem: vec![0x30; 32],      // Private key bytes
+            svid_certificate_pem: vec![0x30; 64], // DER/PEM X.509 SVID cert
+            private_key_pem: vec![0x30; 32],      // Private key
             expires_at_unix,
         }))
     }
@@ -99,28 +121,24 @@ impl IdentityService for FleetIdentityService {
     ) -> Result<Response<MintWorkloadResponse>, Status> {
         let req = request.into_inner();
 
-        // 1. Log with both placeholders ({})
         info!(
-            "Minting workload SVID for service: {}, role: {}",
+            "Minting workload X.509 SVID for service: {}, role: {}",
             req.service_name, req.role_name
         );
 
-        // 2. Use SpiffeId constructor (or include both {} in format!)
         let spiffe_id =
             SpiffeId::new_workload("fleetos.mesh", "default", &req.service_name, &req.role_name)
                 .to_uri();
 
-        // 3. Compute expiration timestamp (24 hours)
-        let expires_at_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let expires_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map_err(|e| Status::internal(e.to_string()))?
             .as_secs()
             + (24 * 3600);
 
-        // 4. Return response
         Ok(Response::new(MintWorkloadResponse {
             spiffe_id,
-            svid_certificate_pem: vec![0x30; 64], // DER-encoded x509 SVID cert
+            svid_certificate_pem: vec![0x30; 64], // DER/PEM X.509 SVID cert
             expires_at_unix,
         }))
     }

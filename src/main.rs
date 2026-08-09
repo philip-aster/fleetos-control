@@ -1,12 +1,12 @@
-mod api;
-mod cloud;
-mod config;
-mod controllers;
-mod grpc;
-mod raft;
-mod scheduler;
-mod secrets;
-mod storage;
+pub mod api;
+pub mod cloud;
+pub mod config;
+pub mod controllers;
+pub mod grpc;
+pub mod raft;
+pub mod scheduler;
+pub mod secrets;
+pub mod storage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -62,7 +62,8 @@ async fn main() -> anyhow::Result<()> {
     let identity_service = FleetIdentityService::new();
     // Pass raft directly into FleetStateService
     let state_service = FleetStateService::new(raft.clone(), db.clone());
-    let secret_service = FleetSecretService::new();
+    let master_key = [0x42; 32];
+    let secret_service = FleetSecretService::new(db.clone(), master_key);
 
     // 5. Start gRPC server
     Server::builder()

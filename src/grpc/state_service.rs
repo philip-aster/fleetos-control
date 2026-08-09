@@ -35,6 +35,10 @@ impl FleetStateService {
         let (tx, _) = broadcast::channel(1024);
         Self { raft, db, tx }
     }
+    /// Broadcasts a state change event directly to active Watch subscribers
+    pub fn broadcast_change(&self, event: StateChangeEvent) {
+        let _ = self.tx.send(event);
+    }
 }
 
 #[tonic::async_trait]
