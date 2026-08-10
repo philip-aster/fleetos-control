@@ -45,6 +45,26 @@ pub mod test_helpers {
         let raft: FleetRaft =
             openraft::Raft::new(1, raft_config, network, log_store, state_machine).await?;
 
+        // ------------------------------------------------------------------
+        // Promote Node 1 to Leader in single-node test cluster
+        // ------------------------------------------------------------------
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            1,
+            Node {
+                rpc_addr: addr.to_string(),
+                node_id: 1,
+            },
+        );
+
+        // Initialize single-node membership
+        if let Err(e) = raft.initialize(nodes).await {
+            tracing::warn!("Raft initialize notice: {:?}", e);
+        }
+
+        // Wait briefly for Raft state machine to complete leader election
+        sleep(Duration::from_millis(150)).await;
+
         let identity_service = FleetIdentityService::new();
         let state_service = FleetStateService::new(raft.clone(), db.clone());
         let master_key = [0x42; 32];
