@@ -16,8 +16,9 @@ pub mod test_helpers {
     use fleetos_core::proto::identity::identity_service_server::IdentityServiceServer;
     use fleetos_core::proto::secret::secret_service_server::SecretServiceServer;
     use fleetos_core::proto::state::state_service_server::StateServiceServer;
-    use openraft::Config as RaftConfig;
+    use openraft::{BasicNode, Config as RaftConfig};
     use redb::Database;
+    use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -46,16 +47,10 @@ pub mod test_helpers {
             openraft::Raft::new(1, raft_config, network, log_store, state_machine).await?;
 
         // ------------------------------------------------------------------
-        // Promote Node 1 to Leader in single-node test cluster
+        // Promote Node 1 to Leader in single-node test cluster using BasicNode
         // ------------------------------------------------------------------
         let mut nodes = BTreeMap::new();
-        nodes.insert(
-            1,
-            Node {
-                rpc_addr: addr.to_string(),
-                node_id: 1,
-            },
-        );
+        nodes.insert(1, BasicNode::new(addr.to_string()));
 
         // Initialize single-node membership
         if let Err(e) = raft.initialize(nodes).await {
