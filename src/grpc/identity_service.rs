@@ -1,11 +1,10 @@
-use crate::storage::models::PodRole;
-use fleetos_core::SpiffeId;
 use fleetos_core::attestor::HardwareAttestor;
 use fleetos_core::attestor::mock::MockHardwareAttestor;
 use fleetos_core::proto::identity::{
     AttestNodeRequest, AttestNodeResponse, MintWorkloadRequest, MintWorkloadResponse,
     identity_service_server::IdentityService,
 };
+use fleetos_core::{PodRole, SpiffeId};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};

@@ -1,9 +1,8 @@
+use crate::grpc::state_service::{FleetStateService, StateChangeEvent};
+use fleetos_core::proto::state::EventType;
+use fleetos_core::{PodSpec, RuntimeEngine};
 use std::sync::Arc;
 use tracing::info;
-
-use crate::grpc::state_service::{FleetStateService, StateChangeEvent};
-use crate::storage::models::{PodSpec, RuntimeEngine};
-use fleetos_core::proto::state::EventType;
 
 pub struct PodDispatcher {
     state_service: Arc<FleetStateService>,

@@ -1,11 +1,10 @@
 pub mod dispatcher;
 
+use crate::grpc::state_service::FleetStateService;
+pub use dispatcher::PodDispatcher;
+use fleetos_core::{PodSpec, RuntimeEngine};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-use crate::grpc::state_service::FleetStateService;
-use crate::storage::models::{PodSpec, RuntimeEngine};
-pub use dispatcher::PodDispatcher;
 
 /// Node capacity and capability profile
 #[derive(Debug, Clone)]

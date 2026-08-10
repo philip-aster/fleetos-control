@@ -3,6 +3,14 @@ name = "fleetos-control"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "fleetos_control"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fleetos_control"
+path = "src/main.rs"
+
 [dependencies]
 fleetos-core = { version = "0.1.0", path = "../fleetos-core" }
 anyhow = "1.0.104"
