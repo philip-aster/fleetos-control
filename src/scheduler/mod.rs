@@ -67,8 +67,14 @@ impl FleetScheduler {
             ));
         }
 
-        // Least-Allocated placement strategy (sort by available RAM)
-        eligible_nodes.sort_by(|a, b| b.1.available_memory_mb.cmp(&a.1.available_memory_mb));
+        // Least-Allocated placement strategy:
+        // Primary sort: Available RAM (descending)
+        // Secondary sort: Available vCPUs (descending)
+        eligible_nodes.sort_by(|a, b| {
+            b.1.available_memory_mb
+                .cmp(&a.1.available_memory_mb)
+                .then_with(|| b.1.available_vcpus.cmp(&a.1.available_vcpus))
+        });
 
         Ok(eligible_nodes.first().unwrap().1)
     }
@@ -78,12 +84,12 @@ impl FleetScheduler {
         &self,
         pod: PodSpec,
         nodes: &HashMap<String, NodeInfo>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, u64), String> {
         let target_node = self.select_node(&pod, nodes)?;
         let target_node_id = target_node.node_id.clone();
 
-        self.dispatcher.dispatch_pod(&target_node_id, pod).await?;
+        let revision = self.dispatcher.dispatch_pod(&target_node_id, pod).await?;
 
-        Ok(target_node_id)
+        Ok((target_node_id, revision))
     }
 }
