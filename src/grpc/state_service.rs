@@ -14,7 +14,6 @@ use fleetos_core::proto::state::{
 
 const STATE_MACHINE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state_machine");
 
-/// Internal event published over the broadcast channel upon successful state changes
 #[derive(Clone, Debug)]
 pub struct StateChangeEvent {
     pub revision: u64,
@@ -31,11 +30,16 @@ pub struct FleetStateService {
 
 impl FleetStateService {
     pub fn new(raft: FleetRaft, db: Arc<Database>) -> Self {
-        // Channel size capacity of 1024 events
+        // Guarantee STATE_MACHINE_TABLE exists in Redb upon startup
+        if let Ok(write_tx) = db.begin_write() {
+            let _ = write_tx.open_table(STATE_MACHINE_TABLE);
+            let _ = write_tx.commit();
+        }
+
         let (tx, _) = broadcast::channel(1024);
         Self { raft, db, tx }
     }
-    /// Broadcasts a state change event directly to active Watch subscribers
+
     pub fn broadcast_change(&self, event: StateChangeEvent) {
         let _ = self.tx.send(event);
     }
@@ -65,7 +69,6 @@ impl StateService for FleetStateService {
             while let Some(msg) = rx.next().await {
                 match msg {
                     Ok(event) => {
-                        // Filter events matching the agent's key prefix
                         if event.key.starts_with(&prefix) {
                             let watch_res = WatchResponse {
                                 revision: event.revision,
@@ -140,7 +143,6 @@ impl StateService for FleetStateService {
             Ok(client_write_response) => {
                 let revision = client_write_response.log_id.index;
 
-                // Broadcast change event to active Watch stream subscribers
                 let _ = self.tx.send(StateChangeEvent {
                     revision,
                     event_type: EventType::Put,
