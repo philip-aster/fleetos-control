@@ -3,11 +3,12 @@ pub mod dispatcher;
 use crate::grpc::state_service::FleetStateService;
 pub use dispatcher::PodDispatcher;
 use fleetos_core::{PodSpec, RuntimeEngine};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Node capacity and capability profile
-#[derive(Debug, Clone)]
+// Node capacity and capability profile
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub node_id: String,
     pub spiffe_id: String,

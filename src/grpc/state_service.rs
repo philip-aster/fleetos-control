@@ -1,4 +1,4 @@
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -42,6 +42,75 @@ impl FleetStateService {
 
     pub fn broadcast_change(&self, event: StateChangeEvent) {
         let _ = self.tx.send(event);
+    }
+
+    /// Helper for controllers: Reads key-value entries matching a prefix directly from Redb
+    pub async fn get_prefix(&self, prefix: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+        let read_tx = self
+            .db
+            .begin_read()
+            .map_err(|e| format!("Redb read transaction error: {:?}", e))?;
+
+        let table = read_tx
+            .open_table(STATE_MACHINE_TABLE)
+            .map_err(|e| format!("Redb open table error: {:?}", e))?;
+
+        let mut results = Vec::new();
+        for res in table
+            .iter()
+            .map_err(|e| format!("Redb iterator error: {:?}", e))?
+        {
+            if let Ok((k, v)) = res {
+                if k.value().starts_with(prefix) {
+                    results.push((k.value().as_bytes().to_vec(), v.value().to_vec()));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Helper for controllers: Writes raw bytes through OpenRaft consensus
+    pub async fn put_bytes(&self, key: &str, value: &[u8]) -> Result<u64, String> {
+        let req = Request::new(PutRequest {
+            key: key.as_bytes().to_vec(),
+            value: value.to_vec(),
+        });
+
+        self.put(req)
+            .await
+            .map_err(|status| format!("Raft commit error: {}", status.message()))
+            .map(|res| res.into_inner().revision)
+    }
+
+    /// Helper for controllers: Submits a key deletion through OpenRaft consensus
+    pub async fn delete_key(&self, key: &str) -> Result<(), String> {
+        let client_req = if key.starts_with("/policies/") {
+            ClientRequest::DeletePolicy {
+                key: key.trim_start_matches("/policies/").to_string(),
+            }
+        } else {
+            ClientRequest::DeletePod {
+                id: key.trim_start_matches("/pods/").to_string(),
+            }
+        };
+
+        let client_write_res = self
+            .raft
+            .client_write(client_req)
+            .await
+            .map_err(|e| format!("Raft delete commit error: {:?}", e))?;
+
+        let revision = client_write_res.log_id.index;
+
+        let _ = self.tx.send(StateChangeEvent {
+            revision,
+            event_type: EventType::Delete,
+            key: key.as_bytes().to_vec(),
+            value: vec![],
+        });
+
+        Ok(())
     }
 }
 

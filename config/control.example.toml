@@ -1,0 +1,34 @@
+# FleetOS Control Plane Configuration Example
+
+# Address to bind the public gRPC services (State, Secret, Policy)
+grpc_bind_addr = "0.0.0.0:9090"
+
+# Address to bind the internal OpenRaft consensus peer network
+raft_bind_addr = "0.0.0.0:9091"
+
+# Unique u64 Raft Node ID for this control plane replica
+node_id = 1
+
+# Path to persistent Redb database storage
+db_path = "/var/lib/fleetos/control.redb"
+
+# SPIFFE Trust Domain for node and workload attestation
+trust_domain = "fleetos.mesh"
+
+# 32-byte Master Key array for ChaCha20-Poly1305 AEAD envelope encryption
+# IMPORTANT: In production, override this with a secure key or environment variable!
+master_key = [
+    66, 66, 66, 66, 66, 66, 66, 66,
+    66, 66, 66, 66, 66, 66, 66, 66,
+    66, 66, 66, 66, 66, 66, 66, 66,
+    66, 66, 66, 66, 66, 66, 66, 66
+]
+
+# Initial Raft cluster peers for bootstrap
+[[initial_cluster_peers]]
+node_id = 1
+addr = "http://127.0.0.1:9091"
+
+# [[initial_cluster_peers]]
+# node_id = 2
+# addr = "http://10.0.1.5:9091"
