@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 
 use crate::raft::types::{ClientRequest, ClientResponse, NodeId, TypeConfig};
 
-// Redb Table Definitions
+// Shared Redb Table Definitions
 const RAFT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const STATE_MACHINE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state_machine");
 const HARD_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("hard_state");
@@ -48,9 +48,7 @@ impl RedbStore {
             snapshot_idx: Arc::new(RwLock::new(0)),
         };
 
-        // Adaptor::new(store) automatically splits the store into (LogStore, StateMachineStore)
         let (log_store, state_machine) = Adaptor::new(store);
-
         Ok((log_store, state_machine))
     }
 }

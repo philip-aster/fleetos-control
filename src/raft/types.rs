@@ -2,7 +2,7 @@ use openraft::declare_raft_types;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 
-/// Client Request Command applied to the Raft state machine
+/// Client Request Commands applied to the Raft state machine
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientRequest {
     PutPod { id: String, data: Vec<u8> },
