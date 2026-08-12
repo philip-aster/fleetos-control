@@ -1,6 +1,7 @@
 // fleetos-control/src/lib.rs
 pub mod api;
 pub mod cloud;
+pub mod config;
 pub mod controllers;
 pub mod grpc;
 pub mod raft;

@@ -77,10 +77,25 @@ impl FleetStateService {
             value: value.to_vec(),
         });
 
-        self.put(req)
+        // 1. Commit the data to the Raft cluster
+        let response = self
+            .put(req)
             .await
-            .map_err(|status| format!("Raft commit error: {}", status.message()))
-            .map(|res| res.into_inner().revision)
+            .map_err(|status| format!("Raft commit error: {}", status.message()))?
+            .into_inner();
+
+        let revision = response.revision;
+
+        // 2. Broadcast the event so watchers (including your test) receive it
+        // Ensure you have an 'EventType::Put' or equivalent in your EventType enum
+        let _ = self.tx.send(StateChangeEvent {
+            revision,
+            event_type: EventType::Put,
+            key: key.as_bytes().to_vec(),
+            value: value.to_vec(),
+        });
+
+        Ok(revision)
     }
 
     /// Helper for controllers: Submits a key deletion through OpenRaft consensus
