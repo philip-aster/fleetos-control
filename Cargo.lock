@@ -764,6 +764,7 @@ checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 name = "fleetos-control"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "axum",
  "chacha20poly1305",
@@ -785,6 +786,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
