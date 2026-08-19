@@ -4,6 +4,57 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Philip Aster and the FleetOS Contributors"]
-description = "Control Plane for FleetOS"
+description = "Control Plane Brain for FleetOS"
 
 [dependencies]
+async-trait = "0.1.92"
+blake3 = "1.8.6"
+chacha20poly1305 = "0.11.0"
+clap = "4.6.6"
+dashmap = "6.2.1"
+fleetos-core = { path = "../fleetos-core", features = ["production"] }
+fleetos-ebpf-common = { path = "../fleetos-ebpf/fleetos-ebpf-common" }
+futures = "0.3.34"
+ipnet = "2.12.1"
+openraft = { version = "0.9.25", features = ["serde"] }
+parking_lot = "0.12.5"
+postcard = { version = "1.1.3", features = ["use-std"] }
+prost = "0.14.4"
+rcgen = "0.14.9"
+redb = "4.2.0"
+rustls = "0.23.43"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+toml = "1.1.4"
+tonic = "0.14.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tss-esapi = { version = "7.7.0", optional = true }
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+[features]
+default = []
+# CA implementation (rcgen/rustls)
+ca = []
+# TPM 2.0 quote verification (requires tpm2-tss system libs)
+tpm = ["dep:tss-esapi"]
+# Apple SE attestation (macOS only)
+apple-se = ["dep:security-framework"]
+# Production aggregate feature
+production = ["ca", "tpm", "apple-se"]
+
+# --- Platform Specific Dependencies ---
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7.0", optional = true }
+
+[[bin]]
+name = "fleetos-control"
+path = "src/main.rs"
+
+[lib]
+name = "fleetos_control"
+path = "src/lib.rs"

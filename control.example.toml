@@ -1,0 +1,90 @@
+# =============================================================================
+# fleetos-control configuration
+# =============================================================================
+
+[node]
+name = "control-1"
+
+# -----------------------------------------------------------------------------
+# Cluster / Raft
+# -----------------------------------------------------------------------------
+# mode:
+#   "bootstrap" — one-time, first control node. Generates both CA roots,
+#                 forms a single-node Raft cluster. Never run this twice.
+#   "join"      — all subsequent control nodes. Attest, get Join Token,
+#                 get SVID, then add-learner → promote.
+[cluster]
+mode = "bootstrap"
+
+# For join mode only: address of an existing control node.
+# join_target = "10.0.1.1:9443"
+
+# For bootstrap mode: initial Raft membership (single node).
+[[cluster.initial_members]]
+id = 1
+address = "10.0.1.1:9443"
+
+# -----------------------------------------------------------------------------
+# Storage
+# -----------------------------------------------------------------------------
+[storage]
+# Local disk only. Never a network filesystem.
+redb_path = "/var/lib/fleetos/control.db"
+
+# -----------------------------------------------------------------------------
+# Trust domains (two independent CAs)
+# -----------------------------------------------------------------------------
+[trust_domains]
+# Data/Control overlay: control ↔ agent/router/gateway, Raft peers.
+data_control = "fleet.example.internal"
+
+# Admin overlay: fleetctl ↔ fleetctl-proxy ↔ control.
+admin = "fleet-admin.example.internal"
+
+# -----------------------------------------------------------------------------
+# SVID TTL policy (owned by fleetos-control, not fleetos-core)
+# -----------------------------------------------------------------------------
+[svid]
+workload_ttl_secs = 3600       # 1 hour
+node_ttl_secs = 3600           # 1 hour
+admin_ttl_secs = 86400         # 24 hours
+delegated_key_ttl_secs = 14400 # 4 hours
+refresh_fraction = 0.75        # refresh at 75% elapsed
+
+# -----------------------------------------------------------------------------
+# Dummy-IP allocation
+# -----------------------------------------------------------------------------
+[dummy_ip]
+# Outer address space (fixed for v1).
+space = "240.0.0.0/4"
+
+# Per-tenant block size. Default /16 = 65,536 addresses per tenant,
+# supporting up to 4,096 tenants within the /4 space.
+# Do NOT set to /8 (exhausts the entire space after 16 tenants).
+tenant_block_prefix = 16
+
+# -----------------------------------------------------------------------------
+# Secrets at-rest encryption
+# -----------------------------------------------------------------------------
+[secrets]
+# Path to the master key file (FileMasterKey for v1).
+master_key_path = "/var/lib/fleetos/master.key"
+
+# -----------------------------------------------------------------------------
+# gRPC listeners
+# -----------------------------------------------------------------------------
+[listeners]
+# Data/Control overlay: PolicyService, WatchService, SchedulerService,
+# RouterAssignmentService, SecretService, AttestationService, CaService.
+data_control = "10.0.1.1:9443"
+
+# Admin overlay: AdminService only (gated to `ctrl` SVID kind).
+admin = "10.0.1.1:9444"
+
+# Raft peer RPC (internal, `control`-kind SVIDs).
+raft = "10.0.1.1:9445"
+
+# -----------------------------------------------------------------------------
+# Provisioning
+# -----------------------------------------------------------------------------
+provision_poll_interval_secs = 30
