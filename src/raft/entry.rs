@@ -1,38 +1,15 @@
-use serde::{Deserialize, Serialize};
+//! Serialization helpers for Raft log entries.
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ClientRequest {
-    PutWorkload {
-        key: String,
-        data: Vec<u8>,
-    },
-    DeleteWorkload {
-        key: String,
-    },
-    RegisterNode {
-        node_id: String,
-        metadata: Vec<u8>,
-    },
-    EvictNode {
-        node_id: String,
-    },
-    UpsertDummyIp {
-        key: String,
-        ip_data: Vec<u8>,
-    },
-    StoreDelegationKey {
-        composite_key: String,
-        node_id: String,
-        key_data: Vec<u8>,
-    },
-    RevokeDelegationKeys {
-        node_id: String,
-    },
+use openraft::Entry;
+use postcard::{from_bytes, to_allocvec};
+
+use super::FleetosRaftConfig;
+use crate::raft::error::RaftError;
+
+pub fn serialize_entry(entry: &Entry<FleetosRaftConfig>) -> Result<Vec<u8>, RaftError> {
+    to_allocvec(entry).map_err(RaftError::Serialization)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClientResponse {
-    pub success: bool,
-    pub version: u64,
-    pub message: String,
+pub fn deserialize_entry(bytes: &[u8]) -> Result<Entry<FleetosRaftConfig>, RaftError> {
+    from_bytes(bytes).map_err(RaftError::Serialization)
 }
