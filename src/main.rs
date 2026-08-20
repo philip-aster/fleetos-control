@@ -1,6 +1,6 @@
 //! `fleetos-control` entrypoint.
 //!
-//! Phase 1: config loading + redb initialization.
+//! Phase 1: config loading + fjall initialization.
 //! Raft, gRPC servers, controllers, and provisioning will be wired in
 //! subsequent phases as each module is implemented.
 
@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         node_name = %config.node.name,
         cluster_mode = ?config.cluster.mode,
-        redb_path = %config.storage.redb_path.display(),
+        fjall_path = %config.storage.fjall_path.display(),
         trust_domain_dc = %config.trust_domains.data_control,
         trust_domain_admin = %config.trust_domains.admin,
         workload_ttl_secs = config.svid.workload_ttl_secs,
@@ -42,13 +42,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "configuration loaded successfully"
     );
 
-    // --- Open redb (single file, multiple table namespaces) ---
-    let db = fleetos_control::storage::open_database(&config.storage.redb_path)?;
+    // --- Open fjall database (directory-based) ---
+    let db = fleetos_control::storage::open_database(&config.storage.fjall_path)?;
+    tracing::info!("fjall database opened");
 
-    tracing::info!("redb database opened");
+    // --- Initialize all keyspaces ---
+    let keyspaces = fleetos_control::storage::init_keyspaces(&db)?;
+    tracing::info!("fjall keyspaces initialized");
 
     // --- Initialize versioned state ---
-    let _state = fleetos_control::storage::version::VersionedState::new(db);
+    // VersionedState now takes the specific `version` keyspace, not the whole DB.
+    let _state = fleetos_control::storage::version::VersionedState::new(keyspaces.version.clone());
 
     tracing::info!(
         "versioned state initialized at version {:?}",
@@ -56,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // TODO(phase2): Initialize or join Raft cluster
-    // let raft_handle = fleetos_control::raft::init(&config, db.clone()).await?;
+    // let raft_handle = fleetos_control::raft::init(&config, db.clone(), keyspaces).await?;
 
     // TODO(phase3): Start gRPC servers (Data/Control + Admin listeners)
     // let data_control_listener = fleetos_control::watch::serve_data_control(...).await?;

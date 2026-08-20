@@ -1,22 +1,26 @@
-use std::io::Cursor;
-use std::sync::Arc;
+//! Snapshot builder for fjall.
 
+use std::io::Cursor;
+
+use fjall::Keyspace;
 use openraft::{RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StoredMembership};
 
 use super::FleetosRaftConfig;
 
-pub struct RedbSnapshotBuilder {
+pub struct FjallSnapshotBuilder {
+    /// Will be used when implementing actual snapshot building
+    /// (serializing full application state from the keyspace).
     #[allow(dead_code)]
-    db: Arc<redb::Database>,
+    raft_snapshot: Keyspace,
 }
 
-impl RedbSnapshotBuilder {
-    pub fn new(db: Arc<redb::Database>) -> Self {
-        Self { db }
+impl FjallSnapshotBuilder {
+    pub fn new(raft_snapshot: Keyspace) -> Self {
+        Self { raft_snapshot }
     }
 }
 
-impl RaftSnapshotBuilder<FleetosRaftConfig> for RedbSnapshotBuilder {
+impl RaftSnapshotBuilder<FleetosRaftConfig> for FjallSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<FleetosRaftConfig>, StorageError<u64>> {
         let data: Vec<u8> = Vec::new();
         let cursor = Cursor::new(data);

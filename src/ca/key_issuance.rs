@@ -1,10 +1,8 @@
 //! Delegated signing key issuance.
 
-use std::sync::Arc;
-
+use fjall::Keyspace;
 use fleetos_core::spiffe::SpiffeId;
 use parking_lot::RwLock;
-use redb::ReadableDatabase;
 
 use super::CaError;
 use super::trust_bundle::TrustBundle;
@@ -48,15 +46,6 @@ pub fn issue_delegated_key(
 
     // Step 3: Sign the delegation with the CA root.
     // TODO: Implement actual DelegatedSigningKey construction using fleetos-core types.
-    // This requires:
-    // 1. Generate an Ed25519 or ECDSA P-256 keypair for the delegated key
-    // 2. Create a DelegatedSigningKey struct with:
-    //    - node_id, target_svid_id, target_ordinal
-    //    - key material (private key for signing, public key for verification)
-    //    - expiry (issued_at + ttl)
-    //    - ordinal field (from request.target_ordinal)
-    // 3. Sign the delegation metadata with the root CA
-    // 4. Serialize and return
 
     tracing::info!(
         node_id = %request.node_id,
@@ -82,9 +71,20 @@ pub trait PlacementVerifier {
     ) -> Result<(), CaError>;
 }
 
-/// Placement verifier backed by redb storage.
+/// Placement verifier backed by fjall storage.
 pub struct StoragePlacementVerifier {
-    db: Arc<redb::Database>,
+    /// Will be used when implementing actual placement lookup
+    /// (querying placements keyspace to verify node hosts the workload).
+    #[allow(dead_code)]
+    placements_keyspace: Keyspace,
+}
+
+impl StoragePlacementVerifier {
+    pub fn new(placements_keyspace: Keyspace) -> Self {
+        Self {
+            placements_keyspace,
+        }
+    }
 }
 
 impl PlacementVerifier for StoragePlacementVerifier {
@@ -94,18 +94,18 @@ impl PlacementVerifier for StoragePlacementVerifier {
         target_svid_id: &SpiffeId,
         target_ordinal: Option<u32>,
     ) -> Result<(), CaError> {
-        // begin_read returns redb::TransactionError → wrap in StorageError::Transaction
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| CaError::Storage(crate::storage::StorageError::Transaction(e)))?;
-
-        // open_table returns redb::TableError → wrap in StorageError::Table
-        let _table = txn
-            .open_table(crate::storage::tables::PLACEMENT_TABLE)
-            .map_err(|e| CaError::Storage(crate::storage::StorageError::Table(e)))?;
+        // Query the placements keyspace to verify that target_svid_id/target_ordinal
+        // is actually scheduled on node_id.
 
         // TODO: Implement actual placement lookup.
+        // The placements keyspace maps PodId -> placement info (including node_id).
+        // We need to:
+        // 1. Find the PodId for target_svid_id + target_ordinal
+        // 2. Look up its placement
+        // 3. Verify the placement's node_id matches the requesting node_id
+        //
+        // For now, we return Ok(()) as a placeholder — this MUST be implemented
+        // before production use, as it's the security-critical check.
 
         tracing::debug!(
             node_id = %node_id,

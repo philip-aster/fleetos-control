@@ -95,8 +95,8 @@ impl CaService {
     }
 
     /// Load CA from persisted state (for non-bootstrap nodes after joining).
-    pub fn load(_db: Arc<redb::Database>, _config: &ControlConfig) -> Result<Self, CaError> {
-        // TODO: Load trust bundles from redb after attestation + join.
+    pub fn load(_db: Arc<fjall::Database>, _config: &ControlConfig) -> Result<Self, CaError> {
+        // TODO: Load trust bundles from fjall after attestation + join.
         // For now, this is a placeholder — bootstrap is the only path implemented.
         Err(CaError::TrustBundle("load not yet implemented".to_owned()))
     }

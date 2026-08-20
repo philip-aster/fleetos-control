@@ -1,56 +1,58 @@
+//! `RaftStateMachine` implementation backed by `fjall`.
+
 use std::io::Cursor;
 use std::sync::Arc;
 
+use fjall::{Database, Keyspace};
 use openraft::storage::RaftStateMachine;
 use openraft::{
     BasicNode, Entry, EntryPayload, LogId, RaftLogId, Snapshot, SnapshotMeta, StorageError,
     StorageIOError, StoredMembership,
 };
-use redb::ReadableDatabase;
 
-use super::snapshot::RedbSnapshotBuilder;
+use super::snapshot::FjallSnapshotBuilder;
 use super::{FleetosRaftConfig, FleetosResponse};
-use crate::storage::tables;
 use crate::storage::version::VersionedState;
 
-pub struct RedbStateMachine {
-    db: Arc<redb::Database>,
+pub struct FjallStateMachine {
+    db: Arc<Database>,
+    raft_state: Keyspace,
+    raft_snapshot: Keyspace,
     versioned_state: VersionedState,
 }
 
-impl RedbStateMachine {
-    pub fn new(db: Arc<redb::Database>, versioned_state: VersionedState) -> Self {
+impl FjallStateMachine {
+    pub fn new(
+        db: Arc<Database>,
+        raft_state: Keyspace,
+        raft_snapshot: Keyspace,
+        versioned_state: VersionedState,
+    ) -> Self {
         Self {
             db,
+            raft_state,
+            raft_snapshot,
             versioned_state,
         }
     }
 }
 
-impl RaftStateMachine<FleetosRaftConfig> for RedbStateMachine {
-    type SnapshotBuilder = RedbSnapshotBuilder;
+impl RaftStateMachine<FleetosRaftConfig> for FjallStateMachine {
+    type SnapshotBuilder = FjallSnapshotBuilder;
 
     async fn applied_state(
         &mut self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
-        let txn = self.db.begin_read().map_err(|e| StorageError::IO {
-            source: StorageIOError::read_state_machine(&e),
-        })?;
-        let table = txn
-            .open_table(tables::RAFT_STATE_TABLE)
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::read_state_machine(&e),
-            })?;
-
         let last_applied =
-            match table
-                .get(b"last_applied".as_slice())
+            match self
+                .raft_state
+                .get(b"last_applied")
                 .map_err(|e| StorageError::IO {
                     source: StorageIOError::read_state_machine(&e),
                 })? {
                 Some(bytes) => {
                     let lid: LogId<u64> =
-                        postcard::from_bytes(bytes.value()).map_err(|e| StorageError::IO {
+                        postcard::from_bytes(&bytes).map_err(|e| StorageError::IO {
                             source: StorageIOError::read_state_machine(&e),
                         })?;
                     Some(lid)
@@ -59,16 +61,15 @@ impl RaftStateMachine<FleetosRaftConfig> for RedbStateMachine {
             };
 
         let last_membership =
-            match table
-                .get(b"last_membership".as_slice())
+            match self
+                .raft_state
+                .get(b"last_membership")
                 .map_err(|e| StorageError::IO {
                     source: StorageIOError::read_state_machine(&e),
                 })? {
-                Some(bytes) => {
-                    postcard::from_bytes(bytes.value()).map_err(|e| StorageError::IO {
-                        source: StorageIOError::read_state_machine(&e),
-                    })?
-                }
+                Some(bytes) => postcard::from_bytes(&bytes).map_err(|e| StorageError::IO {
+                    source: StorageIOError::read_state_machine(&e),
+                })?,
                 None => StoredMembership::default(),
             };
 
@@ -81,70 +82,50 @@ impl RaftStateMachine<FleetosRaftConfig> for RedbStateMachine {
         I::IntoIter: Send,
     {
         let mut responses = Vec::new();
-        let txn = self.db.begin_write().map_err(|e| StorageError::IO {
-            source: StorageIOError::write_state_machine(&e),
-        })?;
+        let mut batch = self.db.batch();
 
         let mut last_log_id: Option<LogId<u64>> = None;
         let mut final_version: Option<fleetos_core::MonotonicVersion> = None;
 
-        {
-            let mut state_table =
-                txn.open_table(tables::RAFT_STATE_TABLE)
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::write_state_machine(&e),
-                    })?;
+        for entry in entries {
+            let log_id = *entry.get_log_id();
+            last_log_id = Some(log_id);
 
-            for entry in entries {
-                let log_id = *entry.get_log_id();
-                last_log_id = Some(log_id);
-
-                match &entry.payload {
-                    EntryPayload::Blank => {}
-                    EntryPayload::Normal(_cmd) => { /* TODO: Dispatch FleetosCommand */ }
-                    EntryPayload::Membership(membership) => {
-                        let stored = StoredMembership::new(Some(log_id), membership.clone());
-                        let serialized =
-                            postcard::to_allocvec(&stored).map_err(|e| StorageError::IO {
-                                source: StorageIOError::write_state_machine(&e),
-                            })?;
-                        state_table
-                            .insert(b"last_membership".as_slice(), serialized.as_slice())
-                            .map_err(|e| StorageError::IO {
-                                source: StorageIOError::write_state_machine(&e),
-                            })?;
-                    }
+            match &entry.payload {
+                EntryPayload::Blank => {}
+                EntryPayload::Normal(_cmd) => { /* TODO: Dispatch FleetosCommand */ }
+                EntryPayload::Membership(membership) => {
+                    let stored = StoredMembership::new(Some(log_id), membership.clone());
+                    let serialized =
+                        postcard::to_allocvec(&stored).map_err(|e| StorageError::IO {
+                            source: StorageIOError::write_state_machine(&e),
+                        })?;
+                    batch.insert(&self.raft_state, b"last_membership", serialized.as_slice());
                 }
-
-                let new_version = self.versioned_state.allocate_version();
-                final_version = Some(new_version);
-
-                responses.push(FleetosResponse {
-                    version: new_version.get(),
-                });
             }
 
-            if let Some(lid) = last_log_id {
-                let serialized = postcard::to_allocvec(&lid).map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_state_machine(&e),
-                })?;
-                state_table
-                    .insert(b"last_applied".as_slice(), serialized.as_slice())
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::write_state_machine(&e),
-                    })?;
-            }
+            let new_version = self.versioned_state.allocate_version();
+            final_version = Some(new_version);
+
+            responses.push(FleetosResponse {
+                version: new_version.get(),
+            });
         }
 
         if let Some(lid) = last_log_id {
+            let serialized = postcard::to_allocvec(&lid).map_err(|e| StorageError::IO {
+                source: StorageIOError::write_state_machine(&e),
+            })?;
+            batch.insert(&self.raft_state, b"last_applied", serialized.as_slice());
+
             self.versioned_state
-                .persist_version(lid.index, &txn)
+                .persist_version(lid.index, &mut batch)
                 .map_err(|e| StorageError::IO {
                     source: StorageIOError::write_state_machine(&e),
                 })?;
         }
 
-        txn.commit().map_err(|e| StorageError::IO {
+        batch.commit().map_err(|e| StorageError::IO {
             source: StorageIOError::write_state_machine(&e),
         })?;
 
@@ -157,7 +138,7 @@ impl RaftStateMachine<FleetosRaftConfig> for RedbStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        RedbSnapshotBuilder::new(self.db.clone())
+        FjallSnapshotBuilder::new(self.raft_snapshot.clone())
     }
 
     async fn begin_receiving_snapshot(
@@ -176,33 +157,15 @@ impl RaftStateMachine<FleetosRaftConfig> for RedbStateMachine {
             source: StorageIOError::write_snapshot(None, &e),
         })?;
 
-        let txn = self.db.begin_write().map_err(|e| StorageError::IO {
-            source: StorageIOError::write_snapshot(None, &e),
-        })?;
-        {
-            let mut snap_table =
-                txn.open_table(tables::RAFT_SNAPSHOT_TABLE)
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::write_snapshot(None, &e),
-                    })?;
-            snap_table
-                .insert(0u64, data.as_slice())
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_snapshot(None, &e),
-                })?;
+        let mut batch = self.db.batch();
+        batch.insert(&self.raft_snapshot, 0u64.to_be_bytes(), data.as_slice());
+        batch.insert(
+            &self.raft_state,
+            b"snapshot_meta",
+            serialized_meta.as_slice(),
+        );
 
-            let mut state_table =
-                txn.open_table(tables::RAFT_STATE_TABLE)
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::write_snapshot(None, &e),
-                    })?;
-            state_table
-                .insert(b"snapshot_meta".as_slice(), serialized_meta.as_slice())
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_snapshot(None, &e),
-                })?;
-        }
-        txn.commit().map_err(|e| StorageError::IO {
+        batch.commit().map_err(|e| StorageError::IO {
             source: StorageIOError::write_snapshot(None, &e),
         })?;
         Ok(())
@@ -211,37 +174,28 @@ impl RaftStateMachine<FleetosRaftConfig> for RedbStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<FleetosRaftConfig>>, StorageError<u64>> {
-        let txn = self.db.begin_read().map_err(|e| StorageError::IO {
-            source: StorageIOError::read_snapshot(None, &e),
-        })?;
-        let state_table =
-            txn.open_table(tables::RAFT_STATE_TABLE)
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::read_snapshot(None, &e),
-                })?;
-
-        let meta: SnapshotMeta<u64, BasicNode> = match state_table
-            .get(b"snapshot_meta".as_slice())
+        let meta: SnapshotMeta<u64, BasicNode> = match self
+            .raft_state
+            .get(b"snapshot_meta")
             .map_err(|e| StorageError::IO {
                 source: StorageIOError::read_snapshot(None, &e),
             })? {
-            Some(bytes) => postcard::from_bytes(bytes.value()).map_err(|e| StorageError::IO {
+            Some(bytes) => postcard::from_bytes(&bytes).map_err(|e| StorageError::IO {
                 source: StorageIOError::read_snapshot(None, &e),
             })?,
             None => return Ok(None),
         };
 
-        let snap_table =
-            txn.open_table(tables::RAFT_SNAPSHOT_TABLE)
+        let data =
+            match self
+                .raft_snapshot
+                .get(0u64.to_be_bytes())
                 .map_err(|e| StorageError::IO {
                     source: StorageIOError::read_snapshot(None, &e),
-                })?;
-        let data = match snap_table.get(0u64).map_err(|e| StorageError::IO {
-            source: StorageIOError::read_snapshot(None, &e),
-        })? {
-            Some(bytes) => bytes.value().to_vec(),
-            None => return Ok(None),
-        };
+                })? {
+                Some(bytes) => bytes.to_vec(),
+                None => return Ok(None),
+            };
 
         Ok(Some(Snapshot {
             meta,

@@ -22,7 +22,7 @@ pub struct ControlConfig {
     /// Raft cluster settings.
     pub cluster: ClusterConfig,
 
-    /// redb storage.
+    /// fjall storage.
     pub storage: StorageConfig,
 
     /// Two independent trust domains.
@@ -98,8 +98,8 @@ pub struct RaftMemberConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
-    /// Path to the redb database file. Local disk only — never a network filesystem.
-    pub redb_path: PathBuf,
+    /// Path to the fjall database directory. Local disk only — never a network filesystem.
+    pub fjall_path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------

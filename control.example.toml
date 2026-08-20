@@ -28,8 +28,9 @@ address = "10.0.1.1:9443"
 # Storage
 # -----------------------------------------------------------------------------
 [storage]
-# Local disk only. Never a network filesystem.
-redb_path = "/var/lib/fleetos/control.db"
+# Local disk only. Fjall uses a directory, not a single file.
+# Never a network filesystem.
+fjall_path = "/var/lib/fleetos/control_db"
 
 # -----------------------------------------------------------------------------
 # Trust domains (two independent CAs)

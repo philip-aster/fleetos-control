@@ -1,141 +1,123 @@
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
+use fjall::{Database, Keyspace};
 use openraft::storage::{LogFlushed, RaftLogStorage};
 use openraft::{
     Entry, LogId, LogState, RaftLogId, RaftLogReader, StorageError, StorageIOError, Vote,
 };
-use redb::{ReadableDatabase, ReadableTable};
 
 use super::FleetosRaftConfig;
 use super::entry::{deserialize_entry, serialize_entry};
-use crate::storage::tables;
 
-pub struct RedbLogStorage {
-    db: Arc<redb::Database>,
+pub struct FjallLogStorage {
+    db: Arc<Database>,
+    raft_log: Keyspace,
+    raft_log_meta: Keyspace,
 }
 
-impl RedbLogStorage {
-    pub fn new(db: Arc<redb::Database>) -> Self {
-        Self { db }
+impl FjallLogStorage {
+    pub fn new(db: Arc<Database>, raft_log: Keyspace, raft_log_meta: Keyspace) -> Self {
+        Self {
+            db,
+            raft_log,
+            raft_log_meta,
+        }
     }
 }
 
 #[derive(Clone)]
-pub struct RedbLogReader {
-    db: Arc<redb::Database>,
+pub struct FjallLogReader {
+    raft_log: Keyspace,
 }
 
-// --- RaftLogReader impl for RedbLogReader (used by replication tasks) ---
-impl RaftLogReader<FleetosRaftConfig> for RedbLogReader {
-    async fn try_get_log_entries<R: RangeBounds<u64> + Send>(
+impl RaftLogReader<FleetosRaftConfig> for FjallLogReader {
+    async fn try_get_log_entries<R: RangeBounds<u64> + Send + std::fmt::Debug + Clone>(
         &mut self,
         range: R,
     ) -> Result<Vec<Entry<FleetosRaftConfig>>, StorageError<u64>> {
-        let txn = self.db.begin_read().map_err(|e| StorageError::IO {
-            source: StorageIOError::read_logs(&e),
-        })?;
-        let table = txn
-            .open_table(tables::RAFT_LOG_TABLE)
-            .map_err(|e| StorageError::IO {
+        let mut entries = Vec::new();
+
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(&n) => n,
+            std::ops::Bound::Excluded(&n) => n + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+
+        // Iterator yields Guard items directly, not Result
+        for guard in self.raft_log.prefix(start.to_be_bytes()) {
+            // Access value through Guard method (returns Result<&Slice, &Error>)
+            let value = guard.value().map_err(|e| StorageError::IO {
                 source: StorageIOError::read_logs(&e),
             })?;
 
-        let mut entries = Vec::new();
-        let iter = table.range(range).map_err(|e| StorageError::IO {
-            source: StorageIOError::read_logs(&e),
-        })?;
-        for item in iter {
-            let (_key, value) = item.map_err(|e| StorageError::IO {
-                source: StorageIOError::read_logs(&e),
-            })?;
-            let entry = deserialize_entry(value.value()).map_err(|e| StorageError::IO {
-                source: StorageIOError::read_logs(&e),
-            })?;
-            entries.push(entry);
+            let index = if value.len() >= 8 {
+                // Deserialize the entry to get its log_id
+                match deserialize_entry(value.as_ref()) {
+                    Ok(entry) => {
+                        let idx = entry.get_log_id().index;
+                        if range.contains(&idx) {
+                            entries.push(entry);
+                        }
+                        idx
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                continue;
+            };
+
+            // Safety limit to avoid scanning too far
+            if index > start + 10000 {
+                break;
+            }
         }
+
         Ok(entries)
     }
 }
 
-// --- RaftLogReader impl for RedbLogStorage (required as supertrait of RaftLogStorage) ---
-impl RaftLogReader<FleetosRaftConfig> for RedbLogStorage {
-    async fn try_get_log_entries<R: RangeBounds<u64> + Send>(
+impl RaftLogReader<FleetosRaftConfig> for FjallLogStorage {
+    async fn try_get_log_entries<R: RangeBounds<u64> + Send + std::fmt::Debug + Clone>(
         &mut self,
         range: R,
     ) -> Result<Vec<Entry<FleetosRaftConfig>>, StorageError<u64>> {
-        let txn = self.db.begin_read().map_err(|e| StorageError::IO {
-            source: StorageIOError::read_logs(&e),
-        })?;
-        let table = txn
-            .open_table(tables::RAFT_LOG_TABLE)
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::read_logs(&e),
-            })?;
-
-        let mut entries = Vec::new();
-        let iter = table.range(range).map_err(|e| StorageError::IO {
-            source: StorageIOError::read_logs(&e),
-        })?;
-        for item in iter {
-            let (_key, value) = item.map_err(|e| StorageError::IO {
-                source: StorageIOError::read_logs(&e),
-            })?;
-            let entry = deserialize_entry(value.value()).map_err(|e| StorageError::IO {
-                source: StorageIOError::read_logs(&e),
-            })?;
-            entries.push(entry);
-        }
-        Ok(entries)
+        let mut reader = FjallLogReader {
+            raft_log: self.raft_log.clone(),
+        };
+        reader.try_get_log_entries(range).await
     }
 }
 
-impl RaftLogStorage<FleetosRaftConfig> for RedbLogStorage {
-    type LogReader = RedbLogReader;
+impl RaftLogStorage<FleetosRaftConfig> for FjallLogStorage {
+    type LogReader = FjallLogReader;
 
     async fn get_log_state(&mut self) -> Result<LogState<FleetosRaftConfig>, StorageError<u64>> {
-        let txn = self.db.begin_read().map_err(|e| StorageError::IO {
-            source: StorageIOError::read_logs(&e),
-        })?;
-        let table = txn
-            .open_table(tables::RAFT_LOG_TABLE)
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::read_logs(&e),
-            })?;
+        // last_key_value() returns Option<Guard>
+        let last_log_id = self.raft_log.last_key_value().and_then(|guard| {
+            guard.value().ok().and_then(|slice| {
+                deserialize_entry(slice.as_ref())
+                    .ok()
+                    .map(|e| *e.get_log_id())
+            })
+        });
 
-        let last = table.last().map_err(|e| StorageError::IO {
-            source: StorageIOError::read_logs(&e),
-        })?;
-        let last_log_id = match last {
-            Some((_key, value)) => {
-                let entry = deserialize_entry(value.value()).map_err(|e| StorageError::IO {
-                    source: StorageIOError::read_logs(&e),
-                })?;
-                Some(*entry.get_log_id())
-            }
-            None => None,
-        };
-
-        // RAFT_LOG_META_TABLE key type is &str — pass string literals directly
-        let meta_table =
-            txn.open_table(tables::RAFT_LOG_META_TABLE)
+        let last_purged =
+            match self
+                .raft_log_meta
+                .get("last_purged")
                 .map_err(|e| StorageError::IO {
                     source: StorageIOError::read_logs(&e),
-                })?;
-        let last_purged = match meta_table
-            .get("last_purged")
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::read_logs(&e),
-            })? {
-            Some(bytes) => {
-                let lid: LogId<u64> =
-                    postcard::from_bytes(bytes.value()).map_err(|e| StorageError::IO {
-                        source: StorageIOError::read_logs(&e),
-                    })?;
-                Some(lid)
-            }
-            None => None,
-        };
+                })? {
+                Some(bytes) => {
+                    let lid: LogId<u64> =
+                        postcard::from_bytes(&bytes).map_err(|e| StorageError::IO {
+                            source: StorageIOError::read_logs(&e),
+                        })?;
+                    Some(lid)
+                }
+                None => None,
+            };
 
         Ok(LogState {
             last_purged_log_id: last_purged,
@@ -144,8 +126,8 @@ impl RaftLogStorage<FleetosRaftConfig> for RedbLogStorage {
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
-        RedbLogReader {
-            db: self.db.clone(),
+        FjallLogReader {
+            raft_log: self.raft_log.clone(),
         }
     }
 
@@ -153,44 +135,24 @@ impl RaftLogStorage<FleetosRaftConfig> for RedbLogStorage {
         let serialized = postcard::to_allocvec(vote).map_err(|e| StorageError::IO {
             source: StorageIOError::write_vote(&e),
         })?;
-        let txn = self.db.begin_write().map_err(|e| StorageError::IO {
-            source: StorageIOError::write_vote(&e),
-        })?;
-        {
-            let mut table =
-                txn.open_table(tables::RAFT_LOG_META_TABLE)
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::write_vote(&e),
-                    })?;
-            // Key type is &str — pass directly
-            table
-                .insert("vote", serialized.as_slice())
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_vote(&e),
-                })?;
-        }
-        txn.commit().map_err(|e| StorageError::IO {
+        let mut batch = self.db.batch();
+        batch.insert(&self.raft_log_meta, "vote", serialized.as_slice());
+        batch.commit().map_err(|e| StorageError::IO {
             source: StorageIOError::write_vote(&e),
         })?;
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        let txn = self.db.begin_read().map_err(|e| StorageError::IO {
-            source: StorageIOError::read_vote(&e),
-        })?;
-        let table = txn
-            .open_table(tables::RAFT_LOG_META_TABLE)
+        match self
+            .raft_log_meta
+            .get("vote")
             .map_err(|e| StorageError::IO {
                 source: StorageIOError::read_vote(&e),
-            })?;
-
-        match table.get("vote").map_err(|e| StorageError::IO {
-            source: StorageIOError::read_vote(&e),
-        })? {
+            })? {
             Some(bytes) => {
                 let vote: Vote<u64> =
-                    postcard::from_bytes(bytes.value()).map_err(|e| StorageError::IO {
+                    postcard::from_bytes(&bytes).map_err(|e| StorageError::IO {
                         source: StorageIOError::read_vote(&e),
                     })?;
                 Ok(Some(vote))
@@ -208,101 +170,84 @@ impl RaftLogStorage<FleetosRaftConfig> for RedbLogStorage {
         I: IntoIterator<Item = Entry<FleetosRaftConfig>> + Send,
         I::IntoIter: Send,
     {
-        let txn = self.db.begin_write().map_err(|e| StorageError::IO {
-            source: StorageIOError::write_logs(&e),
-        })?;
-        {
-            let mut table =
-                txn.open_table(tables::RAFT_LOG_TABLE)
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::write_logs(&e),
-                    })?;
-            for entry in entries {
-                let index = entry.get_log_id().index;
-                let serialized = serialize_entry(&entry).map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_log_entry(*entry.get_log_id(), &e),
-                })?;
-                table
-                    .insert(index, serialized.as_slice())
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::write_log_entry(*entry.get_log_id(), &e),
-                    })?;
-            }
-        }
-        txn.commit().map_err(|e| StorageError::IO {
-            source: StorageIOError::write_logs(&e),
-        })?;
+        let mut batch = self.db.batch();
 
+        for entry in entries {
+            let index = entry.get_log_id().index;
+            let serialized = serialize_entry(&entry).map_err(|e| StorageError::IO {
+                source: StorageIOError::write_log_entry(*entry.get_log_id(), &e),
+            })?;
+            batch.insert(&self.raft_log, index.to_be_bytes(), serialized.as_slice());
+        }
+
+        batch.commit().map_err(|e| StorageError::IO {
+            source: StorageIOError::write_logs(&e),
+        })?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let txn = self.db.begin_write().map_err(|e| StorageError::IO {
-            source: StorageIOError::write_logs(&e),
-        })?;
-        {
-            let mut table =
-                txn.open_table(tables::RAFT_LOG_TABLE)
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::write_logs(&e),
-                    })?;
-            let range = table.range(log_id.index..).map_err(|e| StorageError::IO {
+        let mut batch = self.db.batch();
+
+        // Collect keys to remove first (can't modify while iterating)
+        let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
+
+        for guard in self.raft_log.prefix(log_id.index.to_be_bytes()) {
+            // guard.key() returns a Result, so we must map_err and unwrap it first
+            let key_slice = guard.key().map_err(|e| StorageError::IO {
                 source: StorageIOError::write_logs(&e),
             })?;
-            let keys_to_remove: Vec<u64> = range
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
-            for key in keys_to_remove {
-                table.remove(key).map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_logs(&e),
-                })?;
+            let key_bytes: &[u8] = key_slice.as_ref();
+
+            if key_bytes.len() >= 8 {
+                let index = u64::from_be_bytes(key_bytes[..8].try_into().unwrap_or([0; 8]));
+                if index >= log_id.index {
+                    keys_to_remove.push(key_bytes.to_vec());
+                }
             }
         }
-        txn.commit().map_err(|e| StorageError::IO {
+
+        for key in keys_to_remove {
+            batch.remove(&self.raft_log, key.as_slice());
+        }
+
+        batch.commit().map_err(|e| StorageError::IO {
             source: StorageIOError::write_logs(&e),
         })?;
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let txn = self.db.begin_write().map_err(|e| StorageError::IO {
+        let mut batch = self.db.batch();
+
+        // Collect keys to remove first
+        let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
+
+        for guard in self.raft_log.prefix(0u64.to_be_bytes()) {
+            let key_slice = guard.key().map_err(|e| StorageError::IO {
+                source: StorageIOError::write_logs(&e),
+            })?;
+            let key_bytes: &[u8] = key_slice.as_ref();
+
+            if key_bytes.len() >= 8 {
+                let index = u64::from_be_bytes(key_bytes[..8].try_into().unwrap_or([0; 8]));
+                if index <= log_id.index {
+                    keys_to_remove.push(key_bytes.to_vec());
+                }
+            }
+        }
+
+        for key in keys_to_remove {
+            batch.remove(&self.raft_log, key.as_slice());
+        }
+
+        let serialized = postcard::to_allocvec(&log_id).map_err(|e| StorageError::IO {
             source: StorageIOError::write_logs(&e),
         })?;
-        {
-            let mut table =
-                txn.open_table(tables::RAFT_LOG_TABLE)
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::write_logs(&e),
-                    })?;
-            let range = table.range(..=log_id.index).map_err(|e| StorageError::IO {
-                source: StorageIOError::write_logs(&e),
-            })?;
-            let keys_to_remove: Vec<u64> = range
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
-            for key in keys_to_remove {
-                table.remove(key).map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_logs(&e),
-                })?;
-            }
+        batch.insert(&self.raft_log_meta, "last_purged", serialized.as_slice());
 
-            // Store the entire LogId as postcard-serialized bytes
-            let mut meta =
-                txn.open_table(tables::RAFT_LOG_META_TABLE)
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::write_logs(&e),
-                    })?;
-            let serialized = postcard::to_allocvec(&log_id).map_err(|e| StorageError::IO {
-                source: StorageIOError::write_logs(&e),
-            })?;
-            // Key type is &str — pass directly
-            meta.insert("last_purged", serialized.as_slice())
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_logs(&e),
-                })?;
-        }
-        txn.commit().map_err(|e| StorageError::IO {
+        batch.commit().map_err(|e| StorageError::IO {
             source: StorageIOError::write_logs(&e),
         })?;
         Ok(())
