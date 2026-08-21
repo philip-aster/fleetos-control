@@ -89,6 +89,9 @@ pub fn init_keyspaces(db: &Database) -> Result<Keyspaces, StorageError> {
         router_assignments: db
             .keyspace(tables::ROUTER_ASSIGNMENT_KEYSPACE, opts)
             .map_err(StorageError::Open)?,
+        node_pools: db
+            .keyspace(tables::NODE_POOL_KEYSPACE, opts)
+            .map_err(StorageError::Open)?,
     })
 }
 
@@ -113,6 +116,7 @@ pub struct Keyspaces {
     pub dummy_ips: fjall::Keyspace,
     pub pcr_policies: fjall::Keyspace,
     pub router_assignments: fjall::Keyspace,
+    pub node_pools: fjall::Keyspace,
 }
 
 #[derive(Debug, thiserror::Error)]
