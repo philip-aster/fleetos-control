@@ -12,6 +12,7 @@ async-trait = "0.1.92"
 blake3 = "1.8.6"
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.6", features = ["derive"] }
+cron = "0.17.0"
 dashmap = "6.2.1"
 fjall = "3.1.9"
 fleetos-core = { path = "../fleetos-core", features = ["production"] }
@@ -28,6 +29,7 @@ rustls = "0.23.43"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+tempfile = "3.27.0"
 thiserror = "2.0.20"
 time = "0.3.55"
 tokio = { version = "1.53.1", features = ["full"] }
@@ -38,6 +40,7 @@ tonic = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tss-esapi = { version = "7.7.0", optional = true }
+walkdir = "2.5.0"
 x509-parser = "0.18.1"
 zeroize = { version = "1.9.0", features = ["derive"] }
 

@@ -11,10 +11,14 @@
 //! All controllers are leader-gated: they only run when this node is the Raft leader.
 //! When leadership is lost, all controller tasks are cancelled.
 
+pub mod cron_controller;
 pub mod leader;
 pub mod node_controller;
 pub mod pod_controller;
 pub mod workload_controller;
+
+pub use cron_controller::CronController;
+pub use workload_controller::WorkloadController;
 
 use thiserror::Error;
 
