@@ -1,7 +1,8 @@
 //! Anti-affinity enforcement.
 //!
-//! If a role is `replica`, it must not be scheduled on the same physical node
-//! (or failure domain/zone) as the `primary` or another `replica` of the same service.
+//! If a role requires anti-affinity (configurable), it must not be scheduled on
+//! the same physical node (or failure domain/zone) as another instance of the
+//! same service with that role.
 //!
 //! This is a FILTER, not a score — nodes violating anti-affinity are eliminated
 //! entirely from the candidate set.
@@ -12,12 +13,12 @@ use super::{ClusterState, NodeInfo, PendingPod};
 #[derive(Debug, Clone)]
 pub struct AntiAffinityConfig {
     /// Whether to enforce anti-affinity across failure domains (zones).
-    /// If true, replicas of the same service cannot be in the same zone
-    /// as the primary or sibling replicas.
+    /// If true, instances of the same (service, role) cannot be in the same zone.
     pub cross_zone: bool,
 
     /// Roles that require anti-affinity.
-    /// Default: ["replica"] — replicas must be spread.
+    /// Default: `["replica"]` — replicas must be spread.
+    /// This is configurable because roles are user-defined.
     pub enforced_roles: Vec<String>,
 }
 
@@ -25,6 +26,8 @@ impl Default for AntiAffinityConfig {
     fn default() -> Self {
         Self {
             cross_zone: true,
+            // Default to "replica" as a reasonable starting point,
+            // but operators can configure this for their own role names.
             enforced_roles: vec!["replica".to_owned()],
         }
     }
@@ -44,10 +47,10 @@ pub fn check_anti_affinity(
         return true;
     }
 
-    // Get all placements of the same service.
-    let same_service = state.placements_for_service(&pod.service);
+    // Get all placements of the same service with the same role.
+    let same_service_role = state.placements_for_service_role(&pod.service, &pod.role);
 
-    for placement in same_service {
+    for placement in same_service_role {
         // Check 1: Same physical node — always a violation for enforced roles.
         if placement.node_id == node.node_id {
             return false;
@@ -108,20 +111,20 @@ mod tests {
     }
 
     #[test]
-    fn replica_rejected_on_same_node_as_primary() {
-        let config = AntiAffinityConfig::default();
+    fn enforced_role_rejected_on_same_node() {
+        let config = AntiAffinityConfig::default(); // enforces "replica"
         let node = make_node("node-1", "zone-a");
 
         let state = ClusterState {
             nodes: vec![node.clone()],
-            placements: vec![make_placement("db", "primary", "node-1")],
+            placements: vec![make_placement("db", "replica", "node-1")],
         };
 
         let pod = PendingPod {
             pod_id: "db-replica-0".to_owned(),
             tenant_id: "tenant-1".to_owned(),
             service: "db".to_owned(),
-            role: "replica".to_owned(),
+            role: "replica".to_owned(), // matches enforced_roles
             ordinal: 0,
             resources: ResourceSpec {
                 cpu_millicores: 500,
@@ -134,76 +137,20 @@ mod tests {
     }
 
     #[test]
-    fn replica_rejected_in_same_zone_as_primary() {
-        let config = AntiAffinityConfig::default();
-        let node_a = make_node("node-1", "zone-a");
-        let node_b = make_node("node-2", "zone-a"); // Same zone
-
-        let state = ClusterState {
-            nodes: vec![node_a.clone(), node_b.clone()],
-            placements: vec![make_placement("db", "primary", "node-1")],
-        };
-
-        let pod = PendingPod {
-            pod_id: "db-replica-0".to_owned(),
-            tenant_id: "tenant-1".to_owned(),
-            service: "db".to_owned(),
-            role: "replica".to_owned(),
-            ordinal: 0,
-            resources: ResourceSpec {
-                cpu_millicores: 500,
-                memory_bytes: 512 * 1024 * 1024,
-            },
-            previous_node: None,
-        };
-
-        // node-2 is in the same zone as node-1 (where primary is)
-        assert!(!check_anti_affinity(&pod, &node_b, &state, &config));
-    }
-
-    #[test]
-    fn replica_allowed_in_different_zone() {
-        let config = AntiAffinityConfig::default();
-        let node_a = make_node("node-1", "zone-a");
-        let node_b = make_node("node-2", "zone-b"); // Different zone
-
-        let state = ClusterState {
-            nodes: vec![node_a.clone(), node_b.clone()],
-            placements: vec![make_placement("db", "primary", "node-1")],
-        };
-
-        let pod = PendingPod {
-            pod_id: "db-replica-0".to_owned(),
-            tenant_id: "tenant-1".to_owned(),
-            service: "db".to_owned(),
-            role: "replica".to_owned(),
-            ordinal: 0,
-            resources: ResourceSpec {
-                cpu_millicores: 500,
-                memory_bytes: 512 * 1024 * 1024,
-            },
-            previous_node: None,
-        };
-
-        // node-2 is in a different zone — allowed
-        assert!(check_anti_affinity(&pod, &node_b, &state, &config));
-    }
-
-    #[test]
-    fn primary_not_subject_to_anti_affinity() {
-        let config = AntiAffinityConfig::default();
+    fn non_enforced_role_allowed_on_same_node() {
+        let config = AntiAffinityConfig::default(); // enforces "replica"
         let node = make_node("node-1", "zone-a");
 
         let state = ClusterState {
             nodes: vec![node.clone()],
-            placements: vec![make_placement("db", "replica", "node-1")],
+            placements: vec![make_placement("db", "primary", "node-1")],
         };
 
         let pod = PendingPod {
             pod_id: "db-primary-0".to_owned(),
             tenant_id: "tenant-1".to_owned(),
             service: "db".to_owned(),
-            role: "primary".to_owned(),
+            role: "primary".to_owned(), // NOT in enforced_roles
             ordinal: 0,
             resources: ResourceSpec {
                 cpu_millicores: 500,
@@ -212,7 +159,36 @@ mod tests {
             previous_node: None,
         };
 
-        // Primary is not in the enforced_roles list, so anti-affinity doesn't apply
+        // "primary" is not in enforced_roles, so anti-affinity doesn't apply
         assert!(check_anti_affinity(&pod, &node, &state, &config));
+    }
+
+    #[test]
+    fn custom_enforced_role() {
+        let config = AntiAffinityConfig {
+            cross_zone: true,
+            enforced_roles: vec!["shard".to_owned()], // custom role name
+        };
+        let node = make_node("node-1", "zone-a");
+
+        let state = ClusterState {
+            nodes: vec![node.clone()],
+            placements: vec![make_placement("db", "shard", "node-1")],
+        };
+
+        let pod = PendingPod {
+            pod_id: "db-shard-0".to_owned(),
+            tenant_id: "tenant-1".to_owned(),
+            service: "db".to_owned(),
+            role: "shard".to_owned(), // matches custom enforced_roles
+            ordinal: 0,
+            resources: ResourceSpec {
+                cpu_millicores: 500,
+                memory_bytes: 512 * 1024 * 1024,
+            },
+            previous_node: None,
+        };
+
+        assert!(!check_anti_affinity(&pod, &node, &state, &config));
     }
 }
