@@ -15,10 +15,14 @@ use super::DelegationError;
 
 /// Compute a `DelegationId` from its constituent parts.
 ///
-/// Format: `{node_id}:{target_svid_id}:{target_ordinal}:{issued_at}`
+/// Format: `{node_id}|{target_svid_id}|{target_ordinal}|{issued_at}`
 ///
-/// The `DelegationId` type itself is defined in `fleetos-core`. This function
-/// computes the string that will be parsed into that type.
+/// Uses `|` as separator because SPIFFE URIs contain `:` in their scheme
+/// (`spiffe://...`), which would create parsing ambiguity.
+///
+/// The `DelegationId` type itself is defined in `fleetos-core` as a 16-byte
+/// BLAKE3 hash. This function computes a string representation for storage
+/// in `DelegationRecord.delegation_id`.
 pub fn compute_delegation_id(
     node_id: &str,
     target_svid_id: &str,
@@ -30,7 +34,7 @@ pub fn compute_delegation_id(
         .unwrap_or_else(|| "none".to_owned());
 
     let id = format!(
-        "{}:{}:{}:{}",
+        "{}|{}|{}|{}",
         node_id,
         target_svid_id,
         ordinal_str,
@@ -46,10 +50,10 @@ pub fn compute_delegation_id(
 pub fn parse_delegation_id(
     delegation_id: &str,
 ) -> Result<(String, String, Option<u32>, i64), DelegationError> {
-    let parts: Vec<&str> = delegation_id.split(':').collect();
+    let parts: Vec<&str> = delegation_id.split('|').collect();
     if parts.len() != 4 {
         return Err(DelegationError::IdComputation(format!(
-            "invalid delegation ID format: expected 4 colon-separated parts, got {}",
+            "invalid delegation ID format: expected 4 pipe-separated parts, got {}",
             parts.len()
         )));
     }
@@ -87,6 +91,24 @@ mod tests {
         let issued_at = OffsetDateTime::now_utc();
 
         let id = compute_delegation_id(node_id, target_svid_id, target_ordinal, issued_at).unwrap();
+
+        // Top-level separator must be pipe, because ':' appears inside spiffe:// URIs.
+        assert!(
+            id.contains('|'),
+            "delegation ID should use | as the top-level separator"
+        );
+
+        assert_eq!(
+            id.matches('|').count(),
+            3,
+            "delegation ID should have exactly 3 pipe separators"
+        );
+
+        assert!(
+            id.contains("|2|"),
+            "delegation ID should encode ordinal as a pipe-delimited field"
+        );
+
         let (parsed_node, parsed_svid, parsed_ordinal, parsed_time) =
             parse_delegation_id(&id).unwrap();
 
@@ -103,9 +125,18 @@ mod tests {
         let issued_at = OffsetDateTime::now_utc();
 
         let id = compute_delegation_id(node_id, target_svid_id, None, issued_at).unwrap();
-        assert!(id.contains(":none:"));
+        assert!(id.contains("|none|"));
 
         let (_, _, parsed_ordinal, _) = parse_delegation_id(&id).unwrap();
         assert_eq!(parsed_ordinal, None);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_separator() {
+        // A string using : separator should fail to parse
+        let bad_id =
+            "spiffe://test.internal/ns/system/node/n1:spiffe://test.internal/ns/t/sa/s:0:123";
+        let result = parse_delegation_id(bad_id);
+        assert!(result.is_err());
     }
 }
