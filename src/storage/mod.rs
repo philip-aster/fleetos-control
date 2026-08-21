@@ -4,14 +4,15 @@
 //! atomic-apply invariant: Raft log entry → fjall write → version increment →
 //! broadcast diff, all within one WriteBatch.
 
+pub mod engine;
 pub mod schema;
 pub mod tables;
 pub mod version;
 
+pub use engine::StorageEngine;
+use fjall::{Database, KeyspaceCreateOptions};
 use std::path::Path;
 use std::sync::Arc;
-
-use fjall::{Database, KeyspaceCreateOptions};
 
 /// Open the fjall database at the given path.
 ///

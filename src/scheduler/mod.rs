@@ -18,6 +18,7 @@ pub mod engine;
 pub mod ordinal;
 pub mod topology;
 
+pub use ordinal::OrdinalTracker;
 use thiserror::Error;
 
 use fleetos_core::spiffe::SpiffeId;
