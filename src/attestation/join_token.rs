@@ -43,6 +43,7 @@ pub enum NodeKind {
     Router,
     Gateway,
     Control,
+    FleetctlProxy,
 }
 
 /// Manages join token storage and lifecycle.
