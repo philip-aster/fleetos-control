@@ -7,6 +7,7 @@ authors = ["Philip Aster and the FleetOS Contributors"]
 description = "Control Plane Brain for FleetOS"
 
 [dependencies]
+async-stream = "0.3.6"
 async-trait = "0.1.92"
 blake3 = "1.8.6"
 chacha20poly1305 = "0.11.0"
