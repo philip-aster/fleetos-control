@@ -1006,6 +1006,8 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
  "tss-esapi",

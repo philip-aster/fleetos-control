@@ -37,6 +37,7 @@ tokio-stream = { version = "0.1.19", features = ["net"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 toml = "1.1.4"
 tonic = "0.14.6"
+tonic-prost = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tss-esapi = { version = "7.7.0", optional = true }
@@ -66,3 +67,6 @@ path = "src/main.rs"
 [lib]
 name = "fleetos_control"
 path = "src/lib.rs"
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"

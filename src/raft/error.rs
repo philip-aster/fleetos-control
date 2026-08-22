@@ -18,6 +18,9 @@ pub enum RaftError {
 
     #[error("raft not initialized")]
     NotInitialized,
+
+    #[error("transport error: {0}")]
+    Transport(String),
 }
 
 impl From<RaftError> for openraft::StorageError<u64> {

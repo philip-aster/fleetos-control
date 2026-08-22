@@ -1,4 +1,4 @@
-//! Raft consensus layer backed by `openraft` 0.9.25 + `redb`.
+//! Raft consensus layer backed by `openraft` 0.9.25 + `fjall`.
 //!
 //! This module provides:
 //! - Type configuration (`FleetosRaftConfig`)
@@ -10,6 +10,7 @@
 pub mod entry;
 pub mod error;
 pub mod network;
+pub mod server;
 pub mod snapshot;
 pub mod state_machine;
 pub mod store;
@@ -48,3 +49,13 @@ declare_raft_types!(
 pub struct RaftHandle {
     pub raft: Arc<openraft::Raft<FleetosRaftConfig>>,
 }
+
+// Include the generated proto types for the internal Raft transport.
+pub mod raft_proto {
+    tonic::include_proto!("fleetos.raft");
+}
+
+// Re-export the generated types for convenience.
+pub use raft_proto::RaftRpc;
+pub use raft_proto::raft_transport_client::RaftTransportClient;
+pub use raft_proto::raft_transport_server::RaftTransport as RaftTransportService;
