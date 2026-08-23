@@ -129,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workload_controller = Arc::new(WorkloadController::new(
         storage_engine.clone(),
         ordinal_tracker.clone(),
+        broadcast_hub.clone(),
     ));
     let pod_controller = Arc::new(PodController::new(
         storage_engine.clone(),

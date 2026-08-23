@@ -245,7 +245,7 @@ pub trait Scheduler: Send + Sync {
 ///
 /// This is the scheduler's input — a `PodSpec` that has been expanded
 /// by `workload_controller` with its ordinal already assigned.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PendingPod {
     /// The pod's unique ID.
     pub pod_id: String,

@@ -1,20 +1,13 @@
 //! Pod controller — per-ordinal reconciliation.
-
-use std::sync::Arc;
-
-use fleetos_core::spiffe::PodId;
-
 use super::ControllerError;
 use crate::scheduler::OrdinalTracker;
 use crate::storage::StorageEngine;
+use fleetos_core::spiffe::PodId;
+use std::sync::Arc;
 
 /// The pod controller.
 pub struct PodController {
-    /// Storage engine for placement queries and updates.
-    /// TODO: Used for querying current placements, updating node assignments after rescheduling.
-    #[allow(dead_code)]
     storage: Arc<StorageEngine>,
-
     ordinal_tracker: Arc<OrdinalTracker>,
 }
 
@@ -48,13 +41,11 @@ impl PodController {
         // Generate a new pod_id for the replacement.
         let new_pod_id = PodId::new(format!("{}-{}-{}", workload_id, role, ordinal));
 
-        // TODO: Update the placement to point to the new pod_id.
-        // The ordinal stays the same — this is replace-in-place.
-        // self.storage.update_placement_pod_id(
-        //     tenant_id, workload_id, role, ordinal, &new_pod_id
-        // )?;
+        // Update the placement to point to the new pod_id (replace-in-place).
+        self.storage
+            .update_placement_pod_id(tenant_id, workload_id, role, ordinal, new_pod_id.as_str())
+            .map_err(ControllerError::Storage)?;
 
-        // Extract the old pod_id from the Option<String> for logging.
         let old_pod_id_str = assignment
             .current_pod_id
             .as_deref()
@@ -87,6 +78,7 @@ impl PodController {
 
         for assignment in assignments {
             if assignment.ordinal >= new_count {
+                // Free the ordinal slot.
                 self.ordinal_tracker.free_ordinal(
                     tenant_id,
                     workload_id,
@@ -94,10 +86,12 @@ impl PodController {
                     assignment.ordinal,
                 )?;
 
-                // TODO: Remove the placement from storage.
-                // self.storage.delete_placement(
-                //     tenant_id, workload_id, role, assignment.ordinal
-                // )?;
+                // Remove the placement from storage.
+                if let Some(ref pod_id) = assignment.current_pod_id {
+                    self.storage
+                        .delete_placement(pod_id)
+                        .map_err(ControllerError::Storage)?;
+                }
 
                 tracing::info!(
                     tenant = %tenant_id,
