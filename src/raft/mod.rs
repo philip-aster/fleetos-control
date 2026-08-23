@@ -10,6 +10,7 @@
 pub mod entry;
 pub mod error;
 pub mod network;
+pub mod records;
 pub mod server;
 pub mod snapshot;
 pub mod state_machine;
@@ -20,11 +21,105 @@ use std::sync::Arc;
 
 use openraft::declare_raft_types;
 
-/// Application-level command that gets replicated through the Raft log.
+/// Application-level command replicated through the Raft log.
+///
+/// Every variant carries fully-computed, owned data so application by the state
+/// machine is deterministic across all nodes. Any non-deterministic work (random
+/// token/nonce generation, envelope encryption, timestamp capture, ID derivation,
+/// free-block selection) is done by the leader BEFORE proposing the command.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum FleetosCommand {
-    /// Placeholder — will be expanded as controllers are implemented.
-    Noop,
+    // --- Tenant lifecycle ---
+    CreateTenant {
+        record: records::TenantRecord,
+    },
+    DeleteTenant {
+        tenant_id: String,
+    },
+
+    // --- Workloads ---
+    SubmitWorkloadSpec {
+        record: records::WorkloadSpecRecord,
+    },
+    SubmitCronWorkload {
+        record: records::CronWorkloadRecord,
+    },
+
+    // --- Attestation / join ---
+    MintJoinToken {
+        record: crate::attestation::join_token::JoinTokenRecord,
+    },
+    ConsumeJoinToken {
+        token: Vec<u8>,
+    },
+    SetPcrPolicy {
+        record: crate::attestation::pcr_policy::PcrPolicy,
+    },
+
+    // --- Nodes ---
+    RegisterNode {
+        record: records::NodeRecord,
+    },
+    /// Evicts a node AND revokes ALL of its delegations in a single batch.
+    /// This is one command (not two) so the one-to-many eviction invariant is atomic.
+    EvictNode {
+        node_id: String,
+    },
+    SetNodeSchedulable {
+        node_id: String,
+        schedulable: bool,
+    },
+
+    // --- Delegations (degraded mode) ---
+    /// Upsert into active_delegations. Covers both issuance and refresh (a refresh
+    /// is an upsert with recomputed issued_at / expires_at / refresh_at).
+    IssueDelegation {
+        record: crate::delegation::DelegationRecord,
+    },
+    RevokeDelegation {
+        node_id: String,
+        delegation_id: String,
+    },
+
+    // --- SAG policy ---
+    UpsertSagRule {
+        record: records::SagRuleRecord,
+    },
+    DeleteSagRule {
+        rule_id: String,
+    },
+
+    // --- Dummy IP ---
+    AllocateTenantBlock {
+        record: crate::dummy_ip::allocator::TenantBlock,
+    },
+    /// The leader has already picked the address and incremented `block.next_offset`;
+    /// both the updated block and the assignment are written atomically.
+    AllocateServiceAddress {
+        block: crate::dummy_ip::allocator::TenantBlock,
+        address: crate::dummy_ip::allocator::ServiceAddress,
+    },
+
+    // --- Secrets ---
+    StoreSecret {
+        record: records::SecretRecord,
+    },
+
+    // --- Scheduler / placement ---
+    RecordOrdinalAssignment {
+        record: crate::scheduler::ordinal::OrdinalAssignment,
+    },
+    CommitPlacement {
+        record: crate::scheduler::Placement,
+    },
+
+    // --- Provisioning ---
+    StoreNodePool {
+        record: crate::provisioning::NodePoolRecord,
+    },
+    DeleteNodePool {
+        pool_id: String,
+    },
 }
 
 /// Application-level response returned after applying a command.

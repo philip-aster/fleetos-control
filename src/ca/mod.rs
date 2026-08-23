@@ -9,6 +9,7 @@
 
 pub mod delegated;
 pub mod key_issuance;
+pub mod name_constraints;
 pub mod oid;
 pub mod rcgen_impl;
 pub mod trust_bundle;
