@@ -39,3 +39,13 @@ pub enum TlsError {
     #[error("no valid certificate found in chain")]
     NoCertificate,
 }
+
+/// Connection info extracted from the TLS handshake.
+///
+/// Carries the authenticated peer's SpiffeId from the TLS layer into the
+/// application layer. Tonic makes this available in request extensions
+/// when the stream implements `Connected`.
+#[derive(Debug, Clone)]
+pub struct PeerConnectInfo {
+    pub spiffe_id: fleetos_core::spiffe::SpiffeId,
+}

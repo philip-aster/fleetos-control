@@ -27,8 +27,9 @@ use fleetos_control::secrets::SecretStore;
 use fleetos_control::secrets::crypto::FileMasterKey;
 use fleetos_control::storage::version::VersionedState;
 use fleetos_control::storage::{init_keyspaces, open_database};
+use fleetos_control::tls::PeerConnectInfo;
 use fleetos_control::watch::broadcast::BroadcastHub;
-
+use fleetos_core::spiffe::SpiffeId;
 use openraft::{Config, Raft};
 
 #[derive(Parser)]
@@ -41,6 +42,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install the ring crypto provider as the process default.
+    // REQUIRED by rustls 0.23 — without this, ServerConfig::builder() panics.
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls ring crypto provider");
@@ -165,7 +168,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // --- Phase 8: gRPC Servers ---
-    // --- Phase 8: gRPC Servers ---
     tracing::info!("setting up gRPC servers");
 
     // Mint control plane SVIDs for both trust domains
@@ -215,7 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
             rustls::pki_types::PrivatePkcs8KeyDer::from(dc_svid.private_key_der.to_vec()),
         ),
-        trust_bundle_pem: dc_svid.cert_pem.clone(), // Placeholder — should be full trust bundle
+        trust_bundle_pem: dc_svid.cert_pem.clone(),
         role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
     };
     let dc_server_config =
@@ -262,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn Data/Control listener with custom TLS
     let dc_tls_acceptor = tokio_rustls::TlsAcceptor::from(dc_server_config);
+    let dc_td_config = fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
     tokio::spawn(async move {
         tracing::info!(addr = %dc_addr, "starting Data/Control gRPC listener");
 
@@ -276,13 +279,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let incoming = async_stream::stream! {
             loop {
                 match listener.accept().await {
-                    Ok((stream, _addr)) => {
+                    Ok((stream, addr)) => {
                         let acceptor = dc_tls_acceptor.clone();
+                        let td_config = dc_td_config.clone();
                         yield async move {
-                            let tls_stream = acceptor.accept(stream).await?;
-                            // TODO: Extract peer cert and validate SPIFFE URI SAN
-                            // For now, just return the TLS stream
-                            Ok::<_, std::io::Error>(tls_stream)
+                            let tls_stream = acceptor.accept(stream).await
+                                .map_err(|e| {
+                                    tracing::warn!(error = %e, addr = %addr, "TLS handshake failed");
+                                    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e)
+                                })?;
+
+                            // Extract peer certificate and validate SPIFFE identity
+                            let (_, server_conn) = tls_stream.get_ref();
+                            let peer_certs = server_conn.peer_certificates()
+                                .ok_or_else(|| {
+                                    tracing::warn!(addr = %addr, "no peer certificates");
+                                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no peer cert")
+                                })?;
+
+                            let peer_cert_der = peer_certs.first()
+                                .ok_or_else(|| {
+                                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "empty cert chain")
+                                })?;
+
+                            // Extract SPIFFE URI SAN
+                            let spiffe_uri = fleetos_control::tls::mtls::extract_spiffe_uri_san(peer_cert_der)
+                                .map_err(|e| {
+                                    tracing::warn!(addr = %addr, error = %e, "SPIFFE extraction failed");
+                                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+                                })?;
+
+                            // Validate trust domain and identity kind
+                            fleetos_control::tls::trust_domains::validate_peer_identity(
+                                &spiffe_uri,
+                                fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
+                                &td_config,
+                            ).map_err(|e| {
+                                tracing::warn!(addr = %addr, spiffe = %spiffe_uri, error = %e, "peer identity rejected");
+                                std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+                            })?;
+
+                            // Parse into SpiffeId
+                            let spiffe_id: SpiffeId = spiffe_uri.parse()
+                                .map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                                })?;
+
+                            tracing::debug!(addr = %addr, spiffe = %spiffe_id, "peer authenticated");
+
+                            // Wrap the stream to carry the SpiffeId
+                            Ok::<_, std::io::Error>(PeerAuthenticatedStream {
+                                inner: tls_stream,
+                                spiffe_id,
+                            })
                         }.await;
                     }
                     Err(e) => {
@@ -306,6 +355,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn Admin listener with custom TLS
     let admin_tls_acceptor = tokio_rustls::TlsAcceptor::from(admin_server_config);
+    let admin_td_config =
+        fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
     tokio::spawn(async move {
         tracing::info!(addr = %admin_addr, "starting Admin gRPC listener");
 
@@ -320,22 +371,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let incoming = async_stream::stream! {
             loop {
                 match listener.accept().await {
-                    Ok((stream, _addr)) => {
+                    Ok((stream, addr)) => {
                         let acceptor = admin_tls_acceptor.clone();
+                        let td_config = admin_td_config.clone();
                         yield async move {
-                            let tls_stream = acceptor.accept(stream).await?;
-                            // TODO: Extract peer cert and validate SPIFFE URI SAN
-                            // Attach SpiffeId to request extensions for admin/authz.rs
-                            Ok::<_, std::io::Error>(tls_stream)
+                            let tls_stream = acceptor.accept(stream).await
+                                .map_err(|e| {
+                                    tracing::warn!(error = %e, addr = %addr, "TLS handshake failed");
+                                    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e)
+                                })?;
+
+                            // Extract peer certificate and validate SPIFFE identity
+                            let (_, server_conn) = tls_stream.get_ref();
+                            let peer_certs = server_conn.peer_certificates()
+                                .ok_or_else(|| {
+                                    tracing::warn!(addr = %addr, "no peer certificates");
+                                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no peer cert")
+                                })?;
+
+                            let peer_cert_der = peer_certs.first()
+                                .ok_or_else(|| {
+                                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "empty cert chain")
+                                })?;
+
+                            // Extract SPIFFE URI SAN
+                            let spiffe_uri = fleetos_control::tls::mtls::extract_spiffe_uri_san(peer_cert_der)
+                                .map_err(|e| {
+                                    tracing::warn!(addr = %addr, error = %e, "SPIFFE extraction failed");
+                                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+                                })?;
+
+                            // Validate trust domain and identity kind (Admin domain)
+                            fleetos_control::tls::trust_domains::validate_peer_identity(
+                                &spiffe_uri,
+                                fleetos_control::tls::trust_domains::TrustDomainRole::Admin,
+                                &td_config,
+                            ).map_err(|e| {
+                                tracing::warn!(addr = %addr, spiffe = %spiffe_uri, error = %e, "peer identity rejected");
+                                std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+                            })?;
+
+                            // Parse into SpiffeId
+                            let spiffe_id: SpiffeId = spiffe_uri.parse()
+                                .map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                                })?;
+
+                            tracing::debug!(addr = %addr, spiffe = %spiffe_id, "admin peer authenticated");
+
+                            Ok::<_, std::io::Error>(PeerAuthenticatedStream {
+                                inner: tls_stream,
+                                spiffe_id,
+                            })
                         }.await;
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "failed to accept connection");
+                        tracing::error!(error = %e, "failed to accept admin connection");
                     }
                 }
             }
         };
 
+        // Admin listener ONLY registers the AdminService
         let server = tonic::transport::Server::builder().add_service(
             fleetos_core::proto::fleetos::admin_service_server::AdminServiceServer::new(
                 admin_service,
@@ -358,6 +455,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("fleetos-control shutdown complete");
     Ok(())
+}
+
+/// A TLS stream that carries an authenticated peer identity.
+struct PeerAuthenticatedStream<S> {
+    inner: S,
+    spiffe_id: SpiffeId,
+}
+
+impl<S> tokio::io::AsyncRead for PeerAuthenticatedStream<S>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> tokio::io::AsyncWrite for PeerAuthenticatedStream<S>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl<S> tonic::transport::server::Connected for PeerAuthenticatedStream<S>
+where
+    S: Send + 'static,
+{
+    type ConnectInfo = PeerConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        PeerConnectInfo {
+            spiffe_id: self.spiffe_id.clone(),
+        }
+    }
 }
 
 /// Initialize the Raft cluster based on configuration (bootstrap or join).

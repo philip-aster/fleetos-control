@@ -55,16 +55,16 @@ impl AdminServiceImpl {
     /// This is defense-in-depth — the primary enforcement is at the mTLS layer
     /// (Admin trust bundle validation). But we check here too.
     fn verify_caller<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        // Extract the caller's SpiffeId from the mTLS peer certificate.
-        // The TLS layer attaches it to the request extensions.
-        let caller_svid = request
+        // Extract the caller's SpiffeId from the connection info.
+        // Tonic automatically makes `ConnectInfo` available in request extensions
+        // when the stream implements `Connected`.
+        let connect_info = request
             .extensions()
-            .get::<fleetos_core::spiffe::SpiffeId>()
+            .get::<crate::tls::PeerConnectInfo>()
             .ok_or_else(|| Status::unauthenticated("no peer certificate found"))?;
 
-        authz::verify_admin_caller(caller_svid)
+        authz::verify_admin_caller(&connect_info.spiffe_id)
             .map_err(|_| Status::permission_denied("caller SVID kind is not ctrl"))?;
-
         Ok(())
     }
 }
