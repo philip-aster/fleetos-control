@@ -104,6 +104,7 @@ pub fn build_csr(params: &SvidParams) -> Result<CsrBundle, CaError> {
 pub struct SignedSvid {
     pub cert_pem: String,
     pub cert_der: Vec<u8>,
+    pub private_key_der: Zeroizing<Vec<u8>>,
     pub not_before: OffsetDateTime,
     pub not_after: OffsetDateTime,
 }
@@ -166,6 +167,9 @@ pub fn sign_svid(
     // Generate a fresh keypair for the leaf.
     let leaf_key_pair = KeyPair::generate().map_err(|e| CaError::KeyGeneration(e.to_string()))?;
 
+    // Extract the private key before signing.
+    let private_key_der = Zeroizing::new(leaf_key_pair.serialize_der());
+
     // Construct the Issuer from the CA's params and key.
     let issuer = Issuer::new(ca_cert_params.clone(), ca_key_pair);
 
@@ -174,13 +178,13 @@ pub fn sign_svid(
         .signed_by(&leaf_key_pair, &issuer)
         .map_err(CaError::Rcgen)?;
 
-    // Certificate::pem() returns String directly (not Result)
     let cert_pem = leaf_cert.pem();
     let cert_der = leaf_cert.der().to_vec();
 
     Ok(SignedSvid {
         cert_pem,
         cert_der,
+        private_key_der,
         not_before,
         not_after,
     })

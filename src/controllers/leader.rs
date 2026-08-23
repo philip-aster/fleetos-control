@@ -54,8 +54,12 @@ impl LeaderGate {
                         return;
                     }
 
-                    let metrics = metrics_rx.borrow();
-                    let currently_leader = metrics.state == openraft::ServerState::Leader;
+                    // Extract the boolean and drop the RwLockReadGuard IMMEDIATELY.
+                    // The guard is !Send and cannot be held across the .await below.
+                    let currently_leader = {
+                        let metrics = metrics_rx.borrow();
+                        metrics.state == openraft::ServerState::Leader
+                    };
 
                     if currently_leader && !is_leader {
                         // Became leader — start all controllers

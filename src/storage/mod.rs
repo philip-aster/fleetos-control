@@ -96,6 +96,7 @@ pub fn init_keyspaces(db: &Database) -> Result<Keyspaces, StorageError> {
 }
 
 /// All keyspaces used by fleetos-control.
+#[derive(Clone)]
 pub struct Keyspaces {
     pub version: fjall::Keyspace,
     pub raft_log: fjall::Keyspace,
