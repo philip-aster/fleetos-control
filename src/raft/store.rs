@@ -36,43 +36,29 @@ impl RaftLogReader<FleetosRaftConfig> for FjallLogReader {
         &mut self,
         range: R,
     ) -> Result<Vec<Entry<FleetosRaftConfig>>, StorageError<u64>> {
-        let mut entries = Vec::new();
-
+        // Convert the u64 index range to a big-endian byte range.
+        // BE encoding preserves lexicographic order, so this byte range is
+        // exactly the requested index range.
         let start = match range.start_bound() {
-            std::ops::Bound::Included(&n) => n,
-            std::ops::Bound::Excluded(&n) => n + 1,
-            std::ops::Bound::Unbounded => 0,
+            std::ops::Bound::Included(n) => std::ops::Bound::Included(n.to_be_bytes().to_vec()),
+            std::ops::Bound::Excluded(n) => std::ops::Bound::Excluded(n.to_be_bytes().to_vec()),
+            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+        };
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(n) => std::ops::Bound::Included(n.to_be_bytes().to_vec()),
+            std::ops::Bound::Excluded(n) => std::ops::Bound::Excluded(n.to_be_bytes().to_vec()),
+            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
         };
 
-        // Iterator yields Guard items directly, not Result
-        for guard in self.raft_log.prefix(start.to_be_bytes()) {
-            // Access value through Guard method (returns Result<&Slice, &Error>)
+        let mut entries = Vec::new();
+        for guard in self.raft_log.range((start, end)) {
             let value = guard.value().map_err(|e| StorageError::IO {
                 source: StorageIOError::read_logs(&e),
             })?;
-
-            let index = if value.len() >= 8 {
-                // Deserialize the entry to get its log_id
-                match deserialize_entry(value.as_ref()) {
-                    Ok(entry) => {
-                        let idx = entry.get_log_id().index;
-                        if range.contains(&idx) {
-                            entries.push(entry);
-                        }
-                        idx
-                    }
-                    Err(_) => continue,
-                }
-            } else {
-                continue;
-            };
-
-            // Safety limit to avoid scanning too far
-            if index > start + 10000 {
-                break;
+            if let Ok(entry) = deserialize_entry(value.as_ref()) {
+                entries.push(entry);
             }
         }
-
         Ok(entries)
     }
 }
@@ -189,25 +175,15 @@ impl RaftLogStorage<FleetosRaftConfig> for FjallLogStorage {
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut batch = self.db.batch();
-
-        // Collect keys to remove first (can't modify while iterating)
         let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
 
-        for guard in self.raft_log.prefix(log_id.index.to_be_bytes()) {
-            // guard.key() returns a Result, so we must map_err and unwrap it first
+        // Remove the entire suffix: every entry with index >= log_id.index.
+        for guard in self.raft_log.range(log_id.index.to_be_bytes()..) {
             let key_slice = guard.key().map_err(|e| StorageError::IO {
                 source: StorageIOError::write_logs(&e),
             })?;
-            let key_bytes: &[u8] = key_slice.as_ref();
-
-            if key_bytes.len() >= 8 {
-                let index = u64::from_be_bytes(key_bytes[..8].try_into().unwrap_or([0; 8]));
-                if index >= log_id.index {
-                    keys_to_remove.push(key_bytes.to_vec());
-                }
-            }
+            keys_to_remove.push(key_slice.as_ref().to_vec());
         }
-
         for key in keys_to_remove {
             batch.remove(&self.raft_log, key.as_slice());
         }
@@ -220,28 +196,20 @@ impl RaftLogStorage<FleetosRaftConfig> for FjallLogStorage {
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut batch = self.db.batch();
-
-        // Collect keys to remove first
         let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
 
-        for guard in self.raft_log.prefix(0u64.to_be_bytes()) {
+        // Remove the prefix covered by the snapshot: every entry with index <= log_id.index.
+        for guard in self.raft_log.range(..=log_id.index.to_be_bytes()) {
             let key_slice = guard.key().map_err(|e| StorageError::IO {
                 source: StorageIOError::write_logs(&e),
             })?;
-            let key_bytes: &[u8] = key_slice.as_ref();
-
-            if key_bytes.len() >= 8 {
-                let index = u64::from_be_bytes(key_bytes[..8].try_into().unwrap_or([0; 8]));
-                if index <= log_id.index {
-                    keys_to_remove.push(key_bytes.to_vec());
-                }
-            }
+            keys_to_remove.push(key_slice.as_ref().to_vec());
         }
-
         for key in keys_to_remove {
             batch.remove(&self.raft_log, key.as_slice());
         }
 
+        // Record the purge watermark in the same atomic batch.
         let serialized = postcard::to_allocvec(&log_id).map_err(|e| StorageError::IO {
             source: StorageIOError::write_logs(&e),
         })?;
