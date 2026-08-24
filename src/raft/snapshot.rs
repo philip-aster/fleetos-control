@@ -1,39 +1,122 @@
 //! Snapshot builder for fjall.
-
+//!
+//! Serializes all application keyspaces into a single postcard-encoded
+//! `ApplicationSnapshot`. On install, the state machine restores every
+//! keyspace atomically in one `OwnedWriteBatch`.
 use std::io::Cursor;
+use std::sync::Arc;
 
-use fjall::Keyspace;
-use openraft::{RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StoredMembership};
+use fjall::Database;
+use openraft::{
+    BasicNode, LogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StoredMembership,
+};
 
 use super::FleetosRaftConfig;
+use crate::storage::Keyspaces;
+
+/// Serializable snapshot of all application state.
+///
+/// Each entry is `(keyspace_name, [(key, value), ...])`.
+/// Log keyspaces (`raft_log`, `raft_log_meta`) are excluded —
+/// openraft manages log truncation via snapshot metadata.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ApplicationSnapshot {
+    pub keyspaces: Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>,
+}
+
+/// Errors local to snapshot operations, mapped to `StorageError`.
+fn ser_err(e: postcard::Error) -> StorageError<u64> {
+    StorageError::IO {
+        source: openraft::StorageIOError::write_state_machine(&e),
+    }
+}
+
+fn read_err(e: fjall::Error) -> StorageError<u64> {
+    StorageError::IO {
+        source: openraft::StorageIOError::read_state_machine(&e),
+    }
+}
 
 pub struct FjallSnapshotBuilder {
-    /// Will be used when implementing actual snapshot building
-    /// (serializing full application state from the keyspace).
+    /// Will be used to create a cross-keyspace consistent snapshot via `db.snapshot()`
+    /// before iterating, preventing torn reads if writes happen during snapshot build.
     #[allow(dead_code)]
-    raft_snapshot: Keyspace,
+    db: Arc<Database>,
+    keyspaces: Keyspaces,
 }
 
 impl FjallSnapshotBuilder {
-    pub fn new(raft_snapshot: Keyspace) -> Self {
-        Self { raft_snapshot }
+    pub fn new(db: Arc<Database>, keyspaces: Keyspaces) -> Self {
+        Self { db, keyspaces }
+    }
+
+    /// Collect all key-value pairs from every snapshot-relevant keyspace.
+    fn collect_keyspaces(
+        &self,
+    ) -> Result<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>, StorageError<u64>> {
+        let mut result = Vec::new();
+        for (name, ks) in self.keyspaces.snapshot_keyspaces() {
+            let mut pairs = Vec::new();
+            for guard in ks.prefix(Vec::<u8>::new()) {
+                // into_inner() consumes the guard and returns both key and value
+                let (key, value) = guard.into_inner().map_err(read_err)?;
+                pairs.push((key.to_vec(), value.to_vec()));
+            }
+            result.push((name.to_owned(), pairs));
+        }
+        Ok(result)
     }
 }
 
 impl RaftSnapshotBuilder<FleetosRaftConfig> for FjallSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<FleetosRaftConfig>, StorageError<u64>> {
-        let data: Vec<u8> = Vec::new();
-        let cursor = Cursor::new(data);
+        // 1. Collect all application state.
+        let keyspace_data = self.collect_keyspaces()?;
+        let app_snapshot = ApplicationSnapshot {
+            keyspaces: keyspace_data,
+        };
+        let data = postcard::to_allocvec(&app_snapshot).map_err(ser_err)?;
 
-        let meta = SnapshotMeta {
-            last_log_id: None,
-            last_membership: StoredMembership::default(),
-            snapshot_id: "initial".to_string(),
+        // 2. Read last_applied and last_membership from raft_state.
+        let last_applied: Option<LogId<u64>> = match self
+            .keyspaces
+            .raft_state
+            .get(b"last_applied")
+            .map_err(read_err)?
+        {
+            Some(bytes) => Some(postcard::from_bytes(&bytes).map_err(ser_err)?),
+            None => None,
         };
 
+        let last_membership: StoredMembership<u64, BasicNode> = match self
+            .keyspaces
+            .raft_state
+            .get(b"last_membership")
+            .map_err(read_err)?
+        {
+            Some(bytes) => postcard::from_bytes(&bytes).map_err(ser_err)?,
+            None => StoredMembership::default(),
+        };
+
+        // 3. Build a deterministic snapshot ID from the last applied log entry.
+        let snapshot_id = match last_applied {
+            Some(log_id) => format!("snap-{}-{}", log_id.leader_id.term, log_id.index),
+            None => "snap-initial".to_owned(),
+        };
+
+        tracing::info!(
+            snapshot_id = %snapshot_id,
+            data_len = data.len(),
+            "snapshot built"
+        );
+
         Ok(Snapshot {
-            meta,
-            snapshot: Box::new(cursor),
+            meta: SnapshotMeta {
+                last_log_id: last_applied,
+                last_membership,
+                snapshot_id,
+            },
+            snapshot: Box::new(Cursor::new(data)),
         })
     }
 }

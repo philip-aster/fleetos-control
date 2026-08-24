@@ -581,7 +581,7 @@ impl RaftStateMachine<FleetosRaftConfig> for FjallStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        FjallSnapshotBuilder::new(self.keyspaces.raft_snapshot.clone())
+        super::snapshot::FjallSnapshotBuilder::new(self.db.clone(), self.keyspaces.clone())
     }
 
     async fn begin_receiving_snapshot(
@@ -596,9 +596,43 @@ impl RaftStateMachine<FleetosRaftConfig> for FjallStateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
         let data = snapshot.into_inner();
-        let serialized_meta = postcard::to_allocvec(meta).map_err(ser_err)?;
 
+        // Deserialize the application snapshot.
+        let app_snapshot: super::snapshot::ApplicationSnapshot =
+            postcard::from_bytes(&data).map_err(ser_err)?;
+
+        // Build a single atomic batch: clear all snapshotted keyspaces,
+        // then write every key-value pair from the snapshot.
         let mut batch = self.db.batch();
+
+        // Phase 1: clear existing data in all snapshot-relevant keyspaces.
+        for (_name, ks) in self.keyspaces.snapshot_keyspaces() {
+            for guard in ks.prefix(Vec::<u8>::new()) {
+                let key = guard.key().map_err(read_err)?.to_vec();
+                batch.remove(ks, key.as_slice());
+            }
+        }
+
+        // Phase 2: write all snapshot data.
+        for (name, pairs) in &app_snapshot.keyspaces {
+            // Find the matching keyspace by name.
+            let ks = self
+                .keyspaces
+                .snapshot_keyspaces()
+                .into_iter()
+                .find(|(n, _)| *n == name.as_str())
+                .map(|(_, ks)| ks);
+            let Some(ks) = ks else {
+                tracing::warn!(keyspace = %name, "unknown keyspace in snapshot, skipping");
+                continue;
+            };
+            for (key, value) in pairs {
+                batch.insert(ks, key.as_slice(), value.as_slice());
+            }
+        }
+
+        // Phase 3: persist the snapshot data and meta for get_current_snapshot().
+        let serialized_meta = postcard::to_allocvec(meta).map_err(ser_err)?;
         batch.insert(
             &self.keyspaces.raft_snapshot,
             0u64.to_be_bytes(),
@@ -609,7 +643,16 @@ impl RaftStateMachine<FleetosRaftConfig> for FjallStateMachine {
             b"snapshot_meta",
             serialized_meta.as_slice(),
         );
+
+        // Commit everything atomically.
         batch.commit().map_err(commit_err)?;
+
+        tracing::info!(
+            snapshot_id = %meta.snapshot_id,
+            keyspaces_restored = app_snapshot.keyspaces.len(),
+            "snapshot installed"
+        );
+
         Ok(())
     }
 

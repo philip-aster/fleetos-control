@@ -120,6 +120,38 @@ pub struct Keyspaces {
     pub node_pools: fjall::Keyspace,
 }
 
+impl Keyspaces {
+    /// Returns all keyspaces that must be included in Raft snapshots.
+    ///
+    /// Excludes `raft_log` and `raft_log_meta` — openraft manages log
+    /// truncation separately via snapshot metadata. Includes `raft_state`
+    /// because it carries `last_applied` and `last_membership`.
+    pub fn snapshot_keyspaces(&self) -> Vec<(&'static str, &fjall::Keyspace)> {
+        vec![
+            (tables::VERSION_KEYSPACE, &self.version),
+            (tables::NODE_KEYSPACE, &self.nodes),
+            (tables::SVID_KEYSPACE, &self.svids),
+            (tables::SAG_RULE_KEYSPACE, &self.sag_rules),
+            (tables::JOIN_TOKEN_KEYSPACE, &self.join_tokens),
+            (
+                tables::REVOKED_DELEGATION_KEYSPACE,
+                &self.revoked_delegations,
+            ),
+            (tables::ACTIVE_DELEGATION_KEYSPACE, &self.active_delegations),
+            (tables::ORDINAL_KEYSPACE, &self.ordinals),
+            (tables::PLACEMENT_KEYSPACE, &self.placements),
+            (tables::TENANT_KEYSPACE, &self.tenants),
+            (tables::WORKLOAD_KEYSPACE, &self.workloads),
+            (tables::SECRET_KEYSPACE, &self.secrets),
+            (tables::DUMMY_IP_KEYSPACE, &self.dummy_ips),
+            (tables::PCR_POLICY_KEYSPACE, &self.pcr_policies),
+            (tables::ROUTER_ASSIGNMENT_KEYSPACE, &self.router_assignments),
+            (tables::NODE_POOL_KEYSPACE, &self.node_pools),
+            (tables::RAFT_STATE_KEYSPACE, &self.raft_state),
+        ]
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("failed to create database directory: {0}")]
