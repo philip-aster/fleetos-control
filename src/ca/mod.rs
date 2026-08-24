@@ -8,6 +8,7 @@
 //! A compromise of one does not compromise the other.
 
 pub mod delegated;
+pub mod grpc_service;
 pub mod key_issuance;
 pub mod name_constraints;
 pub mod oid;

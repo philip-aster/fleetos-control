@@ -295,6 +295,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             broadcast_hub.clone(),
         );
 
+    // Attestation and CA services (Data/Control listener)
+    let nonce_manager = Arc::new(fleetos_control::attestation::nonce::NonceManager::new());
+    let pcr_store = Arc::new(
+        fleetos_control::attestation::pcr_policy::PcrPolicyStore::new(
+            keyspaces.pcr_policies.clone(),
+        ),
+    );
+    let attestation_service =
+        fleetos_control::attestation::grpc_service::AttestationServiceImpl::new(
+            nonce_manager,
+            join_token_store.clone(),
+            pcr_store,
+        );
+
+    let ca_grpc_service = fleetos_control::ca::grpc_service::CaServiceImpl::new(
+        ca_service.data_control.clone(),
+        config.svid.node_ttl_secs,
+    );
+
     let admin_service = fleetos_control::admin::service::AdminServiceImpl::new(
         storage_engine.clone(),
         join_token_store.clone(),
@@ -390,7 +409,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .add_service(fleetos_core::proto::fleetos::watch_service_server::WatchServiceServer::new(watch_service))
             .add_service(fleetos_core::proto::fleetos::scheduler_service_server::SchedulerServiceServer::new(scheduler_service))
             .add_service(fleetos_core::proto::fleetos::router_assignment_service_server::RouterAssignmentServiceServer::new(router_service))
-            .add_service(fleetos_core::proto::fleetos::secret_service_server::SecretServiceServer::new(secret_service));
+            .add_service(fleetos_core::proto::fleetos::secret_service_server::SecretServiceServer::new(secret_service))
+            .add_service(fleetos_core::proto::fleetos::attestation_service_server::AttestationServiceServer::new(attestation_service))
+            .add_service(fleetos_core::proto::fleetos::ca_service_server::CaServiceServer::new(ca_grpc_service));
 
         if let Err(e) = server.serve_with_incoming(incoming).await {
             tracing::error!(error = %e, "Data/Control gRPC server failed");

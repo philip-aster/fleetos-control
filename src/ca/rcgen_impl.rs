@@ -219,3 +219,42 @@ pub fn generate_root_ca(trust_domain: &str) -> Result<(KeyPair, CertificateParam
 
     Ok((key_pair, params))
 }
+
+/// Sign a CSR using the CA root keypair.
+///
+/// This is the CSR-based SVID issuance path used by the CaService gRPC endpoint.
+/// The agent generates a keypair, creates a CSR with its SPIFFE ID as URI SAN,
+/// and submits it here. The CA signs the CSR and returns the certificate.
+///
+/// The agent retains its own private key — only the certificate is returned.
+pub fn sign_csr(
+    csr_der: &[u8],
+    ca_key_pair: &KeyPair,
+    ca_cert_params: &CertificateParams,
+    ttl_secs: u64,
+) -> Result<Vec<u8>, CaError> {
+    use rcgen::CertificateSigningRequestParams;
+    use rustls::pki_types::CertificateSigningRequestDer;
+
+    // 1. Parse the CSR to extract params and public key.
+    let csr_der_type = CertificateSigningRequestDer::from(csr_der);
+    let csr_params = CertificateSigningRequestParams::from_der(&csr_der_type)
+        .map_err(|e| CaError::Signing(format!("failed to parse CSR: {}", e)))?;
+
+    // 2. Create Issuer from the CA's params and key.
+    let issuer = Issuer::new(ca_cert_params.clone(), ca_key_pair);
+
+    // 3. Set validity window on the leaf params.
+    let mut final_params = csr_params.params;
+    let not_before = OffsetDateTime::now_utc();
+    let not_after = not_before + time::Duration::seconds(ttl_secs as i64);
+    final_params.not_before = not_before;
+    final_params.not_after = not_after;
+
+    // 4. Sign the certificate with the CA using the CSR's public key.
+    let cert = final_params
+        .signed_by(&csr_params.public_key, &issuer)
+        .map_err(CaError::Rcgen)?;
+
+    Ok(cert.der().to_vec())
+}
