@@ -79,33 +79,40 @@ impl AdminService for AdminServiceImpl {
         request: Request<CreateTenantRequest>,
     ) -> Result<Response<CreateTenantResponse>, Status> {
         self.verify_caller(&request)?;
-
         let req = request.into_inner();
         let tenant_id = req.tenant_id;
-
         if tenant_id.is_empty() {
             return Err(Status::invalid_argument("tenant_id cannot be empty"));
         }
 
-        // TODO: Check if tenant already exists in storage.
-        // let existing = self.storage.get_tenant(&tenant_id)?;
-        // if existing.is_some() {
-        //     return Err(Status::already_exists(format!(
-        //         "tenant '{}' already exists", tenant_id
-        //     )));
-        // }
+        // Check if tenant already exists.
+        let existing = self
+            .storage
+            .get_tenant(&tenant_id)
+            .map_err(|e| Status::internal(format!("storage read failed: {}", e)))?;
+        if existing.is_some() {
+            return Err(Status::already_exists(format!(
+                "tenant '{}' already exists",
+                tenant_id
+            )));
+        }
 
         // Allocate a dummy IP block for this tenant.
-        // Default /16 block (65,536 addresses, up to 4,096 tenants).
         self.dummy_ip_allocator
             .allocate_tenant_block(&tenant_id)
             .map_err(|e| Status::internal(format!("failed to allocate dummy IP block: {}", e)))?;
 
-        // TODO: Store the tenant record in storage.
-        // self.storage.store_tenant(&tenant_id)?;
+        // Persist the tenant record.
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let record = crate::raft::records::TenantRecord {
+            tenant_id: tenant_id.clone(),
+            created_at: now,
+        };
+        self.storage
+            .store_tenant(&record)
+            .map_err(|e| Status::internal(format!("failed to store tenant: {}", e)))?;
 
         tracing::info!(tenant_id = %tenant_id, "tenant created");
-
         Ok(Response::new(CreateTenantResponse { success: true }))
     }
 
@@ -275,12 +282,25 @@ impl AdminService for AdminServiceImpl {
             ));
         }
 
-        // TODO: Store the CronWorkload in storage.
-        // self.storage.store_cron_workload(&cron)?;
-
-        // TODO: Notify the cron controller to re-evaluate schedules.
-        // The cron controller's run_loop will pick up the new CronWorkload
-        // on its next evaluation cycle.
+        // Persist the CronWorkload to storage with cron: prefix.
+        let spec_bytes = prost::Message::encode_to_vec(&cron);
+        let record = crate::raft::records::CronWorkloadRecord {
+            tenant_id: cron.tenant_id.clone(),
+            cron_workload_id: cron.cron_workload_id.clone(),
+            schedule_expression: cron
+                .schedule
+                .as_ref()
+                .map(|s| s.expression.clone())
+                .unwrap_or_default(),
+            spec_bytes,
+        };
+        let serialized = postcard::to_allocvec(&record)
+            .map_err(|e| Status::internal(format!("serialization failed: {}", e)))?;
+        let key = format!("cron:{}:{}", record.tenant_id, record.cron_workload_id);
+        self.storage
+            .workloads
+            .insert(key.as_bytes(), serialized.as_slice())
+            .map_err(|e| Status::internal(format!("storage write failed: {}", e)))?;
 
         tracing::info!(
             tenant_id = %cron.tenant_id,
