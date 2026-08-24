@@ -8,17 +8,14 @@
 //!
 //! Error handling: log and continue. Provider failures are transient;
 //! the next cycle will retry. We never crash on provider errors.
-
-use std::sync::Arc;
-use std::time::Duration;
-
-use crate::attestation::join_token::{JoinTokenStore, NodeKind};
-
 use super::client::ProvisioningClient;
 use super::control_pool::ControlPoolManager;
 use super::{
     BootstrapPayload, NodeLifecycleState, NodePoolRecord, ProvisioningConfig, ProvisioningError,
 };
+use crate::attestation::join_token::{JoinTokenStore, NodeKind};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// The provisioning reconciler.
 ///
@@ -29,7 +26,6 @@ pub struct ProvisioningReconciler {
     client: ProvisioningClient,
     join_token_store: Arc<JoinTokenStore>,
     control_pool_manager: Arc<ControlPoolManager>,
-    #[allow(dead_code)]
     storage: Arc<crate::storage::StorageEngine>,
 }
 
@@ -158,37 +154,54 @@ impl ProvisioningReconciler {
             join_token: token,
             node_kind: node_kind as u8,
         };
-
         payload.to_bytes()
     }
 
-    /// Load all node pool records from fjall.
+    /// Load all node pool records from the `node_pools` keyspace.
+    ///
+    /// Each record is stored with `pool_id` as the key and postcard-serialized
+    /// `NodePoolRecord` as the value. A full prefix scan retrieves all pools.
     fn load_pools(&self) -> Result<Vec<NodePoolRecord>, ProvisioningError> {
-        // TODO: Query the node_pools keyspace for all stored records.
-        // let records = self.storage.load_all_node_pools()?;
-        // Ok(records)
+        let mut records = Vec::new();
 
-        // Placeholder: return empty list until storage query is wired.
-        Ok(Vec::new())
+        // prefix() with empty prefix scans the entire keyspace.
+        // Guard::value() moves the guard, so access it once.
+        for guard in self.storage.node_pools.prefix(Vec::<u8>::new()) {
+            let value = guard.value().map_err(|e| {
+                ProvisioningError::Storage(crate::storage::StorageError::Storage(e))
+            })?;
+
+            if let Ok(record) = postcard::from_bytes::<NodePoolRecord>(value.as_ref()) {
+                records.push(record);
+            } else {
+                tracing::warn!("skipping malformed node pool record");
+            }
+        }
+
+        Ok(records)
     }
 
-    /// Store a node pool record in fjall.
-    #[allow(dead_code)]
-    fn store_pool(&self, record: &NodePoolRecord) -> Result<(), ProvisioningError> {
-        // TODO: Serialize and store in the node_pools keyspace.
-        // let key = record.pool_id.as_bytes();
-        // let value = postcard::to_allocvec(record)?;
-        // self.storage.store_node_pool(key, &value)?;
+    /// Store a node pool record in the `node_pools` keyspace.
+    ///
+    /// Key: `pool_id` bytes. Value: postcard-serialized `NodePoolRecord`.
+    pub fn store_pool(&self, record: &NodePoolRecord) -> Result<(), ProvisioningError> {
+        let serialized = postcard::to_allocvec(record).map_err(ProvisioningError::Serialization)?;
+
+        self.storage
+            .node_pools
+            .insert(record.pool_id.as_bytes(), serialized.as_slice())
+            .map_err(|e| ProvisioningError::Storage(crate::storage::StorageError::Storage(e)))?;
 
         tracing::info!(pool_id = %record.pool_id, "node pool stored");
         Ok(())
     }
 
-    /// Delete a node pool record from fjall.
-    #[allow(dead_code)]
-    fn delete_pool(&self, pool_id: &str) -> Result<(), ProvisioningError> {
-        // TODO: Delete from the node_pools keyspace.
-        // self.storage.delete_node_pool(pool_id)?;
+    /// Delete a node pool record from the `node_pools` keyspace.
+    pub fn delete_pool(&self, pool_id: &str) -> Result<(), ProvisioningError> {
+        self.storage
+            .node_pools
+            .remove(pool_id.as_bytes())
+            .map_err(|e| ProvisioningError::Storage(crate::storage::StorageError::Storage(e)))?;
 
         tracing::info!(pool_id = %pool_id, "node pool deleted");
         Ok(())

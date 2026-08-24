@@ -11,32 +11,39 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use super::snapshot::FjallSnapshotBuilder;
+use super::{FleetosCommand, FleetosRaftConfig, FleetosResponse, records};
+use crate::delegation::DelegationRecord;
+use crate::storage::version::{ChangeKind, VersionedState};
+use crate::storage::{Keyspaces, schema};
+use crate::watch::broadcast::{BroadcastHub, SagUpdateEvent, ScheduleUpdateEvent, WatchEvent};
 use fjall::Database;
+use fleetos_core::spiffe::SpiffeId;
 use openraft::storage::RaftStateMachine;
 use openraft::{
     BasicNode, Entry, EntryPayload, LogId, RaftLogId, Snapshot, SnapshotMeta, StorageError,
     StorageIOError, StoredMembership,
 };
 
-use super::snapshot::FjallSnapshotBuilder;
-use super::{FleetosCommand, FleetosRaftConfig, FleetosResponse, records};
-use crate::delegation::DelegationRecord;
-use crate::storage::version::{ChangeKind, VersionedState};
-use crate::storage::{Keyspaces, schema};
-use fleetos_core::spiffe::SpiffeId;
-
 pub struct FjallStateMachine {
     db: Arc<Database>,
     keyspaces: Keyspaces,
     versioned_state: VersionedState,
+    broadcast_hub: Arc<BroadcastHub>,
 }
 
 impl FjallStateMachine {
-    pub fn new(db: Arc<Database>, keyspaces: Keyspaces, versioned_state: VersionedState) -> Self {
+    pub fn new(
+        db: Arc<Database>,
+        keyspaces: Keyspaces,
+        versioned_state: VersionedState,
+        broadcast_hub: Arc<BroadcastHub>,
+    ) -> Self {
         Self {
             db,
             keyspaces,
             versioned_state,
+            broadcast_hub,
         }
     }
 
@@ -332,6 +339,103 @@ impl FjallStateMachine {
             }
         }
     }
+
+    /// Publish events to the BroadcastHub based on the ChangeKind.
+    /// Called after each entry is committed so watch streams receive data.
+    fn publish_event(&self, version: fleetos_core::MonotonicVersion, change_kind: &ChangeKind) {
+        match change_kind {
+            ChangeKind::SagUpdate | ChangeKind::RevokedDelegations => {
+                self.publish_sag_update(version);
+            }
+            ChangeKind::SecretRotation => {
+                // For secret rotations, publish a generic notification.
+                // The WatchService streams SecretRotationNotification events.
+                // We publish with an empty spiffe_id as a signal to refetch.
+                // TODO: Pass the actual spiffe_id through the command for targeted notifications.
+                self.broadcast_hub
+                    .publish_watch_event(WatchEvent::SecretRotationNotification {
+                        spiffe_id: String::new(),
+                        version,
+                    });
+            }
+            ChangeKind::SchedulingUpdate => {
+                self.publish_schedule_update(version);
+            }
+            // ClusterMembership, TrustBundleRotation, DummyIpUpdate don't have
+            // dedicated watch streams in the current proto schema.
+            _ => {}
+        }
+    }
+
+    /// Read all SAG rules and revoked delegation IDs from keyspaces,
+    /// then publish a SagUpdateEvent to the BroadcastHub.
+    fn publish_sag_update(&self, version: fleetos_core::MonotonicVersion) {
+        // Read all SAG rules from the sag_rules keyspace.
+        // Each value is a stored rule_bytes from SagRuleRecord.
+        // We construct the length-prefixed proto format expected by decode_rules().
+        let mut rules_bytes = Vec::new();
+        for guard in self.keyspaces.sag_rules.prefix(Vec::<u8>::new()) {
+            let value = match guard.value() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let rule_bytes = value.as_ref();
+            rules_bytes.extend_from_slice(&(rule_bytes.len() as u32).to_le_bytes());
+            rules_bytes.extend_from_slice(rule_bytes);
+        }
+
+        // Read all revoked delegation IDs.
+        let mut revoked_ids: Vec<Vec<u8>> = Vec::new();
+        for guard in self.keyspaces.revoked_delegations.prefix(Vec::<u8>::new()) {
+            let value = match guard.value() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Ok(record) = postcard::from_bytes::<DelegationRecord>(value.as_ref()) {
+                revoked_ids.push(record.delegation_id.into_bytes());
+            }
+        }
+
+        self.broadcast_hub.publish_sag_update(SagUpdateEvent {
+            version,
+            rules_bytes,
+            revoked_delegation_ids: revoked_ids,
+        });
+    }
+
+    /// Read all placements from keyspaces and publish a ScheduleUpdateEvent.
+    fn publish_schedule_update(&self, version: fleetos_core::MonotonicVersion) {
+        // Read all placements and construct WorkloadAssignmentRecords.
+        let mut assignments_bytes = Vec::new();
+        let mut records: Vec<crate::watch::scheduler_stream::WorkloadAssignmentRecord> = Vec::new();
+
+        for guard in self.keyspaces.placements.prefix(Vec::<u8>::new()) {
+            let value = match guard.value() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Ok(placement) =
+                postcard::from_bytes::<crate::scheduler::Placement>(value.as_ref())
+            {
+                records.push(crate::watch::scheduler_stream::WorkloadAssignmentRecord {
+                    workload_id: placement.pod_id,
+                    runtime: String::new(), // TODO: Read from workload spec
+                    image: String::new(),   // TODO: Read from workload spec
+                    role: placement.role,
+                });
+            }
+        }
+
+        if let Ok(serialized) = postcard::to_allocvec(&records) {
+            assignments_bytes = serialized;
+        }
+
+        self.broadcast_hub
+            .publish_schedule_update(ScheduleUpdateEvent {
+                version,
+                assignments_bytes,
+            });
+    }
 }
 
 // --- error helpers ---
@@ -451,6 +555,10 @@ impl RaftStateMachine<FleetosRaftConfig> for FjallStateMachine {
 
             // Commit this entry's mutations atomically.
             batch.commit().map_err(commit_err)?;
+
+            // Publish to BroadcastHub so watch streams receive data.
+            // Must happen BEFORE notify_version, which consumes change_kind.
+            self.publish_event(new_version, &change_kind);
 
             // Notify only after a successful commit so subscribers see durable state.
             self.versioned_state

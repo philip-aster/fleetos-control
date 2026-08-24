@@ -88,4 +88,8 @@ raft = "10.0.1.1:9445"
 # -----------------------------------------------------------------------------
 # Provisioning
 # -----------------------------------------------------------------------------
+[provisioning]
+# gRPC endpoint of the cloud provider shim.
+# Empty string means provisioning is disabled.
+endpoint = ""
 provision_poll_interval_secs = 30

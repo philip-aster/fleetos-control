@@ -17,6 +17,7 @@ pub struct StorageEngine {
     pub dummy_ips: Keyspace,
     pub secrets: Keyspace,
     pub sags: Keyspace,
+    pub node_pools: Keyspace,
 }
 
 impl StorageEngine {
@@ -33,6 +34,7 @@ impl StorageEngine {
         dummy_ips: Keyspace,
         secrets: Keyspace,
         sags: Keyspace,
+        node_pools: Keyspace,
     ) -> Self {
         Self {
             raft_log,
@@ -47,6 +49,7 @@ impl StorageEngine {
             dummy_ips,
             secrets,
             sags,
+            node_pools,
         }
     }
 
@@ -80,6 +83,48 @@ impl StorageEngine {
             Some(bytes) => Ok(Some(bytes.to_vec())),
             None => Ok(None),
         }
+    }
+
+    /// Load all stored workload spec records.
+    pub fn list_workloads(
+        &self,
+    ) -> Result<Vec<crate::raft::records::WorkloadSpecRecord>, crate::storage::StorageError> {
+        let mut records = Vec::new();
+        for guard in self.workloads.prefix(Vec::<u8>::new()) {
+            let value = guard
+                .value()
+                .map_err(crate::storage::StorageError::Storage)?;
+            // Skip cron workloads (they have "cron:" prefix).
+            if let Ok(record) =
+                postcard::from_bytes::<crate::raft::records::WorkloadSpecRecord>(value.as_ref())
+            {
+                // Only include non-cron workloads. Cron workloads have keys starting with "cron:".
+                // Since we can't easily check the key here, we rely on the fact that
+                // WorkloadSpecRecord and CronWorkloadRecord have different structures.
+                // If deserialization as WorkloadSpecRecord succeeds, it's a regular workload.
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Load all stored cron workload records.
+    pub fn list_cron_workloads(
+        &self,
+    ) -> Result<Vec<crate::raft::records::CronWorkloadRecord>, crate::storage::StorageError> {
+        let mut records = Vec::new();
+        // Cron workloads are stored with "cron:" prefix.
+        for guard in self.workloads.prefix(b"cron:".as_slice()) {
+            let value = guard
+                .value()
+                .map_err(crate::storage::StorageError::Storage)?;
+            if let Ok(record) =
+                postcard::from_bytes::<crate::raft::records::CronWorkloadRecord>(value.as_ref())
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     // --- Node persistence ---
@@ -209,5 +254,63 @@ impl StorageEngine {
             "placement for {}:{}:{}:{}",
             tenant_id, workload_id, role, ordinal
         )))
+    }
+
+    // --- Node pool persistence ---
+
+    /// Store a node pool record.
+    pub fn store_node_pool(
+        &self,
+        record: &crate::provisioning::NodePoolRecord,
+    ) -> Result<(), crate::storage::StorageError> {
+        let serialized =
+            postcard::to_allocvec(record).map_err(crate::storage::StorageError::Serialization)?;
+        self.node_pools
+            .insert(record.pool_id.as_bytes(), serialized.as_slice())
+            .map_err(crate::storage::StorageError::Storage)
+    }
+
+    /// Get a node pool record by pool_id.
+    pub fn get_node_pool(
+        &self,
+        pool_id: &str,
+    ) -> Result<Option<crate::provisioning::NodePoolRecord>, crate::storage::StorageError> {
+        match self
+            .node_pools
+            .get(pool_id.as_bytes())
+            .map_err(crate::storage::StorageError::Storage)?
+        {
+            Some(bytes) => {
+                let record: crate::provisioning::NodePoolRecord = postcard::from_bytes(&bytes)
+                    .map_err(crate::storage::StorageError::Serialization)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a node pool record.
+    pub fn delete_node_pool(&self, pool_id: &str) -> Result<(), crate::storage::StorageError> {
+        self.node_pools
+            .remove(pool_id.as_bytes())
+            .map_err(crate::storage::StorageError::Storage)
+    }
+
+    /// Load all node pool records.
+    pub fn list_node_pools(
+        &self,
+    ) -> Result<Vec<crate::provisioning::NodePoolRecord>, crate::storage::StorageError> {
+        let mut records = Vec::new();
+        for guard in self.node_pools.prefix(Vec::<u8>::new()) {
+            let value = guard
+                .value()
+                .map_err(crate::storage::StorageError::Storage)?;
+            if let Ok(record) =
+                postcard::from_bytes::<crate::provisioning::NodePoolRecord>(value.as_ref())
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 }

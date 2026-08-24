@@ -21,15 +21,15 @@ use tonic::{Request, Response, Status};
 /// The SecretService gRPC implementation.
 pub struct SecretServiceImpl {
     secret_store: Arc<SecretStore>,
-    /// Tracks the next sequence number per (spiffe_id, svid_version) pair
-    /// for replay protection. Monotonically increasing per recipient.
+    svids_keyspace: fjall::Keyspace, // NEW
     sequence_tracker: Arc<RwLock<HashMap<(String, u64), u64>>>,
 }
 
 impl SecretServiceImpl {
-    pub fn new(secret_store: Arc<SecretStore>) -> Self {
+    pub fn new(secret_store: Arc<SecretStore>, svids_keyspace: fjall::Keyspace) -> Self {
         Self {
             secret_store,
+            svids_keyspace,
             sequence_tracker: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -118,15 +118,23 @@ impl SecretServiceImpl {
     ///
     /// The agent registers its X25519 pubkey during the attestation/join flow.
     /// This is stored in the svids keyspace keyed by the agent's SpiffeId string.
-    ///
-    /// TODO: Wire to actual svids keyspace lookup once the registration flow
-    /// stores X25519 pubkeys. For now, returns an error indicating the key
-    /// is not yet registered.
-    fn lookup_x25519_pubkey(&self, _spiffe_id: &SpiffeId) -> Result<RecipientX25519Pubkey, String> {
-        // TODO: Query the svids keyspace for the X25519 pubkey registered
-        // during attestation. The key format is:
-        //   key: spiffe_id.to_string()
-        //   value: postcard-serialized [u8; 32] X25519 public key
-        Err("X25519 pubkey registration not yet wired".to_owned())
+    fn lookup_x25519_pubkey(&self, spiffe_id: &SpiffeId) -> Result<RecipientX25519Pubkey, String> {
+        let key = spiffe_id.to_string();
+        let bytes = self
+            .svids_keyspace
+            .get(key.as_bytes())
+            .map_err(|e| format!("storage error: {}", e))?
+            .ok_or_else(|| format!("X25519 pubkey not registered for {}", spiffe_id))?;
+
+        if bytes.len() != 32 {
+            return Err(format!(
+                "invalid X25519 pubkey length: expected 32, got {}",
+                bytes.len()
+            ));
+        }
+
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(bytes.as_ref());
+        Ok(RecipientX25519Pubkey(pubkey))
     }
 }

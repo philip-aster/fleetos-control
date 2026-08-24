@@ -19,6 +19,7 @@ use fleetos_control::controllers::{
 };
 use fleetos_control::delegation::revocation::DelegationRevocationStore;
 use fleetos_control::dummy_ip::allocator::DummyIpAllocator;
+use fleetos_control::provisioning::control_pool::ControlPoolManager;
 use fleetos_control::raft::state_machine::FjallStateMachine;
 use fleetos_control::raft::store::FjallLogStorage;
 use fleetos_control::raft::{RaftHandle, network::TonicRaftNetworkFactory};
@@ -124,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyspaces.dummy_ips.clone(),
         keyspaces.secrets.clone(),
         keyspaces.sag_rules.clone(),
+        keyspaces.node_pools.clone(),
     ));
 
     let workload_controller = Arc::new(WorkloadController::new(
@@ -151,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db.clone(),
         keyspaces.clone(),
         versioned_state.clone(),
+        broadcast_hub.clone(),
     )
     .await?;
 
@@ -160,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pod_controller: pod_controller.clone(),
         node_controller: node_controller.clone(),
         cron_controller: cron_controller.clone(),
+        storage_engine: storage_engine.clone(),
     });
 
     let leader_gate = LeaderGate::new(raft_handle.raft.as_ref().clone());
@@ -168,9 +172,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         leader_gate.run(controller_factory, shutdown_rx).await;
     });
 
-    // --- Phase 8: gRPC Servers ---
-    tracing::info!("setting up gRPC servers");
+    // --- Phase 8: Control Pool Manager (needs raft_handle from Phase 6) ---
+    let control_pool_manager = Arc::new(ControlPoolManager::new(
+        raft_handle.raft.clone(),
+        storage_engine.clone(),
+    ));
 
+    // --- Phase 9 (optional): Provisioning ---
+    // Only start provisioning if a provider endpoint is configured.
+    // This is leader-gated, so it only runs on the Raft leader.
+    let provisioning_config = fleetos_control::provisioning::ProvisioningConfig {
+        endpoint: config.provisioning.endpoint.clone(),
+        poll_interval_secs: config.provisioning.poll_interval_secs,
+    };
+
+    if provisioning_config.is_enabled() {
+        match fleetos_control::provisioning::reconcile::ProvisioningReconciler::new(
+            provisioning_config,
+            join_token_store.clone(),
+            control_pool_manager.clone(),
+            storage_engine.clone(),
+        )
+        .await
+        {
+            Ok(mut reconciler) => {
+                tokio::spawn(async move {
+                    reconciler.run_loop().await;
+                });
+                tracing::info!("provisioning reconciler started");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "provisioning not started (endpoint not configured or unreachable)");
+            }
+        }
+    } else {
+        tracing::info!("provisioning disabled (no endpoint configured)");
+    }
+
+    // --- Phase 10: gRPC Servers ---
     // Mint control plane SVIDs for both trust domains
     let dc_bundle = ca_service.data_control.read();
     let dc_params = fleetos_control::ca::rcgen_impl::SvidParams {
@@ -238,6 +277,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &admin_mtls,
     )?);
 
+    tracing::info!("setting up gRPC servers");
+
     // Initialize gRPC services
     let policy_service =
         fleetos_control::watch::policy_stream::PolicyServiceImpl::new(broadcast_hub.clone());
@@ -245,12 +286,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fleetos_control::watch::watch_service::WatchServiceImpl::new(broadcast_hub.clone());
     let scheduler_service =
         fleetos_control::watch::scheduler_stream::SchedulerServiceImpl::new(broadcast_hub.clone());
+    let secret_service = fleetos_control::watch::secret_service::SecretServiceImpl::new(
+        secret_store.clone(),
+        keyspaces.svids.clone(),
+    );
     let router_service =
         fleetos_control::watch::router_assignment::RouterAssignmentServiceImpl::new(
             broadcast_hub.clone(),
         );
-    let secret_service =
-        fleetos_control::watch::secret_service::SecretServiceImpl::new(secret_store.clone());
 
     let admin_service = fleetos_control::admin::service::AdminServiceImpl::new(
         storage_engine.clone(),
@@ -523,6 +566,7 @@ async fn init_raft_cluster(
     db: Arc<fjall::Database>,
     keyspaces: fleetos_control::storage::Keyspaces,
     versioned_state: VersionedState,
+    broadcast_hub: Arc<BroadcastHub>,
 ) -> Result<(RaftHandle, watch::Sender<bool>), Box<dyn std::error::Error>> {
     let raft_config = Config {
         heartbeat_interval: 500,
@@ -541,7 +585,12 @@ async fn init_raft_cluster(
         keyspaces.raft_log.clone(),
         keyspaces.raft_log_meta.clone(),
     );
-    let state_machine = FjallStateMachine::new(db.clone(), keyspaces.clone(), versioned_state);
+    let state_machine = FjallStateMachine::new(
+        db.clone(),
+        keyspaces.clone(),
+        versioned_state,
+        broadcast_hub,
+    );
 
     // Create network factory
     let peer_addresses = match config.cluster.mode {
@@ -631,51 +680,110 @@ struct FleetosControllerFactory {
     pod_controller: Arc<PodController>,
     node_controller: Arc<NodeController>,
     cron_controller: Arc<CronController>,
+    storage_engine: Arc<fleetos_control::storage::StorageEngine>,
 }
 
 impl ControllerFactory for FleetosControllerFactory {
     fn start_controllers(&self, join_set: &mut tokio::task::JoinSet<()>) {
         tracing::info!("starting controllers (this node is leader)");
 
-        // Start workload controller reconciliation loop
+        // Workload controller: periodically re-reconcile all stored workloads.
         let wc = self.workload_controller.clone();
+        let se = self.storage_engine.clone();
         join_set.spawn(async move {
             tracing::info!("workload controller started");
-            // TODO: Implement actual reconciliation loop
-            // For now, just keep the task alive
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                let _ = &wc; // Use wc to suppress warning
+                interval.tick().await;
+                // Read all stored workloads and re-reconcile.
+                match se.list_workloads() {
+                    Ok(workloads) => {
+                        for record in workloads {
+                            match prost::Message::decode(record.spec_bytes.as_slice()) {
+                                Ok(spec) => {
+                                    if let Err(e) = wc.reconcile(&spec).await {
+                                        tracing::warn!(
+                                            workload_id = %record.workload_id,
+                                            error = %e,
+                                            "workload re-reconciliation failed"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        workload_id = %record.workload_id,
+                                        error = %e,
+                                        "failed to decode workload spec"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to list workloads");
+                    }
+                }
             }
         });
 
-        // Start pod controller
-        let pc = self.pod_controller.clone();
+        // Pod controller: placeholder loop until health-check mechanism is wired.
+        let _pc = self.pod_controller.clone();
         join_set.spawn(async move {
             tracing::info!("pod controller started");
+            // TODO: Wire to a health-check mechanism that detects dead pods
+            // and calls pc.reconcile_dead_pod() for each one.
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                let _ = &pc;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });
 
-        // Start node controller
-        let nc = self.node_controller.clone();
+        // Node controller: placeholder loop until heartbeat mechanism is wired.
+        let _nc = self.node_controller.clone();
         join_set.spawn(async move {
             tracing::info!("node controller started");
+            // TODO: Wire to a heartbeat/lease mechanism that detects dead nodes
+            // and calls nc.evict_node() for each one.
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                let _ = &nc;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });
 
-        // Start cron controller
+        // Cron controller: evaluate cron schedules and trigger when due.
         let cc = self.cron_controller.clone();
+        let se_cron = self.storage_engine.clone();
         join_set.spawn(async move {
             tracing::info!("cron controller started");
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                let _ = &cc;
+                interval.tick().await;
+                // Read all stored cron workloads and check schedules.
+                match se_cron.list_cron_workloads() {
+                    Ok(cron_workloads) => {
+                        for record in cron_workloads {
+                            match prost::Message::decode(record.spec_bytes.as_slice()) {
+                                Ok(cron) => {
+                                    if let Err(e) = cc.trigger(&cron).await {
+                                        tracing::warn!(
+                                            cron_id = %record.cron_workload_id,
+                                            error = %e,
+                                            "cron trigger failed"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        cron_id = %record.cron_workload_id,
+                                        error = %e,
+                                        "failed to decode cron workload spec"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to list cron workloads");
+                    }
+                }
             }
         });
     }

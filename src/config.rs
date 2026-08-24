@@ -43,6 +43,20 @@ pub struct ControlConfig {
     /// Cloud provisioning poll interval.
     #[serde(default = "default_provision_poll")]
     pub provision_poll_interval_secs: u64,
+
+    pub provisioning: ProvisioningConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvisioningConfig {
+    /// gRPC endpoint of the cloud provider shim.
+    /// Empty string means provisioning is disabled.
+    #[serde(default)]
+    pub endpoint: String,
+
+    /// Reconciliation interval in seconds.
+    #[serde(default = "default_provision_poll")]
+    pub poll_interval_secs: u64,
 }
 
 fn default_provision_poll() -> u64 {

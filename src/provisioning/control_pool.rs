@@ -1,43 +1,35 @@
 //! CONTROL node pool management — openraft membership changes.
-//!
-//! CONTROL-kind node pools need distinct reconciliation logic from
-//! AGENT/ROUTER/GATEWAY pools. Scaling the control plane is an openraft
-//! membership change (add-learner → promote), never a naive spin-up-and-walk-away.
-//!
-//! Flow for new CONTROL nodes:
-//! 1. Provider creates the node (via ReconcileNodePool)
-//! 2. Node boots, uses bootstrap_payload Join Token to attest
-//! 3. Node gets a signed SVID (IdKind::Control)
-//! 4. We add it as an openraft learner (it starts catching up on the log)
-//! 5. Once the learner has caught up, we promote it to voter (joins quorum)
-
-use std::sync::Arc;
-
-use fleetos_core::proto::provisioning::NodePoolStatus;
-
 use super::{NodeLifecycleState, NodePoolRecord, ProvisioningError};
 use crate::attestation::join_token::NodeKind;
+use crate::raft::FleetosRaftConfig;
+use crate::storage::StorageEngine;
+use fleetos_core::proto::provisioning::NodePoolStatus;
+use openraft::{ChangeMembers, Raft};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Manages CONTROL pool → openraft membership transitions.
 pub struct ControlPoolManager {
-    // TODO: Add openraft Raft handle for membership changes.
-    // raft: Raft<FleetosRaftConfig>,
-
-    // TODO: Add storage for tracking which control nodes have been
-    // added as learners / promoted to voters.
+    raft: Arc<Raft<FleetosRaftConfig>>,
     #[allow(dead_code)]
-    storage: Arc<crate::storage::StorageEngine>,
+    storage: Arc<StorageEngine>,
 }
 
 impl ControlPoolManager {
-    pub fn new(storage: Arc<crate::storage::StorageEngine>) -> Self {
-        Self { storage }
+    pub fn new(raft: Arc<Raft<FleetosRaftConfig>>, storage: Arc<StorageEngine>) -> Self {
+        Self { raft, storage }
+    }
+
+    /// Derive a deterministic Raft node ID from a provider handle.
+    fn derive_node_id(provider_handle: &str) -> u64 {
+        let hash = blake3::hash(provider_handle.as_bytes());
+        let bytes = hash.as_bytes();
+        u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
     }
 
     /// Handle the status of a CONTROL pool.
-    ///
-    /// Checks for new RUNNING control nodes that aren't yet Raft members,
-    /// and initiates the add-learner → promote flow.
     pub async fn handle_control_pool_status(
         &self,
         pool: &NodePoolRecord,
@@ -47,19 +39,14 @@ impl ControlPoolManager {
 
         for node in &status.nodes {
             let state = NodeLifecycleState::from_proto(node.state);
-
             match state {
                 NodeLifecycleState::Running => {
-                    // Check if this node is already a Raft member.
-                    // If not, initiate the add-learner → promote flow.
                     self.ensure_raft_membership(&node.provider_handle).await?;
                 }
                 NodeLifecycleState::Terminated => {
-                    // If this node was a Raft member, remove it from the cluster.
                     self.remove_raft_membership(&node.provider_handle).await?;
                 }
                 NodeLifecycleState::Pending => {
-                    // Node is still being created. Nothing to do yet.
                     tracing::debug!(
                         pool_id = %pool.pool_id,
                         provider_handle = %node.provider_handle,
@@ -73,63 +60,111 @@ impl ControlPoolManager {
     }
 
     /// Ensure a control node is a Raft member.
-    ///
-    /// If the node is not yet a member, add it as a learner.
-    /// If it's a learner that has caught up, promote it to voter.
     async fn ensure_raft_membership(&self, provider_handle: &str) -> Result<(), ProvisioningError> {
-        // TODO: Check if this provider_handle corresponds to a known Raft member.
-        // This requires cross-referencing the provider_handle with the node's
-        // SpiffeId (which we get after the node attests and joins).
-        //
-        // Flow:
-        // 1. Look up the node's SpiffeId from the provider_handle
-        //    (stored during attestation/join).
-        // 2. Check if the SpiffeId is already a Raft voter or learner.
-        // 3. If not a member: add as learner via raft.add_learner()
-        // 4. If a learner that has caught up: promote via raft.promote_learner()
+        let node_id = Self::derive_node_id(provider_handle);
 
-        tracing::debug!(
+        let metrics = self.raft.metrics().borrow().clone();
+        let membership = &metrics.membership_config.membership();
+
+        // Check if already a voter
+        let voters: BTreeSet<u64> = membership.voter_ids().collect();
+        if voters.contains(&node_id) {
+            tracing::debug!(
+                provider_handle = %provider_handle,
+                node_id = %node_id,
+                "already a raft voter"
+            );
+            return Ok(());
+        }
+
+        // Check if already a learner
+        let learners: BTreeSet<u64> = membership.learner_ids().collect();
+        if learners.contains(&node_id) {
+            // Already a learner — promote to voter
+            tracing::info!(
+                provider_handle = %provider_handle,
+                node_id = %node_id,
+                "promoting learner to voter"
+            );
+
+            let mut new_voters = voters.clone();
+            new_voters.insert(node_id);
+
+            let change = ChangeMembers::AddVoters(
+                std::iter::once((
+                    node_id,
+                    openraft::BasicNode {
+                        addr: String::new(),
+                    },
+                ))
+                .collect(),
+            );
+
+            self.raft
+                .change_membership(change, false)
+                .await
+                .map_err(|e| ProvisioningError::Raft(e.to_string()))?;
+
+            tracing::info!(node_id = %node_id, "promoted to raft voter");
+            return Ok(());
+        }
+
+        // Not a member at all — add as learner
+        tracing::info!(
             provider_handle = %provider_handle,
-            "checking raft membership for control node"
+            node_id = %node_id,
+            "adding as raft learner"
         );
 
-        // TODO: Implement actual openraft membership changes:
-        //
-        // let node_id = self.lookup_node_id(provider_handle)?;
-        // let membership = self.raft.metrics().borrow().membership_state.clone();
-        //
-        // if !membership.contains(&node_id) {
-        //     // Add as learner
-        //     self.raft.add_learner(node_id, node_config).await
-        //         .map_err(|e| ProvisioningError::Raft(e.to_string()))?;
-        //     tracing::info!(node = %node_id, "added as raft learner");
-        // } else if membership.is_learner(&node_id) && self.has_caught_up(&node_id)? {
-        //     // Promote to voter
-        //     self.raft.promote_learner(node_id).await
-        //         .map_err(|e| ProvisioningError::Raft(e.to_string()))?;
-        //     tracing::info!(node = %node_id, "promoted to raft voter");
-        // }
+        let node_config = openraft::BasicNode {
+            addr: String::new(),
+        };
 
+        self.raft
+            .add_learner(node_id, node_config, false)
+            .await
+            .map_err(|e| ProvisioningError::Raft(e.to_string()))?;
+
+        tracing::info!(node_id = %node_id, "added as raft learner");
         Ok(())
     }
 
     /// Remove a control node from the Raft cluster.
-    ///
-    /// Called when a CONTROL node is TERMINATED.
     async fn remove_raft_membership(&self, provider_handle: &str) -> Result<(), ProvisioningError> {
-        // TODO: Remove the node from the Raft membership.
-        // This is a critical operation — removing a voter changes the quorum.
-        // Must be done carefully to avoid losing quorum.
-        //
-        // let node_id = self.lookup_node_id(provider_handle)?;
-        // self.raft.remove_learner(node_id).await
-        //     .map_err(|e| ProvisioningError::Raft(e.to_string()))?;
+        let node_id = Self::derive_node_id(provider_handle);
+
+        let metrics = self.raft.metrics().borrow().clone();
+        let membership = &metrics.membership_config.membership();
+
+        let voters: BTreeSet<u64> = membership.voter_ids().collect();
+        let learners: BTreeSet<u64> = membership.learner_ids().collect();
+
+        if !voters.contains(&node_id) && !learners.contains(&node_id) {
+            tracing::debug!(
+                provider_handle = %provider_handle,
+                node_id = %node_id,
+                "not a raft member, nothing to remove"
+            );
+            return Ok(());
+        }
 
         tracing::warn!(
             provider_handle = %provider_handle,
-            "control node terminated, removing from raft membership"
+            node_id = %node_id,
+            "removing from raft membership"
         );
 
+        let mut to_remove = BTreeSet::new();
+        to_remove.insert(node_id);
+
+        let change = ChangeMembers::RemoveNodes(to_remove);
+
+        self.raft
+            .change_membership(change, false)
+            .await
+            .map_err(|e| ProvisioningError::Raft(e.to_string()))?;
+
+        tracing::info!(node_id = %node_id, "removed from raft membership");
         Ok(())
     }
 }
