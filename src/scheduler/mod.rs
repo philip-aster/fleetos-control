@@ -153,6 +153,47 @@ pub struct ClusterState {
 }
 
 impl ClusterState {
+    /// Build the scheduler's view from replicated node records and placements.
+    ///
+    /// Available resources per node are derived by subtracting the node's current
+    /// placements from its reported capacity. Records whose `node_id` is not a
+    /// valid SpiffeId are skipped. A node is schedulable only if it is marked
+    /// schedulable AND its status is Active (cordoned/evicted nodes are excluded).
+    pub fn build(
+        node_records: &[crate::raft::records::NodeRecord],
+        placements: Vec<Placement>,
+    ) -> Self {
+        let mut nodes = Vec::new();
+        for record in node_records {
+            let Ok(node_id) = record.node_id.parse::<SpiffeId>() else {
+                tracing::warn!(node_id = %record.node_id, "skipping node record with unparseable SpiffeId");
+                continue;
+            };
+            let capacity = ResourceSpec {
+                cpu_millicores: record.capacity_cpu_millicores,
+                memory_bytes: record.capacity_memory_bytes,
+            };
+            let mut used = ResourceSpec::zero();
+            let mut pod_count = 0u32;
+            for placement in &placements {
+                if placement.node_id == node_id {
+                    used = used.add(&placement.resources);
+                    pod_count += 1;
+                }
+            }
+            nodes.push(NodeInfo {
+                node_id,
+                capacity,
+                available: capacity.subtract(&used),
+                failure_domain: record.failure_domain.clone(),
+                schedulable: record.schedulable
+                    && record.status == crate::raft::records::NodeStatus::Active,
+                pod_count,
+            });
+        }
+        Self { nodes, placements }
+    }
+
     /// Get all placements for a specific service.
     pub fn placements_for_service(&self, service: &str) -> Vec<&Placement> {
         self.placements

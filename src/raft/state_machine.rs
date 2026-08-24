@@ -149,6 +149,11 @@ impl FjallStateMachine {
                         schedulable: *schedulable,
                         last_heartbeat: 0,
                         registered_at: 0,
+                        // Zero capacity is fail-closed: a node with no reported capacity
+                        // cannot be scheduled onto until it registers with real values.
+                        capacity_cpu_millicores: 0,
+                        capacity_memory_bytes: 0,
+                        failure_domain: String::new(),
                     },
                 };
                 let value = postcard::to_allocvec(&record).map_err(ser_err)?;
@@ -179,6 +184,9 @@ impl FjallStateMachine {
                         schedulable: false,
                         last_heartbeat: 0,
                         registered_at: 0,
+                        capacity_cpu_millicores: 0,
+                        capacity_memory_bytes: 0,
+                        failure_domain: String::new(),
                     },
                 };
                 let value = postcard::to_allocvec(&record).map_err(ser_err)?;

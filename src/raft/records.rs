@@ -26,6 +26,12 @@ pub struct NodeRecord {
     pub schedulable: bool,
     pub last_heartbeat: i64,
     pub registered_at: i64,
+    /// Total CPU capacity in millicores. Reported by the agent on registration/heartbeat.
+    pub capacity_cpu_millicores: u64,
+    /// Total memory capacity in bytes. Reported by the agent on registration/heartbeat.
+    pub capacity_memory_bytes: u64,
+    /// Failure domain / availability zone for topology spread and anti-affinity.
+    pub failure_domain: String,
 }
 
 /// A tenant namespace record.

@@ -181,15 +181,15 @@ impl WorkloadController {
 
     /// Build a ClusterState snapshot from storage.
     fn build_cluster_state(&self) -> Result<ClusterState, ControllerError> {
-        let nodes = self
+        let node_records = self
             .storage
-            .list_nodes()
+            .list_node_records()
             .map_err(ControllerError::Storage)?;
         let placements = self
             .storage
             .list_placements()
             .map_err(ControllerError::Storage)?;
-        Ok(ClusterState { nodes, placements })
+        Ok(ClusterState::build(&node_records, placements))
     }
 
     /// Build a PodSpec from a WorkloadSpec template, overwriting the six trusted fields.

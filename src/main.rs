@@ -113,11 +113,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Phase 5: Controllers ---
     let storage_engine = Arc::new(fleetos_control::storage::StorageEngine::new(
+        keyspaces.version.clone(),
         keyspaces.raft_log.clone(),
         keyspaces.raft_log_meta.clone(),
+        keyspaces.raft_state.clone(),
+        keyspaces.raft_snapshot.clone(),
         keyspaces.nodes.clone(),
+        keyspaces.svids.clone(),
         keyspaces.placements.clone(),
+        keyspaces.tenants.clone(),
+        keyspaces.ordinals.clone(),
         keyspaces.workloads.clone(),
+        keyspaces.router_assignments.clone(),
         keyspaces.active_delegations.clone(),
         keyspaces.revoked_delegations.clone(),
         keyspaces.join_tokens.clone(),

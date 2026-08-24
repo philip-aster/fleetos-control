@@ -1,15 +1,27 @@
 //! Unified storage engine interface.
-use crate::scheduler::{NodeInfo, Placement};
+use crate::raft::records::{NodeRecord, TenantRecord};
+use crate::scheduler::Placement;
 use fjall::Keyspace;
 use fleetos_core::spiffe::SpiffeId;
 
 /// Unified storage engine providing access to all keyspaces.
+///
+/// Holds all 20 keyspaces created by `storage::init_keyspaces`. Read paths used
+/// by services and controllers live here; replicated write paths live in the
+/// Raft state machine.
 pub struct StorageEngine {
+    pub version: Keyspace,
     pub raft_log: Keyspace,
     pub raft_log_meta: Keyspace,
+    pub raft_state: Keyspace,
+    pub raft_snapshot: Keyspace,
     pub nodes: Keyspace,
+    pub svids: Keyspace,
     pub placements: Keyspace,
+    pub tenants: Keyspace,
+    pub ordinals: Keyspace,
     pub workloads: Keyspace,
+    pub router_assignments: Keyspace,
     pub delegations: Keyspace,
     pub delegations_revoked: Keyspace,
     pub join_tokens: Keyspace,
@@ -21,12 +33,20 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        version: Keyspace,
         raft_log: Keyspace,
         raft_log_meta: Keyspace,
+        raft_state: Keyspace,
+        raft_snapshot: Keyspace,
         nodes: Keyspace,
+        svids: Keyspace,
         placements: Keyspace,
+        tenants: Keyspace,
+        ordinals: Keyspace,
         workloads: Keyspace,
+        router_assignments: Keyspace,
         delegations: Keyspace,
         delegations_revoked: Keyspace,
         join_tokens: Keyspace,
@@ -37,11 +57,18 @@ impl StorageEngine {
         node_pools: Keyspace,
     ) -> Self {
         Self {
+            version,
             raft_log,
             raft_log_meta,
+            raft_state,
+            raft_snapshot,
             nodes,
+            svids,
             placements,
+            tenants,
+            ordinals,
             workloads,
+            router_assignments,
             delegations,
             delegations_revoked,
             join_tokens,
@@ -51,6 +78,50 @@ impl StorageEngine {
             sags,
             node_pools,
         }
+    }
+
+    // --- Tenant persistence ---
+
+    /// Store a tenant record.
+    pub fn store_tenant(&self, record: &TenantRecord) -> Result<(), crate::storage::StorageError> {
+        let serialized =
+            postcard::to_allocvec(record).map_err(crate::storage::StorageError::Serialization)?;
+        self.tenants
+            .insert(record.tenant_id.as_bytes(), serialized.as_slice())
+            .map_err(crate::storage::StorageError::Storage)
+    }
+
+    /// Get a tenant record by ID.
+    pub fn get_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<TenantRecord>, crate::storage::StorageError> {
+        match self
+            .tenants
+            .get(tenant_id.as_bytes())
+            .map_err(crate::storage::StorageError::Storage)?
+        {
+            Some(bytes) => {
+                let record: TenantRecord = postcard::from_bytes(&bytes)
+                    .map_err(crate::storage::StorageError::Serialization)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List all tenant records.
+    pub fn list_tenants(&self) -> Result<Vec<TenantRecord>, crate::storage::StorageError> {
+        let mut records = Vec::new();
+        for guard in self.tenants.prefix(Vec::<u8>::new()) {
+            let value = guard
+                .value()
+                .map_err(crate::storage::StorageError::Storage)?;
+            if let Ok(record) = postcard::from_bytes::<TenantRecord>(value.as_ref()) {
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     // --- Workload persistence ---
@@ -85,7 +156,7 @@ impl StorageEngine {
         }
     }
 
-    /// Load all stored workload spec records.
+    /// Load all stored workload spec records (excludes cron workloads).
     pub fn list_workloads(
         &self,
     ) -> Result<Vec<crate::raft::records::WorkloadSpecRecord>, crate::storage::StorageError> {
@@ -94,14 +165,9 @@ impl StorageEngine {
             let value = guard
                 .value()
                 .map_err(crate::storage::StorageError::Storage)?;
-            // Skip cron workloads (they have "cron:" prefix).
             if let Ok(record) =
                 postcard::from_bytes::<crate::raft::records::WorkloadSpecRecord>(value.as_ref())
             {
-                // Only include non-cron workloads. Cron workloads have keys starting with "cron:".
-                // Since we can't easily check the key here, we rely on the fact that
-                // WorkloadSpecRecord and CronWorkloadRecord have different structures.
-                // If deserialization as WorkloadSpecRecord succeeds, it's a regular workload.
                 records.push(record);
             }
         }
@@ -113,7 +179,6 @@ impl StorageEngine {
         &self,
     ) -> Result<Vec<crate::raft::records::CronWorkloadRecord>, crate::storage::StorageError> {
         let mut records = Vec::new();
-        // Cron workloads are stored with "cron:" prefix.
         for guard in self.workloads.prefix(b"cron:".as_slice()) {
             let value = guard
                 .value()
@@ -129,7 +194,7 @@ impl StorageEngine {
 
     // --- Node persistence ---
 
-    /// Store a node record (serialized NodeInfo).
+    /// Store a serialized node record.
     pub fn store_node(
         &self,
         node_id: &str,
@@ -147,18 +212,21 @@ impl StorageEngine {
             .map_err(crate::storage::StorageError::Storage)
     }
 
-    /// Load all nodes from storage.
-    pub fn list_nodes(&self) -> Result<Vec<NodeInfo>, crate::storage::StorageError> {
-        let mut nodes = Vec::new();
+    /// Load all node records from storage.
+    ///
+    /// Returns `NodeRecord` (the replicated record type). Use
+    /// `ClusterState::build()` to derive the scheduler's `NodeInfo` view.
+    pub fn list_node_records(&self) -> Result<Vec<NodeRecord>, crate::storage::StorageError> {
+        let mut records = Vec::new();
         for guard in self.nodes.prefix(Vec::<u8>::new()) {
             let value = guard
                 .value()
                 .map_err(crate::storage::StorageError::Storage)?;
-            if let Ok(node) = postcard::from_bytes::<NodeInfo>(value.as_ref()) {
-                nodes.push(node);
+            if let Ok(record) = postcard::from_bytes::<NodeRecord>(value.as_ref()) {
+                records.push(record);
             }
         }
-        Ok(nodes)
+        Ok(records)
     }
 
     // --- Placement persistence ---
@@ -233,7 +301,6 @@ impl StorageEngine {
         ordinal: u32,
         new_pod_id: &str,
     ) -> Result<(), crate::storage::StorageError> {
-        // Find the placement matching the ordinal slot
         let all = self.list_placements()?;
         for placement in &all {
             if placement.tenant_id == tenant_id
@@ -241,7 +308,6 @@ impl StorageEngine {
                 && placement.role == role
                 && placement.ordinal == ordinal
             {
-                // Remove old entry, insert with new pod_id
                 self.placements
                     .remove(placement.pod_id.as_bytes())
                     .map_err(crate::storage::StorageError::Storage)?;
