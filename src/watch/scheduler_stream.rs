@@ -2,17 +2,23 @@
 //!
 //! Streams workload assignments to agents. Each WorkloadAssignment carries
 //! workload_id, runtime, image, and role.
-
+use super::broadcast::BroadcastHub;
+use fleetos_core::proto::state::SchedulerService;
+use fleetos_core::proto::state::{ScheduleUpdate, WatchRequest, WorkloadAssignment};
 use std::pin::Pin;
 use std::sync::Arc;
-
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use fleetos_core::proto::state::SchedulerService;
-use fleetos_core::proto::state::{ScheduleUpdate, WatchRequest, WorkloadAssignment};
-
-use super::broadcast::BroadcastHub;
+/// Internal representation of a workload assignment, serialized into
+/// `ScheduleUpdateEvent.assignments_bytes` by the state machine.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkloadAssignmentRecord {
+    pub workload_id: String,
+    pub runtime: String,
+    pub image: String,
+    pub role: String,
+}
 
 /// The SchedulerService gRPC implementation.
 pub struct SchedulerServiceImpl {
@@ -35,13 +41,10 @@ impl SchedulerService for SchedulerServiceImpl {
         _request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchScheduleStream>, Status> {
         let mut rx = self.hub.subscribe_schedule();
-
         let stream = async_stream::stream! {
             loop {
                 match rx.recv().await {
                     Ok(update) => {
-                        // Deserialize assignments from internal format.
-                        // TODO: Implement proper deserialization to proto WorkloadAssignment.
                         let assignments = match deserialize_assignments(&update.assignments_bytes) {
                             Ok(a) => a,
                             Err(e) => {
@@ -49,7 +52,6 @@ impl SchedulerService for SchedulerServiceImpl {
                                 continue;
                             }
                         };
-
                         let schedule_update = ScheduleUpdate {
                             version: update.version.get(),
                             assignments,
@@ -66,22 +68,24 @@ impl SchedulerService for SchedulerServiceImpl {
                 }
             }
         };
-
         Ok(Response::new(Box::pin(stream)))
     }
 }
 
-/// Deserialize workload assignments from internal format to proto messages.
-///
-/// TODO: Implement proper conversion from internal PodSpec representation
-/// to proto WorkloadAssignment messages.
+/// Deserialize workload assignments from internal postcard format to proto messages.
 fn deserialize_assignments(bytes: &[u8]) -> Result<Vec<WorkloadAssignment>, super::WatchError> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-
-    // TODO: Proper conversion from internal scheduling state to proto WorkloadAssignment.
-    // Each WorkloadAssignment has: workload_id, runtime, image, role.
-    let _ = bytes;
-    Ok(Vec::new())
+    let records: Vec<WorkloadAssignmentRecord> =
+        postcard::from_bytes(bytes).map_err(super::WatchError::Serialization)?;
+    Ok(records
+        .into_iter()
+        .map(|r| WorkloadAssignment {
+            workload_id: r.workload_id,
+            runtime: r.runtime,
+            image: r.image,
+            role: r.role,
+        })
+        .collect())
 }
