@@ -30,3 +30,5 @@ pub const PCR_POLICY_KEYSPACE: &str = "app_pcr_policies";
 pub const ROUTER_ASSIGNMENT_KEYSPACE: &str = "app_router_assignments";
 
 pub const NODE_POOL_KEYSPACE: &str = "node_pools";
+
+pub const TRUST_BUNDLE_KEYSPACE: &str = "app_trust_bundles";

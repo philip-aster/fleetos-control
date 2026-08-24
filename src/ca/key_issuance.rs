@@ -93,7 +93,11 @@ pub fn issue_delegated_key(
 
     // Step 5: Sign the intermediate cert with the root CA.
     let bundle = trust_bundle.read();
-    let issuer = Issuer::new(bundle.current_params.clone(), &bundle.current_key);
+    let ca_cert_der_type =
+        rustls::pki_types::CertificateDer::from(bundle.current_cert_der.as_slice());
+    let issuer = Issuer::from_ca_cert_der(&ca_cert_der_type, &bundle.current_key)
+        .map_err(|e| CaError::Signing(format!("failed to construct issuer: {}", e)))?;
+
     let intermediate_cert = intermediate_params
         .signed_by(&delegated_key_pair, &issuer)
         .map_err(CaError::Rcgen)?;

@@ -1,14 +1,13 @@
 //! X.509 certificate signing implementation using `rcgen` + `rustls`.
-
+use super::CaError;
+use super::oid;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
+use rustls::pki_types::CertificateDer;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
-
-use super::CaError;
-use super::oid;
 
 /// Identity kinds that can be signed by the CA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +42,6 @@ pub fn build_csr(params: &SvidParams) -> Result<CsrBundle, CaError> {
     let mut cert_params = CertificateParams::new(vec![]).map_err(CaError::Rcgen)?;
 
     // Set the SPIFFE ID as a URI SAN.
-    // SanType::URI expects Ia5String; use try_into() to convert without naming the type.
     let spiffe_uri = params
         .spiffe_id
         .clone()
@@ -87,7 +85,7 @@ pub fn build_csr(params: &SvidParams) -> Result<CsrBundle, CaError> {
     let csr = cert_params
         .serialize_request(&key_pair)
         .map_err(CaError::Rcgen)?;
-    // CertificateSigningRequest::pem() returns Result<String, Error>
+
     let csr_pem = csr.pem().map_err(CaError::Rcgen)?;
 
     // Extract private key bytes.
@@ -109,11 +107,11 @@ pub struct SignedSvid {
     pub not_after: OffsetDateTime,
 }
 
-/// Sign an SVID certificate using the CA root keypair.
+/// Sign an SVID certificate using the CA root keypair and certificate DER.
 pub fn sign_svid(
     params: &SvidParams,
     ca_key_pair: &KeyPair,
-    ca_cert_params: &CertificateParams,
+    ca_cert_der: &[u8],
 ) -> Result<SignedSvid, CaError> {
     // Build the leaf certificate parameters.
     let mut leaf_params = CertificateParams::new(vec![]).map_err(CaError::Rcgen)?;
@@ -170,8 +168,10 @@ pub fn sign_svid(
     // Extract the private key before signing.
     let private_key_der = Zeroizing::new(leaf_key_pair.serialize_der());
 
-    // Construct the Issuer from the CA's params and key.
-    let issuer = Issuer::new(ca_cert_params.clone(), ca_key_pair);
+    // Construct the Issuer from the CA's certificate DER and key.
+    let ca_cert_der_type = CertificateDer::from(ca_cert_der);
+    let issuer = Issuer::from_ca_cert_der(&ca_cert_der_type, ca_key_pair)
+        .map_err(|e| CaError::Signing(format!("failed to construct issuer: {}", e)))?;
 
     // Sign the leaf certificate with the CA.
     let leaf_cert = leaf_params
@@ -220,17 +220,11 @@ pub fn generate_root_ca(trust_domain: &str) -> Result<(KeyPair, CertificateParam
     Ok((key_pair, params))
 }
 
-/// Sign a CSR using the CA root keypair.
-///
-/// This is the CSR-based SVID issuance path used by the CaService gRPC endpoint.
-/// The agent generates a keypair, creates a CSR with its SPIFFE ID as URI SAN,
-/// and submits it here. The CA signs the CSR and returns the certificate.
-///
-/// The agent retains its own private key — only the certificate is returned.
+/// Sign a CSR using the CA root keypair and certificate DER.
 pub fn sign_csr(
     csr_der: &[u8],
     ca_key_pair: &KeyPair,
-    ca_cert_params: &CertificateParams,
+    ca_cert_der: &[u8],
     ttl_secs: u64,
 ) -> Result<Vec<u8>, CaError> {
     use rcgen::CertificateSigningRequestParams;
@@ -241,8 +235,10 @@ pub fn sign_csr(
     let csr_params = CertificateSigningRequestParams::from_der(&csr_der_type)
         .map_err(|e| CaError::Signing(format!("failed to parse CSR: {}", e)))?;
 
-    // 2. Create Issuer from the CA's params and key.
-    let issuer = Issuer::new(ca_cert_params.clone(), ca_key_pair);
+    // 2. Create Issuer from the CA's certificate DER and key.
+    let ca_cert_der_type = CertificateDer::from(ca_cert_der);
+    let issuer = Issuer::from_ca_cert_der(&ca_cert_der_type, ca_key_pair)
+        .map_err(|e| CaError::Signing(format!("failed to construct issuer: {}", e)))?;
 
     // 3. Set validity window on the leaf params.
     let mut final_params = csr_params.params;

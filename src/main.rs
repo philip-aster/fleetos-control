@@ -1,7 +1,6 @@
 //! `fleetos-control` entrypoint.
 //!
 //! Full integration: Raft cluster, dual CAs, gRPC servers, leader-gated controllers.
-
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -58,8 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
     tracing::info!(config = %cli.config.display(), "loading configuration");
-    let config = ControlConfig::load(&cli.config)?;
 
+    let config = ControlConfig::load(&cli.config)?;
     tracing::info!(
         node_name = %config.node.name,
         cluster_mode = ?config.cluster.mode,
@@ -80,15 +79,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broadcast_hub = BroadcastHub::new();
     tracing::info!("broadcast hub initialized");
 
-    // --- Phase 3: Trust bundles (dual CAs) ---
-    let ca_service = CaService::bootstrap(&config)?;
+    // --- Phase 3: Load master key (secrets + CA encryption at rest) ---
+    let master_key = if config.secrets.master_key_path.exists() {
+        FileMasterKey::load(&config.secrets.master_key_path)?
+    } else {
+        FileMasterKey::generate(&config.secrets.master_key_path)?
+    };
+    tracing::info!("master key loaded");
+
+    // --- Phase 4: Trust bundles (dual CAs) ---
+    // Bootstraps on first run, loads persisted encrypted bundles on restart.
+    let ca_service = CaService::init(&config, keyspaces.trust_bundles.clone(), &master_key)?;
     tracing::info!(
         data_control_td = %config.trust_domains.data_control,
         admin_td = %config.trust_domains.admin,
-        "dual-root CA bootstrapped"
+        "dual-root CA initialized"
     );
 
-    // --- Phase 4: Core services initialization ---
+    // --- Phase 5: Core services initialization ---
     let join_token_store = Arc::new(JoinTokenStore::new(keyspaces.join_tokens.clone()));
     let dummy_ip_allocator = Arc::new(DummyIpAllocator::new(
         keyspaces.dummy_ips.clone(),
@@ -100,18 +108,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyspaces.revoked_delegations.clone(),
     ));
 
-    // Load master key for secrets
-    let master_key = if config.secrets.master_key_path.exists() {
-        FileMasterKey::load(&config.secrets.master_key_path)?
-    } else {
-        FileMasterKey::generate(&config.secrets.master_key_path)?
-    };
+    // The CA borrow of master_key ended with the init() call above,
+    // so ownership transfers cleanly into the SecretStore here.
     let secret_store = Arc::new(SecretStore::new(
         keyspaces.secrets.clone(),
         Box::new(master_key),
     ));
 
-    // --- Phase 5: Controllers ---
+    // --- Phase 6: Controllers ---
     let storage_engine = Arc::new(fleetos_control::storage::StorageEngine::new(
         keyspaces.version.clone(),
         keyspaces.raft_log.clone(),
@@ -154,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workload_controller.clone(),
     ));
 
-    // --- Phase 6: Raft cluster initialization ---
+    // --- Phase 7: Raft cluster initialization ---
     let (raft_handle, shutdown_tx) = init_raft_cluster(
         &config,
         db.clone(),
@@ -164,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // --- Phase 7: Controller factory and leader gate ---
+    // --- Phase 8: Controller factory and leader gate ---
     let controller_factory = Arc::new(FleetosControllerFactory {
         workload_controller: workload_controller.clone(),
         pod_controller: pod_controller.clone(),
@@ -179,13 +183,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         leader_gate.run(controller_factory, shutdown_rx).await;
     });
 
-    // --- Phase 8: Control Pool Manager (needs raft_handle from Phase 6) ---
+    // --- Phase 9: Control Pool Manager (needs raft_handle from Phase 7) ---
     let control_pool_manager = Arc::new(ControlPoolManager::new(
         raft_handle.raft.clone(),
         storage_engine.clone(),
     ));
 
-    // --- Phase 9 (optional): Provisioning ---
+    // --- Phase 10 (optional): Provisioning ---
     // Only start provisioning if a provider endpoint is configured.
     // This is leader-gated, so it only runs on the Raft leader.
     let provisioning_config = fleetos_control::provisioning::ProvisioningConfig {
@@ -216,7 +220,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("provisioning disabled (no endpoint configured)");
     }
 
-    // --- Phase 10: gRPC Servers ---
+    // --- Phase 11: gRPC Servers ---
+
     // Mint control plane SVIDs for both trust domains
     let dc_bundle = ca_service.data_control.read();
     let dc_params = fleetos_control::ca::rcgen_impl::SvidParams {
@@ -233,7 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dc_svid = fleetos_control::ca::rcgen_impl::sign_svid(
         &dc_params,
         &dc_bundle.current_key,
-        &dc_bundle.current_params,
+        &dc_bundle.current_cert_der,
     )?;
     drop(dc_bundle);
 
@@ -252,7 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_svid = fleetos_control::ca::rcgen_impl::sign_svid(
         &admin_params,
         &admin_bundle.current_key,
-        &admin_bundle.current_params,
+        &admin_bundle.current_cert_der,
     )?;
     drop(admin_bundle);
 
@@ -335,9 +340,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn Data/Control listener with custom TLS
     let dc_tls_acceptor = tokio_rustls::TlsAcceptor::from(dc_server_config);
     let dc_td_config = fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
+
     tokio::spawn(async move {
         tracing::info!(addr = %dc_addr, "starting Data/Control gRPC listener");
-
         let listener = match tokio::net::TcpListener::bind(dc_addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -352,6 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok((stream, addr)) => {
                         let acceptor = dc_tls_acceptor.clone();
                         let td_config = dc_td_config.clone();
+
                         yield async move {
                             let tls_stream = acceptor.accept(stream).await
                                 .map_err(|e| {
@@ -429,9 +435,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_tls_acceptor = tokio_rustls::TlsAcceptor::from(admin_server_config);
     let admin_td_config =
         fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
+
     tokio::spawn(async move {
         tracing::info!(addr = %admin_addr, "starting Admin gRPC listener");
-
         let listener = match tokio::net::TcpListener::bind(admin_addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -446,6 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok((stream, addr)) => {
                         let acceptor = admin_tls_acceptor.clone();
                         let td_config = admin_td_config.clone();
+
                         yield async move {
                             let tls_stream = acceptor.accept(stream).await
                                 .map_err(|e| {
@@ -602,6 +609,7 @@ async fn init_raft_cluster(
         election_timeout_max: 3000,
         ..Default::default()
     };
+
     let raft_config =
         Arc::new(raft_config.validate().map_err(|e| {
             Box::<dyn std::error::Error>::from(format!("invalid raft config: {}", e))
@@ -613,6 +621,7 @@ async fn init_raft_cluster(
         keyspaces.raft_log.clone(),
         keyspaces.raft_log_meta.clone(),
     );
+
     let state_machine = FjallStateMachine::new(
         db.clone(),
         keyspaces.clone(),
@@ -677,18 +686,15 @@ async fn init_raft_cluster(
                     )
                 })
                 .collect();
+
             raft.initialize(members).await.map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("raft bootstrap failed: {}", e))
             })?;
             tracing::info!("raft cluster bootstrapped");
         }
         ClusterMode::Join => {
-            // TODO: Implement join flow
-            // 1. Attest with join_target
-            // 2. Get Join Token
-            // 3. Get SVID
-            // 4. Call add_learner on the cluster
-            // 5. Wait for promotion to voter
+            // Implemented in Step 5 (Join Mode):
+            // attest → get SVID → add_learner → promote to voter.
             tracing::warn!("join mode not yet implemented, running as standalone node");
         }
     }
@@ -698,7 +704,6 @@ async fn init_raft_cluster(
     };
 
     let (shutdown_tx, _) = watch::channel(false);
-
     Ok((raft_handle, shutdown_tx))
 }
 

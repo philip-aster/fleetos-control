@@ -54,7 +54,7 @@ impl CaService for CaServiceImpl {
         let cert_der = rcgen_impl::sign_csr(
             &req.csr_der,
             &bundle.current_key,
-            &bundle.current_params,
+            &bundle.current_cert_der,
             self.svid_ttl_secs,
         )
         .map_err(|e| Status::internal(format!("CSR signing failed: {}", e)))?;
