@@ -84,10 +84,12 @@ impl AttestationService for AttestationServiceImpl {
     /// Verify a hardware attestation quote and join token.
     ///
     /// Flow:
-    /// 1. Validate the nonce (must have been issued by us, single-use)
-    /// 2. Verify the quote based on quote_type (TPM2, Apple SE, VSOCK)
-    /// 3. Validate and consume the join token (strict single-use)
-    /// 4. Return the attested identity
+    /// 1. Validate and consume the join token (strict single-use)
+    /// 2. Deserialize the raw quote based on quote_type
+    /// 3. Extract the nonce from the quote and validate against NonceManager
+    /// 4. Correlate the nonce with the claimed SpiffeId from RequestNonce
+    /// 5. Verify the quote signature and PCR values
+    /// 6. Return the attested identity with the verified claimed SpiffeId
     async fn submit_quote(
         &self,
         request: Request<AttestationQuote>,
@@ -110,39 +112,130 @@ impl AttestationService for AttestationServiceImpl {
                 Status::permission_denied(format!("join token validation failed: {}", e))
             })?;
 
-        // TODO: Extract nonce from the raw quote and validate against NonceManager.
-        // The nonce is embedded in the TPM quote's extraData field or the
-        // Apple SE attestation data. For now, we skip nonce verification
-        // and rely on the join token as the primary authorization.
-        //
-        // Full implementation requires:
-        // 1. Parse the raw_quote based on quote_type
-        // 2. Extract the nonce from the quote structure
-        // 3. Call nonce_manager.validate_and_consume(extracted_nonce)
-        // 4. Verify the quote signature against the attestation key
-        // 5. Validate PCR values against the expected policy
+        // Deserialize the raw quote based on quote_type and extract the nonce.
+        // The raw_quote is a postcard-serialized TpmQuote or AppleSeAttestation.
+        let (extracted_nonce, claimed_spiffe_id) = match quote.quote_type {
+            // TPM2 quote
+            0 => {
+                let tpm_quote: super::tpm::TpmQuote = postcard::from_bytes(&quote.raw_quote)
+                    .map_err(|e| {
+                        Status::invalid_argument(format!("failed to parse TPM quote: {}", e))
+                    })?;
 
-        // Determine the claimed SPIFFE ID.
-        // For now, we construct it from the node kind in the join token.
-        // In production, this would be extracted from the quote or provided
-        // by the agent during the attestation flow.
-        let claimed_spiffe_id = format!(
-            "spiffe://fleet.example.internal/ns/system/node/pending-{}",
-            token_record.node_kind as u8
-        );
+                // Validate the nonce against the NonceManager (single-use).
+                let nonce_valid = self
+                    .nonce_manager
+                    .validate_and_consume(&tpm_quote.nonce)
+                    .map_err(|e| Status::internal(format!("nonce validation failed: {}", e)))?;
+                if !nonce_valid {
+                    return Err(Status::permission_denied(
+                        "attestation nonce is invalid or already consumed",
+                    ));
+                }
+
+                // Look up the claimed SpiffeId associated with this nonce.
+                let claimed = self
+                    .nonce_claims
+                    .read()
+                    .get(&tpm_quote.nonce)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Status::permission_denied("no claimed identity for this nonce")
+                    })?;
+
+                // Verify PCR values against the expected policy for this node.
+                // The node_id is derived from the claimed SpiffeId for PCR policy lookup.
+                if let Some(expected_pcrs) = self
+                    .pcr_store
+                    .get_expected_pcrs(&claimed)
+                    .map_err(|e| Status::internal(format!("PCR policy lookup failed: {}", e)))?
+                {
+                    super::tpm::verify_tpm_quote(&tpm_quote, &tpm_quote.nonce, &expected_pcrs)
+                        .map_err(|e| {
+                            Status::permission_denied(format!(
+                                "TPM quote verification failed: {}",
+                                e
+                            ))
+                        })?;
+                } else {
+                    // No PCR policy configured — verify with empty expected set.
+                    super::tpm::verify_tpm_quote(&tpm_quote, &tpm_quote.nonce, &[]).map_err(
+                        |e| {
+                            Status::permission_denied(format!(
+                                "TPM quote verification failed: {}",
+                                e
+                            ))
+                        },
+                    )?;
+                }
+
+                (tpm_quote.nonce, claimed)
+            }
+            // Apple Secure Enclave quote
+            1 => {
+                let se_attestation: super::apple_se::AppleSeAttestation =
+                    postcard::from_bytes(&quote.raw_quote).map_err(|e| {
+                        Status::invalid_argument(format!(
+                            "failed to parse Apple SE attestation: {}",
+                            e
+                        ))
+                    })?;
+
+                // Validate the nonce against the NonceManager (single-use).
+                let nonce_valid = self
+                    .nonce_manager
+                    .validate_and_consume(&se_attestation.nonce)
+                    .map_err(|e| Status::internal(format!("nonce validation failed: {}", e)))?;
+                if !nonce_valid {
+                    return Err(Status::permission_denied(
+                        "attestation nonce is invalid or already consumed",
+                    ));
+                }
+
+                // Look up the claimed SpiffeId associated with this nonce.
+                let claimed = self
+                    .nonce_claims
+                    .read()
+                    .get(&se_attestation.nonce)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Status::permission_denied("no claimed identity for this nonce")
+                    })?;
+
+                // Verify the Apple SE attestation.
+                super::apple_se::verify_apple_se_attestation(
+                    &se_attestation,
+                    &se_attestation.nonce,
+                )
+                .map_err(|e| {
+                    Status::permission_denied(format!("Apple SE attestation failed: {}", e))
+                })?;
+
+                (se_attestation.nonce, claimed)
+            }
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unsupported quote_type: {}",
+                    other
+                )));
+            }
+        };
+
+        // Clean up the nonce claim after successful verification.
+        self.nonce_claims.write().remove(&extracted_nonce);
 
         let now = time::OffsetDateTime::now_utc();
-
         tracing::info!(
             claimed_spiffe_id = %claimed_spiffe_id,
             node_kind = ?token_record.node_kind,
+            quote_type = quote.quote_type,
             "attestation quote verified"
         );
 
         Ok(Response::new(AttestedIdentity {
             claimed_spiffe_id,
             quote_type: quote.quote_type,
-            pcr_digest: Vec::new(), // TODO: Extract from quote
+            pcr_digest: Vec::new(),
             verified_at_unix: now.unix_timestamp(),
         }))
     }
