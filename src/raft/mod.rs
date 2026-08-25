@@ -94,6 +94,7 @@ pub enum FleetosCommand {
     // --- Secrets ---
     StoreSecret {
         record: records::SecretRecord,
+        target_spiffe_id: String,
     },
     // --- Scheduler / placement ---
     RecordOrdinalAssignment {

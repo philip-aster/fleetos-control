@@ -1,106 +1,102 @@
-//! Nonce management for attestation challenges.
+//! Nonce generation and validation for hardware attestation.
 //!
-//! Security-critical: we generate the nonce, every verify() call requires
-//! a fresh nonce we supplied. Never reuse a nonce. A captured quote from
-//! a previous join is worthless without the matching nonce.
+//! Nonces are persisted to a fjall keyspace so pending attestations survive
+//! control-plane restarts. Each nonce is single-use and carries a TTL.
+use std::time::Duration;
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use parking_lot::Mutex;
+use rand::Rng;
+use time::OffsetDateTime;
 
 use super::AttestationError;
-use parking_lot::RwLock;
-use rand::Rng;
 
-/// Length of attestation nonces in bytes (256 bits).
-const NONCE_LENGTH: usize = 32;
-
-/// Maximum age of a nonce before it expires (5 minutes).
-/// Prevents accumulation of stale nonces if a node never completes attestation.
-const NONCE_TTL_SECS: u64 = 300;
-
-/// Manages attestation nonces.
-///
-/// Nonces are generated on demand, stored until consumed or expired.
-/// Each nonce is single-use: once validated, it is removed from the pool.
+/// Manages attestation nonces with TTL expiry, backed by fjall.
 pub struct NonceManager {
-    /// Pending nonces awaiting consumption.
-    pending: Arc<RwLock<HashSet<Vec<u8>>>>,
-
-    /// Creation timestamps for expiry tracking.
-    timestamps: Arc<RwLock<std::collections::HashMap<Vec<u8>, time::OffsetDateTime>>>,
+    /// Keyspace mapping nonce bytes -> expiry unix timestamp (i64 BE bytes).
+    keyspaces: fjall::Keyspace,
+    /// TTL for nonces.
+    ttl: Duration,
+    /// Serializes get+remove so a nonce cannot be consumed twice by
+    /// concurrent requests on the same node.
+    consume_lock: Mutex<()>,
 }
 
 impl NonceManager {
-    pub fn new() -> Self {
+    pub fn new(keyspaces: fjall::Keyspace) -> Self {
         Self {
-            pending: Arc::new(RwLock::new(HashSet::new())),
-            timestamps: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            keyspaces,
+            ttl: Duration::from_secs(300),
+            consume_lock: Mutex::new(()),
         }
     }
 
-    /// Generate a fresh cryptographically-random nonce.
-    ///
-    /// The nonce is stored internally until consumed or expired.
-    pub fn generate(&self) -> Result<Vec<u8>, AttestationError> {
-        let mut nonce = vec![0u8; NONCE_LENGTH];
+    /// Generate a fresh 32-byte nonce and persist it with its expiry.
+    pub fn generate_nonce(&self) -> Result<Vec<u8>, AttestationError> {
+        // Opportunistic cleanup of expired nonces (best-effort).
+        let _ = self.sweep_expired();
+
+        let mut nonce = vec![0u8; 32];
         rand::rng().fill_bytes(&mut nonce);
 
-        let now = time::OffsetDateTime::now_utc();
-
-        self.pending.write().insert(nonce.clone());
-        self.timestamps.write().insert(nonce.clone(), now);
-
-        // Opportunistically clean expired nonces.
-        self.cleanup_expired();
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + self.ttl.as_secs() as i64;
+        self.keyspaces
+            .insert(nonce.as_slice(), expires_at.to_be_bytes().as_slice())
+            .map_err(|e| AttestationError::Nonce(format!("nonce storage failed: {}", e)))?;
 
         Ok(nonce)
     }
 
-    /// Validate and consume a nonce.
+    /// Validate a nonce and consume it (single-use).
     ///
-    /// Returns true if the nonce was valid (previously issued, not expired, not consumed).
-    /// The nonce is removed from the pool regardless of outcome (single-use).
+    /// Returns `true` if the nonce was known and unexpired, `false` otherwise.
+    /// The nonce is removed either way.
     pub fn validate_and_consume(&self, nonce: &[u8]) -> Result<bool, AttestationError> {
-        let mut pending = self.pending.write();
-        let mut timestamps = self.timestamps.write();
+        let _guard = self.consume_lock.lock();
 
-        if !pending.contains(nonce) {
-            return Ok(false);
-        }
+        let value = match self
+            .keyspaces
+            .get(nonce)
+            .map_err(|e| AttestationError::Nonce(format!("nonce lookup failed: {}", e)))?
+        {
+            Some(v) => v,
+            None => return Ok(false),
+        };
 
-        // Check expiry.
-        if let Some(created_at) = timestamps.get(nonce) {
-            let elapsed = time::OffsetDateTime::now_utc() - *created_at;
-            if elapsed.whole_seconds() > NONCE_TTL_SECS as i64 {
-                // Expired — remove and reject.
-                pending.remove(nonce);
-                timestamps.remove(nonce);
-                return Ok(false);
-            }
-        }
+        // Single-use: remove before validating.
+        self.keyspaces
+            .remove(nonce)
+            .map_err(|e| AttestationError::Nonce(format!("nonce removal failed: {}", e)))?;
 
-        // Valid — consume it (single-use).
-        pending.remove(nonce);
-        timestamps.remove(nonce);
-        Ok(true)
+        let bytes: [u8; 8] = value
+            .as_ref()
+            .try_into()
+            .map_err(|_| AttestationError::Nonce("corrupt nonce expiry".to_owned()))?;
+        let expires_at = i64::from_be_bytes(bytes);
+
+        Ok(OffsetDateTime::now_utc().unix_timestamp() <= expires_at)
     }
 
-    /// Remove expired nonces from the pool.
-    fn cleanup_expired(&self) {
-        let now = time::OffsetDateTime::now_utc();
-        let mut pending = self.pending.write();
-        let mut timestamps = self.timestamps.write();
-
-        let expired: Vec<Vec<u8>> = timestamps
-            .iter()
-            .filter(|(_, created_at)| (now - **created_at).whole_seconds() > NONCE_TTL_SECS as i64)
-            .map(|(nonce, _)| nonce.clone())
-            .collect();
-
-        for nonce in expired {
-            pending.remove(&nonce);
-            timestamps.remove(&nonce);
+    /// Remove expired nonces.
+    fn sweep_expired(&self) -> Result<(), AttestationError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mut expired_keys = Vec::new();
+        for guard in self.keyspaces.prefix(Vec::<u8>::new()) {
+            let Ok((key, value)) = guard.into_inner() else {
+                continue;
+            };
+            let Ok(bytes): Result<[u8; 8], _> = value.as_ref().try_into() else {
+                continue;
+            };
+            if i64::from_be_bytes(bytes) < now {
+                expired_keys.push(key.to_vec());
+            }
         }
+        for key in expired_keys {
+            self.keyspaces
+                .remove(key)
+                .map_err(|e| AttestationError::Nonce(format!("nonce sweep failed: {}", e)))?;
+        }
+        Ok(())
     }
 }
 
@@ -108,32 +104,37 @@ impl NonceManager {
 mod tests {
     use super::*;
 
+    fn test_nonce_manager(name: &str) -> (std::sync::Arc<fjall::Database>, NonceManager) {
+        let dir = std::env::temp_dir().join(format!(
+            "fleetos-nonce-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = crate::storage::open_database(&dir).unwrap();
+        let keyspaces = crate::storage::init_keyspaces(&db).unwrap();
+        (db, NonceManager::new(keyspaces.nonces.clone()))
+    }
+
+    #[test]
+    fn generated_nonces_are_unique() {
+        let (_db, manager) = test_nonce_manager("unique");
+        let n1 = manager.generate_nonce().unwrap();
+        let n2 = manager.generate_nonce().unwrap();
+        assert_ne!(n1, n2);
+    }
+
     #[test]
     fn nonce_is_single_use() {
-        let manager = NonceManager::new();
-        let nonce = manager.generate().unwrap();
-
-        // First use succeeds.
+        let (_db, manager) = test_nonce_manager("single-use");
+        let nonce = manager.generate_nonce().unwrap();
         assert!(manager.validate_and_consume(&nonce).unwrap());
-
-        // Second use fails (already consumed).
         assert!(!manager.validate_and_consume(&nonce).unwrap());
     }
 
     #[test]
     fn unknown_nonce_is_rejected() {
-        let manager = NonceManager::new();
-        let fake_nonce = vec![0u8; NONCE_LENGTH];
-
-        assert!(!manager.validate_and_consume(&fake_nonce).unwrap());
-    }
-
-    #[test]
-    fn generated_nonces_are_unique() {
-        let manager = NonceManager::new();
-        let n1 = manager.generate().unwrap();
-        let n2 = manager.generate().unwrap();
-
-        assert_ne!(n1, n2);
+        let (_db, manager) = test_nonce_manager("unknown");
+        assert!(!manager.validate_and_consume(b"unknown-nonce").unwrap());
     }
 }

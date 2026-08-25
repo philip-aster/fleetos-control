@@ -17,7 +17,7 @@ pub mod join_token;
 pub mod nonce;
 pub mod pcr_policy;
 pub mod tpm;
-
+use std::sync::Arc;
 use thiserror::Error;
 
 use fleetos_core::spiffe::SpiffeId;
@@ -83,7 +83,7 @@ pub struct AttestationResult {
 
 /// The attestation service orchestrates the full join flow.
 pub struct AttestationService {
-    nonce_manager: nonce::NonceManager,
+    nonce_manager: Arc<nonce::NonceManager>,
     join_token_store: join_token::JoinTokenStore,
     pcr_store: pcr_policy::PcrPolicyStore,
 }
@@ -92,9 +92,10 @@ impl AttestationService {
     pub fn new(
         join_tokens_keyspace: fjall::Keyspace,
         pcr_policies_keyspace: fjall::Keyspace,
+        nonces_keyspace: fjall::Keyspace,
     ) -> Self {
         Self {
-            nonce_manager: nonce::NonceManager::new(),
+            nonce_manager: Arc::new(nonce::NonceManager::new(nonces_keyspace)),
             join_token_store: join_token::JoinTokenStore::new(join_tokens_keyspace),
             pcr_store: pcr_policy::PcrPolicyStore::new(pcr_policies_keyspace),
         }
@@ -105,7 +106,7 @@ impl AttestationService {
     /// Every attestation attempt requires a nonce we generated.
     /// A captured quote from a previous join is worthless without the matching nonce.
     pub fn issue_nonce(&self) -> Result<Vec<u8>, AttestationError> {
-        self.nonce_manager.generate()
+        self.nonce_manager.generate_nonce()
     }
 
     /// Validate a nonce that was previously issued.

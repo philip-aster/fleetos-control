@@ -371,7 +371,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
     // Attestation and CA services (Data/Control listener)
-    let nonce_manager = Arc::new(fleetos_control::attestation::nonce::NonceManager::new());
+    let nonce_manager = Arc::new(fleetos_control::attestation::nonce::NonceManager::new(
+        keyspaces.nonces.clone(),
+    ));
     let pcr_store = Arc::new(
         fleetos_control::attestation::pcr_policy::PcrPolicyStore::new(
             keyspaces.pcr_policies.clone(),
@@ -382,6 +384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             nonce_manager,
             join_token_store.clone(),
             pcr_store,
+            keyspaces.nonce_claims.clone(),
         );
 
     // CaService is only available when the local CA is loaded.

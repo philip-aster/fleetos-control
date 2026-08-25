@@ -28,7 +28,7 @@ pub const SECRET_KEYSPACE: &str = "app_secrets";
 pub const DUMMY_IP_KEYSPACE: &str = "app_dummy_ips";
 pub const PCR_POLICY_KEYSPACE: &str = "app_pcr_policies";
 pub const ROUTER_ASSIGNMENT_KEYSPACE: &str = "app_router_assignments";
-
 pub const NODE_POOL_KEYSPACE: &str = "node_pools";
-
 pub const TRUST_BUNDLE_KEYSPACE: &str = "app_trust_bundles";
+pub const NONCE_KEYSPACE: &str = "app_nonces";
+pub const NONCE_CLAIM_KEYSPACE: &str = "app_nonce_claims";

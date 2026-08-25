@@ -8,15 +8,12 @@
 //! (atomic-apply invariant), and subscribers are notified only after a successful
 //! commit, so they never observe state that isn't durable.
 
-use std::io::Cursor;
-use std::sync::Arc;
-
 use super::snapshot::FjallSnapshotBuilder;
 use super::{FleetosCommand, FleetosRaftConfig, FleetosResponse, records};
 use crate::delegation::DelegationRecord;
 use crate::storage::version::{ChangeKind, VersionedState};
 use crate::storage::{Keyspaces, schema};
-use crate::watch::broadcast::{BroadcastHub, SagUpdateEvent, ScheduleUpdateEvent, WatchEvent};
+use crate::watch::broadcast::{BroadcastHub, SagUpdateEvent, WatchEvent};
 use fjall::Database;
 use fleetos_core::spiffe::SpiffeId;
 use openraft::storage::RaftStateMachine;
@@ -24,6 +21,9 @@ use openraft::{
     BasicNode, Entry, EntryPayload, LogId, RaftLogId, Snapshot, SnapshotMeta, StorageError,
     StorageIOError, StoredMembership,
 };
+use prost::Message;
+use std::io::Cursor;
+use std::sync::Arc;
 
 pub struct FjallStateMachine {
     db: Arc<Database>,
@@ -295,7 +295,10 @@ impl FjallStateMachine {
             }
 
             // --- Secrets ---
-            FleetosCommand::StoreSecret { record } => {
+            FleetosCommand::StoreSecret {
+                record,
+                target_spiffe_id: _,
+            } => {
                 let secret_key = format!("secret:{}", record.key);
                 batch.insert(
                     &self.keyspaces.secrets,
@@ -322,11 +325,11 @@ impl FjallStateMachine {
                 Ok(ChangeKind::SchedulingUpdate)
             }
             FleetosCommand::CommitPlacement { record } => {
-                let value = postcard::to_allocvec(record).map_err(ser_err)?;
+                let serialized = postcard::to_allocvec(record).map_err(ser_err)?;
                 batch.insert(
                     &self.keyspaces.placements,
                     record.pod_id.as_bytes(),
-                    value.as_slice(),
+                    serialized.as_slice(),
                 );
                 Ok(ChangeKind::SchedulingUpdate)
             }
@@ -413,10 +416,7 @@ impl FjallStateMachine {
 
     /// Read all placements from keyspaces and publish a ScheduleUpdateEvent.
     fn publish_schedule_update(&self, version: fleetos_core::MonotonicVersion) {
-        // Read all placements and construct WorkloadAssignmentRecords.
-        let mut assignments_bytes = Vec::new();
         let mut records: Vec<crate::watch::scheduler_stream::WorkloadAssignmentRecord> = Vec::new();
-
         for guard in self.keyspaces.placements.prefix(Vec::<u8>::new()) {
             let value = match guard.value() {
                 Ok(v) => v,
@@ -425,24 +425,48 @@ impl FjallStateMachine {
             if let Ok(placement) =
                 postcard::from_bytes::<crate::scheduler::Placement>(value.as_ref())
             {
+                let (runtime, image) =
+                    self.lookup_workload_metadata(&placement.tenant_id, &placement.service);
                 records.push(crate::watch::scheduler_stream::WorkloadAssignmentRecord {
-                    workload_id: placement.pod_id,
-                    runtime: String::new(), // TODO: Read from workload spec
-                    image: String::new(),   // TODO: Read from workload spec
-                    role: placement.role,
+                    workload_id: placement.service.clone(),
+                    runtime,
+                    image,
+                    role: placement.role.clone(),
                 });
             }
         }
-
-        if let Ok(serialized) = postcard::to_allocvec(&records) {
-            assignments_bytes = serialized;
-        }
-
+        let assignments_bytes = match postcard::to_allocvec(&records) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
         self.broadcast_hub
-            .publish_schedule_update(ScheduleUpdateEvent {
+            .publish_schedule_update(crate::watch::broadcast::ScheduleUpdateEvent {
                 version,
                 assignments_bytes,
             });
+    }
+
+    fn lookup_workload_metadata(&self, tenant_id: &str, workload_id: &str) -> (String, String) {
+        let key = format!("{}:{}", tenant_id, workload_id);
+        let Ok(Some(value)) = self.keyspaces.workloads.get(key.as_bytes()) else {
+            return (String::new(), String::new());
+        };
+        let Ok(record) =
+            postcard::from_bytes::<crate::raft::records::WorkloadSpecRecord>(value.as_ref())
+        else {
+            return (String::new(), String::new());
+        };
+        let Ok(spec) =
+            fleetos_core::proto::workload::WorkloadSpec::decode(record.spec_bytes.as_slice())
+        else {
+            return (String::new(), String::new());
+        };
+        let runtime = spec
+            .pod_spec
+            .as_ref()
+            .map(|p| p.runtime.clone())
+            .unwrap_or_default();
+        (runtime, spec.image)
     }
 }
 
