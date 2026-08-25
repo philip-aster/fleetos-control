@@ -297,7 +297,7 @@ impl FjallStateMachine {
             // --- Secrets ---
             FleetosCommand::StoreSecret {
                 record,
-                target_spiffe_id: _,
+                target_spiffe_id,
             } => {
                 let secret_key = format!("secret:{}", record.key);
                 batch.insert(
@@ -311,7 +311,9 @@ impl FjallStateMachine {
                     acl_key.as_bytes(),
                     record.acl_bytes.as_slice(),
                 );
-                Ok(ChangeKind::SecretRotation)
+                Ok(ChangeKind::SecretRotation {
+                    target_spiffe_id: target_spiffe_id.clone(),
+                })
             }
 
             // --- Scheduler / placement ---
@@ -358,14 +360,10 @@ impl FjallStateMachine {
             ChangeKind::SagUpdate | ChangeKind::RevokedDelegations => {
                 self.publish_sag_update(version);
             }
-            ChangeKind::SecretRotation => {
-                // For secret rotations, publish a generic notification.
-                // The WatchService streams SecretRotationNotification events.
-                // We publish with an empty spiffe_id as a signal to refetch.
-                // TODO: Pass the actual spiffe_id through the command for targeted notifications.
+            ChangeKind::SecretRotation { target_spiffe_id } => {
                 self.broadcast_hub
                     .publish_watch_event(WatchEvent::SecretRotationNotification {
-                        spiffe_id: String::new(),
+                        spiffe_id: target_spiffe_id.clone(),
                         version,
                     });
             }

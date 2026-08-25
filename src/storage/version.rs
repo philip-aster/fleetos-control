@@ -27,7 +27,7 @@ pub enum ChangeKind {
     SagUpdate,
     TrustBundleRotation,
     ClusterMembership,
-    SecretRotation,
+    SecretRotation { target_spiffe_id: String },
     RevokedDelegations,
     SchedulingUpdate,
     DummyIpUpdate,
