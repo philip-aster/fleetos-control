@@ -5,8 +5,7 @@
 
 use std::sync::Arc;
 
-use tonic::{Request, Response, Status};
-
+use crate::raft::FleetosRaftConfig;
 use fleetos_core::proto::admin::AdminService;
 use fleetos_core::proto::admin::ClusterStatus;
 use fleetos_core::proto::admin::{
@@ -14,6 +13,7 @@ use fleetos_core::proto::admin::{
     GetClusterStatusRequest, ListNodesRequest, ListNodesResponse, WorkloadSpecAck,
 };
 use fleetos_core::proto::workload::{CronWorkload, WorkloadSpec};
+use tonic::{Request, Response, Status};
 
 use super::authz;
 use crate::attestation::join_token::{JoinTokenStore, NodeKind};
@@ -24,13 +24,13 @@ use crate::storage::StorageEngine;
 
 /// The AdminService gRPC implementation.
 pub struct AdminServiceImpl {
-    #[allow(dead_code)]
     storage: Arc<StorageEngine>,
     join_token_store: Arc<JoinTokenStore>,
     dummy_ip_allocator: Arc<DummyIpAllocator>,
     workload_controller: Arc<WorkloadController>,
     #[allow(dead_code)]
     cron_controller: Arc<CronController>,
+    raft: Arc<openraft::Raft<FleetosRaftConfig>>,
 }
 
 impl AdminServiceImpl {
@@ -40,6 +40,7 @@ impl AdminServiceImpl {
         dummy_ip_allocator: Arc<DummyIpAllocator>,
         workload_controller: Arc<WorkloadController>,
         cron_controller: Arc<CronController>,
+        raft: Arc<openraft::Raft<FleetosRaftConfig>>,
     ) -> Self {
         Self {
             storage,
@@ -47,6 +48,7 @@ impl AdminServiceImpl {
             dummy_ip_allocator,
             workload_controller,
             cron_controller,
+            raft,
         }
     }
 
@@ -168,41 +170,54 @@ impl AdminService for AdminServiceImpl {
 
     /// List all fleetos-agent nodes and their status.
     ///
-    /// v1: Returns node SVIDs only. Detailed status is a fast-follow.
+    /// Returns SPIFFE IDs of all registered nodes except evicted ones.
     async fn list_nodes(
         &self,
         request: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
         self.verify_caller(&request)?;
 
-        // TODO: Query the node registry from storage.
-        // let nodes = self.storage.list_nodes()?;
-        // let node_svids = nodes.iter().map(|n| n.svid.to_string()).collect();
+        let records = self
+            .storage
+            .list_node_records()
+            .map_err(|e| Status::internal(format!("node registry query failed: {}", e)))?;
 
-        // Placeholder: return empty list until storage query is wired.
-        let node_svids: Vec<String> = Vec::new();
+        let node_svids: Vec<String> = records
+            .iter()
+            .filter(|r| r.status != crate::raft::records::NodeStatus::Evicted)
+            .map(|r| r.node_id.clone())
+            .collect();
 
         Ok(Response::new(ListNodesResponse { node_svids }))
     }
 
     /// Get overall cluster health and capacity.
+    ///
+    /// Reports the current Raft term and the count of nodes in Active status.
     async fn get_cluster_status(
         &self,
         request: Request<GetClusterStatusRequest>,
     ) -> Result<Response<ClusterStatus>, Status> {
         self.verify_caller(&request)?;
 
-        // TODO: Query Raft state for current term and healthy node count.
-        // let raft_term = self.raft.current_term()?;
-        // let healthy_nodes = self.storage.count_healthy_nodes()?;
+        // Current Raft term from live metrics.
+        let raft_term = self.raft.metrics().borrow().current_term;
 
-        // Placeholder values until Raft state query is wired.
-        let status = ClusterStatus {
-            raft_term: 0,
-            healthy_nodes: 0,
-        };
+        // Healthy = nodes in Active status (cordoned nodes are healthy but
+        // not schedulable; evicted nodes are gone).
+        let records = self
+            .storage
+            .list_node_records()
+            .map_err(|e| Status::internal(format!("node registry query failed: {}", e)))?;
+        let healthy_nodes = records
+            .iter()
+            .filter(|r| r.status == crate::raft::records::NodeStatus::Active)
+            .count() as u32;
 
-        Ok(Response::new(status))
+        Ok(Response::new(ClusterStatus {
+            raft_term,
+            healthy_nodes,
+        }))
     }
 
     /// Mint a Join Token for bootstrapping new infrastructure.

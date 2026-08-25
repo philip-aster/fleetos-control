@@ -33,46 +33,6 @@ pub fn verify_admin_caller(caller_svid: &SpiffeId) -> Result<(), AdminError> {
     }
 }
 
-/// Extract the caller's SpiffeId from a tonic request's mTLS peer certificate.
-///
-/// In production, the SVID is extracted from the TLS connection's peer
-/// certificate SAN (Subject Alternative Name). The mTLS layer has already
-/// verified the certificate chain against the Admin trust bundle.
-///
-/// This function extracts the SpiffeId from the certificate's URI SAN.
-pub fn extract_caller_svid(_request: &tonic::Request<()>) -> Result<SpiffeId, AdminError> {
-    // In tonic, the peer certificate is available via the transport's
-    // TLS info. We extract the SpiffeId from the certificate's URI SAN.
-    //
-    // The exact mechanism depends on how the TLS layer exposes the peer cert.
-    // For now, we use tonic's metadata extension if available.
-    //
-    // TODO: Wire this to the actual TLS peer certificate extraction.
-    // The mTLS layer (tls/mtls.rs) should attach the verified SpiffeId
-    // to the request extensions during the handshake.
-
-    // Placeholder: extract from request extensions
-    // In production, this would be:
-    // let spiffe_id = request.extensions().get::<SpiffeId>()
-    //     .ok_or(AdminError::Unauthorized)?;
-    // verify_admin_caller(spiffe_id)?;
-    // Ok(spiffe_id.clone())
-
-    // For now, return an error indicating the TLS layer needs to be wired
-    Err(AdminError::Unauthorized)
-}
-
-/// Verify admin caller from a SpiffeId string (for testing or when the
-/// TLS layer provides the SVID as a string).
-pub fn verify_admin_caller_from_str(caller_svid_str: &str) -> Result<SpiffeId, AdminError> {
-    let spiffe_id: SpiffeId = caller_svid_str
-        .parse()
-        .map_err(|_| AdminError::Unauthorized)?;
-
-    verify_admin_caller(&spiffe_id)?;
-    Ok(spiffe_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

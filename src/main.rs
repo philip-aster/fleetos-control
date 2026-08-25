@@ -402,6 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dummy_ip_allocator.clone(),
         workload_controller.clone(),
         cron_controller.clone(),
+        raft_handle.raft.clone(),
     );
 
     let dc_addr: std::net::SocketAddr = config.listeners.data_control.parse()?;
