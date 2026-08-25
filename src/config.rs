@@ -45,6 +45,9 @@ pub struct ControlConfig {
     pub provision_poll_interval_secs: u64,
 
     pub provisioning: ProvisioningConfig,
+
+    #[serde(default)]
+    pub health: HealthConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +60,40 @@ pub struct ProvisioningConfig {
     /// Reconciliation interval in seconds.
     #[serde(default = "default_provision_poll")]
     pub poll_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HealthConfig {
+    /// Seconds after which a node with no heartbeat is evicted.
+    /// Default 3600 (1 hour, matching SVID TTL).
+    #[serde(default = "default_node_lease_timeout")]
+    pub node_lease_timeout_secs: i64,
+    /// Interval between node health checks.
+    #[serde(default = "default_node_check_interval")]
+    pub node_check_interval_secs: u64,
+    /// Interval between pod reconciliation checks.
+    #[serde(default = "default_pod_check_interval")]
+    pub pod_check_interval_secs: u64,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            node_lease_timeout_secs: default_node_lease_timeout(),
+            node_check_interval_secs: default_node_check_interval(),
+            pod_check_interval_secs: default_pod_check_interval(),
+        }
+    }
+}
+
+fn default_node_lease_timeout() -> i64 {
+    3600
+}
+fn default_node_check_interval() -> u64 {
+    15
+}
+fn default_pod_check_interval() -> u64 {
+    20
 }
 
 fn default_provision_poll() -> u64 {

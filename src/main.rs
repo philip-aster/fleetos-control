@@ -245,6 +245,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_controller: node_controller.clone(),
         cron_controller: cron_controller.clone(),
         storage_engine: storage_engine.clone(),
+        node_lease_timeout_secs: config.health.node_lease_timeout_secs,
+        node_check_interval_secs: config.health.node_check_interval_secs,
+        pod_check_interval_secs: config.health.pod_check_interval_secs,
     });
 
     let leader_gate = LeaderGate::new(raft_handle.raft.as_ref().clone());
@@ -859,6 +862,9 @@ struct FleetosControllerFactory {
     node_controller: Arc<NodeController>,
     cron_controller: Arc<CronController>,
     storage_engine: Arc<fleetos_control::storage::StorageEngine>,
+    node_lease_timeout_secs: i64,
+    node_check_interval_secs: u64,
+    pod_check_interval_secs: u64,
 }
 
 impl ControllerFactory for FleetosControllerFactory {
@@ -873,7 +879,6 @@ impl ControllerFactory for FleetosControllerFactory {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                // Read all stored workloads and re-reconcile.
                 match se.list_workloads() {
                     Ok(workloads) => {
                         for record in workloads {
@@ -904,21 +909,134 @@ impl ControllerFactory for FleetosControllerFactory {
             }
         });
 
-        // Pod controller: placeholder loop until health-check mechanism is wired (Step 6).
-        let _pc = self.pod_controller.clone();
+        // Pod controller: detect dead pods and reconcile.
+        // Scans workload specs, checks each expected ordinal for a live placement,
+        // and calls reconcile_dead_pod for any ordinal whose placement is missing.
+        let pc = self.pod_controller.clone();
+        let se_pod = self.storage_engine.clone();
+        let pod_interval_secs = self.pod_check_interval_secs;
         join_set.spawn(async move {
             tracing::info!("pod controller started");
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(pod_interval_secs));
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                interval.tick().await;
+                match se_pod.list_workloads() {
+                    Ok(workloads) => {
+                        for record in workloads {
+                            let spec: fleetos_core::proto::workload::WorkloadSpec =
+                                match prost::Message::decode(record.spec_bytes.as_slice()) {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
+                                };
+                            for (role, count) in &spec.replicas {
+                                for ordinal in 0..*count {
+                                    // Check if a placement exists for this ordinal.
+                                    let has_placement = se_pod
+                                        .list_placements()
+                                        .map(|placements| {
+                                            placements.iter().any(|p| {
+                                                p.tenant_id == spec.tenant_id
+                                                    && p.service == spec.workload_id
+                                                    && p.role == *role
+                                                    && p.ordinal == ordinal
+                                            })
+                                        })
+                                        .unwrap_or(false);
+
+                                    if !has_placement {
+                                        tracing::info!(
+                                            tenant = %spec.tenant_id,
+                                            workload = %spec.workload_id,
+                                            role = %role,
+                                            ordinal = ordinal,
+                                            "missing placement detected, reconciling dead pod"
+                                        );
+                                        if let Err(e) = pc
+                                            .reconcile_dead_pod(
+                                                &spec.tenant_id,
+                                                &spec.workload_id,
+                                                role,
+                                                ordinal,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                tenant = %spec.tenant_id,
+                                                workload = %spec.workload_id,
+                                                role = %role,
+                                                ordinal = ordinal,
+                                                error = %e,
+                                                "pod reconciliation failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to list workloads for pod check");
+                    }
+                }
             }
         });
 
-        // Node controller: placeholder loop until heartbeat mechanism is wired (Step 6).
-        let _nc = self.node_controller.clone();
+        // Node controller: detect dead nodes via heartbeat lease and evict.
+        // Scans all registered nodes; any node whose last_heartbeat is older
+        // than the lease timeout is evicted (delegations revoked, placements removed).
+        let nc = self.node_controller.clone();
+        let se_node = self.storage_engine.clone();
+        let lease_timeout = self.node_lease_timeout_secs;
+        let node_interval_secs = self.node_check_interval_secs;
         join_set.spawn(async move {
             tracing::info!("node controller started");
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(node_interval_secs));
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                interval.tick().await;
+                let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                match se_node.list_node_records() {
+                    Ok(records) => {
+                        for record in records {
+                            // Skip already-evicted nodes.
+                            if record.status == fleetos_control::raft::records::NodeStatus::Evicted
+                            {
+                                continue;
+                            }
+                            let age = now - record.last_heartbeat;
+                            if age > lease_timeout {
+                                tracing::warn!(
+                                    node_id = %record.node_id,
+                                    age_secs = age,
+                                    lease_timeout_secs = lease_timeout,
+                                    "node heartbeat expired, evicting"
+                                );
+                                match record.node_id.parse::<fleetos_core::spiffe::SpiffeId>() {
+                                    Ok(spiffe_id) => {
+                                        if let Err(e) = nc.evict_node(&spiffe_id).await {
+                                            tracing::warn!(
+                                                node_id = %record.node_id,
+                                                error = %e,
+                                                "node eviction failed"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            node_id = %record.node_id,
+                                            error = %e,
+                                            "cannot parse node_id as SpiffeId, skipping eviction"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to list node records");
+                    }
+                }
             }
         });
 
@@ -930,7 +1048,6 @@ impl ControllerFactory for FleetosControllerFactory {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                // Read all stored cron workloads and check schedules.
                 match se_cron.list_cron_workloads() {
                     Ok(cron_workloads) => {
                         for record in cron_workloads {

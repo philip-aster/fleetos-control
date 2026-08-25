@@ -95,6 +95,17 @@ admin = "10.0.1.1:9444"
 raft = "10.0.1.1:9445"
 
 # -----------------------------------------------------------------------------
+# Health / lease configuration
+# -----------------------------------------------------------------------------
+[health]
+# Seconds after which a node with no heartbeat is evicted.
+node_lease_timeout_secs = 3600
+# Interval between node health checks.
+node_check_interval_secs = 15
+# Interval between pod reconciliation checks.
+pod_check_interval_secs = 20
+
+# -----------------------------------------------------------------------------
 # Provisioning
 # -----------------------------------------------------------------------------
 [provisioning]
