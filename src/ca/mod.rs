@@ -24,6 +24,22 @@ use crate::config::ControlConfig;
 
 use self::trust_bundle::TrustBundle;
 
+/// SVID version record stored in the `svids` keyspace.
+///
+/// Tracks the current SVID version for each SpiffeId. Incremented on every
+/// `submit_csr` issuance. Used by `SecretService` for replay protection:
+/// secrets sealed for a given version can only be fetched by a certificate
+/// at or above that version.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SvidRecord {
+    /// The SpiffeId this record tracks.
+    pub spiffe_id: String,
+    /// Current SVID version (incremented on each rotation/issuance).
+    pub svid_version: u64,
+    /// Unix timestamp of the most recent issuance.
+    pub issued_at_unix: i64,
+}
+
 /// Errors from CA operations.
 #[derive(Debug, Error)]
 pub enum CaError {

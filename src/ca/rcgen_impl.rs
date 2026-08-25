@@ -223,6 +223,33 @@ pub fn generate_root_ca(trust_domain: &str) -> Result<(KeyPair, CertificateParam
     Ok((key_pair, params))
 }
 
+/// Extract the SPIFFE ID URI from a DER-encoded CSR.
+///
+/// Parses the CSR and returns the first URI SAN that starts with "spiffe://".
+/// Used by the CA service to identify which SpiffeId is requesting an SVID
+/// so it can track the SVID version.
+pub fn extract_spiffe_id_from_csr(csr_der: &[u8]) -> Result<String, CaError> {
+    use rcgen::CertificateSigningRequestParams;
+    use rustls::pki_types::CertificateSigningRequestDer;
+
+    let csr_der_type = CertificateSigningRequestDer::from(csr_der);
+    let csr_params = CertificateSigningRequestParams::from_der(&csr_der_type)
+        .map_err(|e| CaError::Signing(format!("failed to parse CSR: {}", e)))?;
+
+    for san in &csr_params.params.subject_alt_names {
+        if let rcgen::SanType::URI(uri) = san {
+            let uri_str = uri.to_string();
+            if uri_str.starts_with("spiffe://") {
+                return Ok(uri_str);
+            }
+        }
+    }
+
+    Err(CaError::Validation(
+        "no SPIFFE URI SAN found in CSR".to_owned(),
+    ))
+}
+
 /// Sign a CSR using the CA root keypair and certificate DER.
 pub fn sign_csr(
     csr_der: &[u8],

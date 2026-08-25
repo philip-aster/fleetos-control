@@ -389,6 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fleetos_control::ca::grpc_service::CaServiceImpl::new(
             ca.data_control.clone(),
             config.svid.node_ttl_secs,
+            keyspaces.svids.clone(),
         )
     });
 
