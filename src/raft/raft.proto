@@ -1,38 +1,40 @@
 syntax = "proto3";
-
 package fleetos.raft;
 
 // Internal Raft transport between fleetos-control peers.
 // NEVER exposed in fleetos-core::proto — purely an implementation detail.
-// mTLS with IdKind::Control SVIDs in the Data/Control trust domain.
 //
 // Design: openraft's types are already serde-serializable (via the "serde"
 // feature). We serialize them to bytes with postcard and send them as opaque
 // payloads over gRPC. This avoids mirroring openraft's complex generic type
 // hierarchy in proto and keeps the wire format simple.
-
 service RaftTransport {
-  // Leader → Follower: replicate log entries.
-  rpc AppendEntries(RaftRpc) returns (RaftRpc);
+    // Leader → Follower: replicate log entries.
+    rpc AppendEntries(RaftRpc) returns (RaftRpc);
 
-  // Candidate → All: request votes during election.
-  rpc Vote(RaftRpc) returns (RaftRpc);
+    // Candidate → All: request votes during election.
+    rpc Vote(RaftRpc) returns (RaftRpc);
 
-  // Leader → Follower: transfer a snapshot for fast catch-up.
-  rpc InstallSnapshot(RaftRpc) returns (RaftRpc);
+    // Leader → Follower: transfer a snapshot for fast catch-up.
+    rpc InstallSnapshot(RaftRpc) returns (RaftRpc);
+
+    // Joiner → Cluster: request to be added as learner (blocking until caught
+    // up) and promoted to voter. Handled by the leader; non-leaders respond
+    // with the leader's address for redirect.
+    rpc RequestJoin(RaftRpc) returns (RaftRpc);
 }
 
 // Generic RPC envelope.
 // The `payload` field carries postcard-serialized openraft request/response types.
 message RaftRpc {
-  // The Raft node ID of the sender.
-  uint64 sender_id = 1;
+    // The Raft node ID of the sender.
+    uint64 sender_id = 1;
 
-  // The Raft node ID of the intended recipient.
-  uint64 target_id = 2;
+    // The Raft node ID of the intended recipient.
+    uint64 target_id = 2;
 
-  // Postcard-serialized openraft type bytes.
-  // For requests: AppendEntriesRequest / VoteRequest / InstallSnapshotRequest
-  // For responses: AppendEntriesResponse / VoteResponse / InstallSnapshotResponse
-  bytes payload = 3;
+    // Postcard-serialized openraft type bytes.
+    // For requests: AppendEntriesRequest / VoteRequest / InstallSnapshotRequest / JoinRequestPayload
+    // For responses: AppendEntriesResponse / VoteResponse / InstallSnapshotResponse / JoinResponsePayload
+    bytes payload = 3;
 }

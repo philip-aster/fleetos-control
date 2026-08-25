@@ -31,6 +31,7 @@ pub struct SvidParams {
 /// A generated keypair + CSR bundle.
 pub struct CsrBundle {
     pub csr_pem: String,
+    pub csr_der: Vec<u8>,
     pub private_key: Zeroizing<Vec<u8>>,
     pub key_pair: KeyPair,
 }
@@ -87,12 +88,14 @@ pub fn build_csr(params: &SvidParams) -> Result<CsrBundle, CaError> {
         .map_err(CaError::Rcgen)?;
 
     let csr_pem = csr.pem().map_err(CaError::Rcgen)?;
+    let csr_der = csr.der().to_vec();
 
     // Extract private key bytes.
     let private_key = Zeroizing::new(key_pair.serialize_der());
 
     Ok(CsrBundle {
         csr_pem,
+        csr_der,
         private_key,
         key_pair,
     })

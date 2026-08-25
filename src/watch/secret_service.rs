@@ -53,10 +53,15 @@ impl SecretService for SecretServiceImpl {
     ) -> Result<Response<SealedSecret>, Status> {
         // CRITICAL: Extract peer identity from extensions BEFORE into_inner(),
         // which consumes the Request.
-        let requesting_spiffe_id = request
+        // CRITICAL: Extract peer identity from extensions BEFORE into_inner(),
+        // which consumes the Request.
+        let connect_info = request
             .extensions()
-            .get::<SpiffeId>()
+            .get::<crate::tls::PeerConnectInfo>()
             .cloned()
+            .ok_or_else(|| Status::unauthenticated("no peer identity found"))?;
+        let requesting_spiffe_id = connect_info
+            .spiffe_id
             .ok_or_else(|| Status::unauthenticated("no peer identity found"))?;
 
         let req = request.into_inner();

@@ -21,12 +21,10 @@ impl ControlPoolManager {
     }
 
     /// Derive a deterministic Raft node ID from a provider handle.
+    /// Shared with the manual join path (raft::derive_raft_node_id) so both
+    /// always agree on node IDs.
     fn derive_node_id(provider_handle: &str) -> u64 {
-        let hash = blake3::hash(provider_handle.as_bytes());
-        let bytes = hash.as_bytes();
-        u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ])
+        crate::raft::derive_raft_node_id(provider_handle)
     }
 
     /// Handle the status of a CONTROL pool.

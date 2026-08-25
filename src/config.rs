@@ -82,12 +82,22 @@ pub struct ClusterConfig {
     /// "bootstrap" for the one-time first node, "join" for all others.
     pub mode: ClusterMode,
 
-    /// For `join` mode: the address of an existing control node to contact
-    /// after attestation + Join Token + SVID issuance.
+    /// For `join` mode: Data/Control address of an existing control node
+    /// (attestation + CA endpoints).
     #[serde(default)]
     pub join_target: Option<String>,
 
+    /// For `join` mode: raft transport address of an existing control node
+    /// (where RaftTransport.RequestJoin is served).
+    #[serde(default)]
+    pub join_raft_target: Option<String>,
+
+    /// For `join` mode: single-use join token minted via AdminService.
+    #[serde(default)]
+    pub join_token: String,
+
     /// For `bootstrap` mode: initial single-node Raft cluster.
+    /// Addresses MUST be raft transport addresses (listeners.raft).
     /// Ignored in join mode.
     #[serde(default)]
     pub initial_members: Vec<RaftMemberConfig>,

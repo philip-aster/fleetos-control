@@ -47,5 +47,8 @@ pub enum TlsError {
 /// when the stream implements `Connected`.
 #[derive(Debug, Clone)]
 pub struct PeerConnectInfo {
-    pub spiffe_id: fleetos_core::spiffe::SpiffeId,
+    /// Authenticated peer SpiffeId. `None` for unauthenticated connections,
+    /// which are only possible on listeners with optional client auth
+    /// (the Data/Control listener, for the pre-SVID attestation flow).
+    pub spiffe_id: Option<fleetos_core::spiffe::SpiffeId>,
 }

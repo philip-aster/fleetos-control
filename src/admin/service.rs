@@ -62,9 +62,14 @@ impl AdminServiceImpl {
             .extensions()
             .get::<crate::tls::PeerConnectInfo>()
             .ok_or_else(|| Status::unauthenticated("no peer certificate found"))?;
+        let spiffe_id = connect_info
+            .spiffe_id
+            .as_ref()
+            .ok_or_else(|| Status::unauthenticated("no peer certificate found"))?;
 
-        authz::verify_admin_caller(&connect_info.spiffe_id)
+        authz::verify_admin_caller(spiffe_id)
             .map_err(|_| Status::permission_denied("caller SVID kind is not ctrl"))?;
+
         Ok(())
     }
 }

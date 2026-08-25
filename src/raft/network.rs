@@ -38,13 +38,16 @@ impl TonicRaftNetworkFactory {
 impl RaftNetworkFactory<FleetosRaftConfig> for TonicRaftNetworkFactory {
     type Network = TonicRaftNetwork;
 
-    async fn new_client(&mut self, target: u64, _node: &openraft::BasicNode) -> Self::Network {
-        let address = self
-            .peer_addresses
-            .lock()
-            .get(&target)
-            .cloned()
-            .unwrap_or_default();
+    async fn new_client(&mut self, target: u64, node: &openraft::BasicNode) -> Self::Network {
+        // Prefer the static config map (bootstrap); fall back to the address
+        // openraft learned from membership changes (join mode).
+        let address = {
+            let peers = self.peer_addresses.lock();
+            peers
+                .get(&target)
+                .cloned()
+                .unwrap_or_else(|| node.addr.clone())
+        };
         TonicRaftNetwork {
             target,
             address,
@@ -63,7 +66,12 @@ impl TonicRaftNetwork {
     async fn get_client(&self) -> Result<RaftTransportClient<Channel>, std::io::Error> {
         let mut client_guard = self.client.lock().await;
         if client_guard.is_none() {
-            let channel = Channel::from_shared(self.address.clone())
+            let endpoint = if self.address.starts_with("http") {
+                self.address.clone()
+            } else {
+                format!("http://{}", self.address)
+            };
+            let channel = Channel::from_shared(endpoint)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
                 .connect()
                 .await
@@ -104,6 +112,7 @@ impl RaftNetwork<FleetosRaftConfig> for TonicRaftNetwork {
             .get_client()
             .await
             .map_err(|e| self.map_io_to_rpc_err(e))?;
+
         let payload = Self::serialize(&req).map_err(|e| self.map_io_to_rpc_err(e))?;
 
         let rpc = RaftRpc {
@@ -131,6 +140,7 @@ impl RaftNetwork<FleetosRaftConfig> for TonicRaftNetwork {
             .get_client()
             .await
             .map_err(|e| self.map_io_to_rpc_err(e))?;
+
         let payload = Self::serialize(&req).map_err(|e| self.map_io_to_rpc_err(e))?;
 
         let rpc = RaftRpc {
@@ -175,6 +185,7 @@ impl RaftNetwork<FleetosRaftConfig> for TonicRaftNetwork {
             meta: snapshot.meta,
             data,
         };
+
         let payload =
             Self::serialize(&wire).map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
 

@@ -7,6 +7,7 @@ pub mod config;
 pub mod controllers;
 pub mod delegation;
 pub mod dummy_ip;
+pub mod join;
 pub mod policy;
 pub mod proto;
 pub mod provisioning;

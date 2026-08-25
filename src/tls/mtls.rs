@@ -43,6 +43,37 @@ pub fn build_server_config(mtls: &MtlsConfig) -> Result<ServerConfig, TlsError> 
     Ok(config)
 }
 
+/// Build a `rustls::ServerConfig` with OPTIONAL client authentication.
+///
+/// Used by the Data/Control listener: attestation is inherently pre-SVID,
+/// so joiners connect without a client certificate. Peers that DO present
+/// a certificate are still fully validated against the trust bundle.
+pub fn build_server_config_optional_auth(mtls: &MtlsConfig) -> Result<ServerConfig, TlsError> {
+    let mut root_store = rustls::RootCertStore::empty();
+
+    let certs = rustls_pemfile::certs(&mut mtls.trust_bundle_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TlsError::Certificate(format!("failed to parse trust bundle PEM: {}", e)))?;
+
+    for cert in certs {
+        root_store.add(cert).map_err(|e| {
+            TlsError::Certificate(format!("failed to add cert to root store: {}", e))
+        })?;
+    }
+
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| TlsError::Certificate(format!("failed to build client verifier: {}", e)))?;
+
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(mtls.cert_chain.clone(), mtls.private_key.clone_key())
+        .map_err(|e| TlsError::Rustls(format!("failed to build server config: {}", e)))?;
+
+    Ok(config)
+}
+
 /// Build a `rustls::ClientConfig` for outbound connections.
 pub fn build_client_config(mtls: &MtlsConfig) -> Result<ClientConfig, TlsError> {
     let mut root_store = rustls::RootCertStore::empty();

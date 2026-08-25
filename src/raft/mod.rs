@@ -2,11 +2,10 @@
 //!
 //! This module provides:
 //! - Type configuration (`FleetosRaftConfig`)
-//! - Log storage (`store::RedbLogStorage`)
-//! - State machine (`state_machine::RedbStateMachine`)
+//! - Log storage (`store::FjallLogStorage`)
+//! - State machine (`state_machine::FjallStateMachine`)
 //! - Tonic-based network transport (`network::TonicRaftNetwork`)
 //! - Initialization / bootstrap logic
-
 pub mod entry;
 pub mod error;
 pub mod network;
@@ -16,10 +15,9 @@ pub mod snapshot;
 pub mod state_machine;
 pub mod store;
 
+use openraft::declare_raft_types;
 use std::io::Cursor;
 use std::sync::Arc;
-
-use openraft::declare_raft_types;
 
 /// Application-level command replicated through the Raft log.
 ///
@@ -36,7 +34,6 @@ pub enum FleetosCommand {
     DeleteTenant {
         tenant_id: String,
     },
-
     // --- Workloads ---
     SubmitWorkloadSpec {
         record: records::WorkloadSpecRecord,
@@ -44,7 +41,6 @@ pub enum FleetosCommand {
     SubmitCronWorkload {
         record: records::CronWorkloadRecord,
     },
-
     // --- Attestation / join ---
     MintJoinToken {
         record: crate::attestation::join_token::JoinTokenRecord,
@@ -55,7 +51,6 @@ pub enum FleetosCommand {
     SetPcrPolicy {
         record: crate::attestation::pcr_policy::PcrPolicy,
     },
-
     // --- Nodes ---
     RegisterNode {
         record: records::NodeRecord,
@@ -69,7 +64,6 @@ pub enum FleetosCommand {
         node_id: String,
         schedulable: bool,
     },
-
     // --- Delegations (degraded mode) ---
     /// Upsert into active_delegations. Covers both issuance and refresh (a refresh
     /// is an upsert with recomputed issued_at / expires_at / refresh_at).
@@ -80,7 +74,6 @@ pub enum FleetosCommand {
         node_id: String,
         delegation_id: String,
     },
-
     // --- SAG policy ---
     UpsertSagRule {
         record: records::SagRuleRecord,
@@ -88,7 +81,6 @@ pub enum FleetosCommand {
     DeleteSagRule {
         rule_id: String,
     },
-
     // --- Dummy IP ---
     AllocateTenantBlock {
         record: crate::dummy_ip::allocator::TenantBlock,
@@ -99,12 +91,10 @@ pub enum FleetosCommand {
         block: crate::dummy_ip::allocator::TenantBlock,
         address: crate::dummy_ip::allocator::ServiceAddress,
     },
-
     // --- Secrets ---
     StoreSecret {
         record: records::SecretRecord,
     },
-
     // --- Scheduler / placement ---
     RecordOrdinalAssignment {
         record: crate::scheduler::ordinal::OrdinalAssignment,
@@ -112,7 +102,6 @@ pub enum FleetosCommand {
     CommitPlacement {
         record: crate::scheduler::Placement,
     },
-
     // --- Provisioning ---
     StoreNodePool {
         record: crate::provisioning::NodePoolRecord,
@@ -138,6 +127,38 @@ declare_raft_types!(
         Entry        = openraft::Entry<FleetosRaftConfig>,
         SnapshotData = Cursor<Vec<u8>>,
 );
+
+/// Payload for `RaftTransport.RequestJoin` (postcard-serialized into RaftRpc.payload).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JoinRequestPayload {
+    /// Raft node ID the joiner will use (derived from its node name).
+    pub node_id: u64,
+    /// Address of the joiner's raft transport listener.
+    pub address: String,
+}
+
+/// Response payload for `RaftTransport.RequestJoin`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JoinResponsePayload {
+    /// True if the node was added as learner (caught up) and promoted to voter.
+    pub success: bool,
+    /// If the contacted node is not the leader, the leader's raft address
+    /// so the joiner can retry against it.
+    pub leader_address: Option<String>,
+}
+
+/// Derive a deterministic Raft node ID from a stable string handle.
+///
+/// Both manual join (`join.rs` via `init_raft_cluster`) and the provisioning
+/// CONTROL-pool manager use this so the leader and the joining node always
+/// agree on the node ID.
+pub fn derive_raft_node_id(handle: &str) -> u64 {
+    let hash = blake3::hash(handle.as_bytes());
+    let bytes = hash.as_bytes();
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
 
 /// Shared handle to the running Raft node.
 #[derive(Clone)]

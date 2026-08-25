@@ -11,18 +11,27 @@ name = "control-1"
 # mode:
 #   "bootstrap" — one-time, first control node. Generates both CA roots,
 #                 forms a single-node Raft cluster. Never run this twice.
-#   "join"      — all subsequent control nodes. Attest, get Join Token,
-#                 get SVID, then add-learner → promote.
+#   "join"      — all subsequent control nodes. Attest, get SVID, request
+#                 membership, catch up via snapshot, promote to voter.
 [cluster]
 mode = "bootstrap"
 
-# For join mode only: address of an existing control node.
+# For join mode only: Data/Control address of an existing control node.
 # join_target = "10.0.1.1:9443"
 
+# For join mode only: raft transport address of an existing control node.
+# join_raft_target = "10.0.1.1:9445"
+
+# For join mode only: single-use join token from AdminService.GenerateJoinToken.
+# join_token = ""
+
 # For bootstrap mode: initial Raft membership (single node).
+# NOTE: address MUST be the raft transport address (listeners.raft),
+# not the Data/Control address.
 [[cluster.initial_members]]
 id = 1
-address = "10.0.1.1:9443"
+address = "10.0.1.1:9445"
+
 
 # -----------------------------------------------------------------------------
 # Storage
