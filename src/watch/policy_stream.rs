@@ -47,6 +47,8 @@ impl PolicyService for PolicyServiceImpl {
                             version: update.version.get(),
                             rules,
                             revoked_delegation_ids: update.revoked_delegation_ids,
+                            // Step 19 (G-4) will populate this from the revocation set.
+                            revoked_spiffe_ids: Vec::new(),
                         };
                         yield Ok(sag_update);
                     }

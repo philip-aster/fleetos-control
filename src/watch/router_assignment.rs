@@ -23,6 +23,8 @@ pub struct RouteEntryRecord {
     pub destination_role: String,
     /// The agent node hosting this destination (SPIFFE ID of the agent).
     pub target_agent_svid: String,
+    /// The allocated dummy service address in canonical IPv4 value form.
+    pub dummy_ip: u32,
 }
 
 /// The RouterAssignmentService gRPC implementation.
@@ -90,6 +92,7 @@ fn deserialize_routes(bytes: &[u8]) -> Result<Vec<RouteEntry>, super::WatchError
             destination_svid: r.destination_svid,
             destination_role: r.destination_role,
             target_agent_svid: r.target_agent_svid,
+            dummy_ip: r.dummy_ip,
         })
         .collect())
 }

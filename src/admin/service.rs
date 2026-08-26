@@ -9,8 +9,11 @@ use crate::raft::FleetosRaftConfig;
 use fleetos_core::proto::admin::AdminService;
 use fleetos_core::proto::admin::ClusterStatus;
 use fleetos_core::proto::admin::{
-    CreateTenantRequest, CreateTenantResponse, GenerateJoinTokenRequest, GenerateJoinTokenResponse,
-    GetClusterStatusRequest, ListNodesRequest, ListNodesResponse, WorkloadSpecAck,
+    CreateTenantRequest, CreateTenantResponse, DelegatedKeyRequest, DelegatedKeyResponse,
+    DeleteSagRuleRequest, DeleteWorkloadRequest, GenerateJoinTokenRequest,
+    GenerateJoinTokenResponse, GetClusterStatusRequest, ListNodesRequest, ListNodesResponse,
+    NodeAck, NodeId, QuotaAck, QuotaRequest, QuotaResponse, SagRuleAck, ScaleWorkloadRequest,
+    SecretAck, SecretAclChange, StoreSecretRequest, UpsertSagRuleRequest, WorkloadSpecAck,
 };
 use fleetos_core::proto::workload::{CronWorkload, WorkloadSpec};
 use tonic::{Request, Response, Status};
@@ -331,5 +334,97 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(fleetos_core::proto::admin::CronWorkloadAck {
             accepted: true,
         }))
+    }
+
+    // --- v0.1.5-rc.1 AdminService surface (stubs pending Step 16/20) ---
+
+    async fn upsert_sag_rule(
+        &self,
+        request: Request<UpsertSagRuleRequest>,
+    ) -> Result<Response<SagRuleAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16/20"))
+    }
+
+    async fn delete_sag_rule(
+        &self,
+        request: Request<DeleteSagRuleRequest>,
+    ) -> Result<Response<SagRuleAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16/20"))
+    }
+
+    async fn store_secret(
+        &self,
+        request: Request<StoreSecretRequest>,
+    ) -> Result<Response<SecretAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16/20"))
+    }
+
+    async fn grant_secret_access(
+        &self,
+        request: Request<SecretAclChange>,
+    ) -> Result<Response<SecretAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16/20"))
+    }
+
+    async fn revoke_secret_access(
+        &self,
+        request: Request<SecretAclChange>,
+    ) -> Result<Response<SecretAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16/20"))
+    }
+
+    async fn request_delegated_key(
+        &self,
+        request: Request<DelegatedKeyRequest>,
+    ) -> Result<Response<DelegatedKeyResponse>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 20"))
+    }
+
+    async fn delete_workload(
+        &self,
+        request: Request<DeleteWorkloadRequest>,
+    ) -> Result<Response<WorkloadSpecAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16"))
+    }
+
+    async fn scale_workload(
+        &self,
+        request: Request<ScaleWorkloadRequest>,
+    ) -> Result<Response<WorkloadSpecAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16"))
+    }
+
+    async fn cordon_node(&self, request: Request<NodeId>) -> Result<Response<NodeAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16"))
+    }
+
+    async fn evict_node(&self, request: Request<NodeId>) -> Result<Response<NodeAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16"))
+    }
+
+    async fn set_quota(
+        &self,
+        request: Request<QuotaRequest>,
+    ) -> Result<Response<QuotaAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16"))
+    }
+
+    async fn get_quota(
+        &self,
+        request: Request<QuotaRequest>,
+    ) -> Result<Response<QuotaResponse>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 16"))
     }
 }

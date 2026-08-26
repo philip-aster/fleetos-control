@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "fleetos-core"
-version = "0.1.4"
+version = "0.1.5-rc-1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "fleetos-ebpf-common"
-version = "0.1.1"
+version = "0.1.2-rc-1"
 dependencies = [
  "bytemuck",
  "fleetos-core",

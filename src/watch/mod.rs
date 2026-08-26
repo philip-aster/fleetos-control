@@ -14,6 +14,7 @@ pub mod policy_stream;
 pub mod router_assignment;
 pub mod scheduler_stream;
 pub mod secret_service;
+pub mod status_service;
 pub mod watch_service;
 
 use thiserror::Error;

@@ -12,7 +12,9 @@ use fleetos_core::MonotonicVersion;
 use fleetos_core::hash::IdentityFingerprint;
 use fleetos_core::policy::{SagAction, SagRule, SagRuleId};
 use fleetos_core::spiffe::{IdKind, SpiffeId};
-use fleetos_ebpf_common::{EbpfPolicyKey, EbpfPolicyValue, EbpfPolicyWildcardKey, HostOrderPort};
+use fleetos_ebpf_common::{
+    DummyIpRouteValue, EbpfPolicyKey, EbpfPolicyValue, EbpfPolicyWildcardKey, HostOrderPort,
+};
 
 use super::fingerprint;
 use super::precedence;
@@ -215,6 +217,29 @@ pub fn rule_id(rule: &SagRule) -> SagRuleId {
             SagAction::Deny => "deny",
         },
     )
+}
+
+/// Convert route components into the `fleetos-ebpf-common` route map value struct.
+///
+/// Layout (40 bytes, 8-byte aligned):
+/// - dst_fp: IdentityFingerprint (16 bytes)
+/// - target_agent_fp: IdentityFingerprint (16 bytes)
+/// - sag_version: u64 (8 bytes)
+///
+/// The agent computes `dst_fp` and `target_agent_fp` from the SVID strings
+/// streamed via `WatchRoutes` using `IdentityFingerprint::of`. Control emits
+/// the full route set at each `MonotonicVersion`; the agent inserts all
+/// version-N entries, then purges entries with `sag_version < N`.
+pub fn to_ebpf_route_value(
+    dst_fp: IdentityFingerprint,
+    target_agent_fp: IdentityFingerprint,
+    sag_version: u64,
+) -> DummyIpRouteValue {
+    DummyIpRouteValue {
+        dst_fp,
+        target_agent_fp,
+        sag_version,
+    }
 }
 
 #[cfg(test)]
