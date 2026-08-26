@@ -18,15 +18,16 @@ pub fn sign_with_delegated_key(
     csr_der: &[u8],
     delegated_key_der: &[u8],
     delegated_cert_der: &[u8],
+    role: Option<&str>,
+    ordinal: Option<u32>,
 ) -> Result<Vec<u8>, CaError> {
-    // 1. Parse the CSR to extract params and public key
-    // rcgen 0.14.9 uses pki-types for DER wrappers
+    // 1. Parse the CSR (SPIFFE SAN + standard extensions only — see build_csr
+    //    contract — so rcgen parses it cleanly).
     let csr_der_type = CertificateSigningRequestDer::from(csr_der);
     let csr_params = CertificateSigningRequestParams::from_der(&csr_der_type)
         .map_err(|e| CaError::Signing(format!("failed to parse CSR: {}", e)))?;
 
     // 2. Parse the delegated private key
-    // Convert DER to PEM for rcgen's from_pem (safest cross-version compatibility)
     let delegated_key_pem = der_to_pem(delegated_key_der, "PRIVATE KEY")?;
     let delegated_key = KeyPair::from_pem(&delegated_key_pem)
         .map_err(|e| CaError::Signing(format!("failed to parse delegated key: {}", e)))?;
@@ -36,19 +37,28 @@ pub fn sign_with_delegated_key(
     let issuer = Issuer::from_ca_cert_der(&delegated_cert_der_type, &delegated_key)
         .map_err(|e| CaError::Signing(format!("failed to construct issuer: {}", e)))?;
 
-    // 4. Add degraded-mode OID extension to the certificate params
+    // 4. Stamp FleetOS custom extensions. Delegated signing is degraded by
+    //    definition; role/ordinal come from the caller (delegated flow knows them).
     let mut final_params = csr_params.params;
     final_params
         .custom_extensions
         .push(oid::degraded_extension(true));
+    if let Some(role) = role {
+        final_params
+            .custom_extensions
+            .push(oid::role_extension(role));
+    }
+    if let Some(ordinal) = ordinal {
+        final_params
+            .custom_extensions
+            .push(oid::ordinal_extension(ordinal));
+    }
 
     // 5. Sign the certificate with the delegated key using the CSR's public key
-    // CertificateParams::signed_by takes the subject's public key and the issuer
     let cert = final_params
         .signed_by(&csr_params.public_key, &issuer)
         .map_err(CaError::Rcgen)?;
 
-    // 6. Return the DER-encoded certificate
     Ok(cert.der().to_vec())
 }
 

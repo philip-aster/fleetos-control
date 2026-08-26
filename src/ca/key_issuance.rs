@@ -330,34 +330,28 @@ mod tests {
     /// The constraint must not break the legitimate path: signing an
     /// end-entity workload SVID under a pathLen=0 intermediate.
     ///
-    /// NOTE: builds a minimal CSR directly (SPIFFE URI SAN only) rather than
-    /// via `rcgen_impl::build_csr`, because `build_csr` embeds the FleetOS
-    /// custom OID extensions and `sign_with_delegated_key` currently cannot
-    /// parse custom-extension CSRs (separate pre-existing gap, tracked as a
-    /// new finding). The minimal CSR is enough to prove pathLen=0 does not
-    /// block end-entity signing.
+    /// Per the build_csr contract, the CSR carries only the SPIFFE SAN; the
+    /// signer stamps degraded=true plus role/ordinal.
     #[test]
     fn delegated_intermediate_still_signs_end_entity_svids() {
         let key = issue_and_deserialize();
 
-        let key_pair = rcgen::KeyPair::generate().unwrap();
-        let mut csr_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        csr_params.subject_alt_names.push(rcgen::SanType::URI(
-            "spiffe://fleet.example.internal/ns/tenant-1/sa/db"
-                .to_string()
-                .try_into()
-                .unwrap(),
-        ));
-        let csr_der = csr_params
-            .serialize_request(&key_pair)
-            .unwrap()
-            .der()
-            .to_vec();
+        let csr_params = crate::ca::rcgen_impl::SvidParams {
+            spiffe_id: "spiffe://fleet.example.internal/ns/tenant-1/sa/db".to_owned(),
+            kind: crate::ca::rcgen_impl::SvidKind::Workload,
+            role: None,      // not embedded in CSR; passed to the signer below
+            ordinal: None,   // not embedded in CSR; passed to the signer below
+            degraded: false, // signer stamps degraded=true on the delegated path
+            ttl_secs: 3600,
+        };
+        let csr = crate::ca::rcgen_impl::build_csr(&csr_params).unwrap();
 
         let signed = crate::ca::delegated::sign_with_delegated_key(
-            &csr_der,
+            &csr.csr_der,
             key.signing_key.as_slice(),
             &key.intermediate_cert_der,
+            Some("replica"),
+            Some(0),
         )
         .expect("end-entity signing under a pathLen=0 intermediate must succeed");
         assert!(!signed.is_empty());

@@ -67,20 +67,13 @@ pub fn build_csr(params: &SvidParams) -> Result<CsrBundle, CaError> {
     // Not a CA certificate.
     cert_params.is_ca = IsCa::NoCa;
 
-    // Add custom OID extensions.
-    if let Some(ref role) = params.role {
-        cert_params
-            .custom_extensions
-            .push(oid::role_extension(role));
-    }
-    if let Some(ordinal) = params.ordinal {
-        cert_params
-            .custom_extensions
-            .push(oid::ordinal_extension(ordinal));
-    }
-    cert_params
-        .custom_extensions
-        .push(oid::degraded_extension(params.degraded));
+    // CONTRACT: the CSR carries ONLY the SPIFFE URI SAN + standard extensions.
+    // FleetOS custom OID extensions (role/ordinal/degraded) are deliberately NOT
+    // embedded here: rcgen 0.14.9's CertificateSigningRequestParams::from_der
+    // rejects CSRs with unknown custom extensions, which would break sign_csr /
+    // sign_with_delegated_key. The CA stamps those extensions at signing time
+    // (sign_csr adds degraded=false; sign_with_delegated_key adds degraded=true
+    // plus role/ordinal). Do not re-add custom extensions to the CSR.
 
     // Generate CSR.
     let csr = cert_params
@@ -270,17 +263,54 @@ pub fn sign_csr(
     let issuer = Issuer::from_ca_cert_der(&ca_cert_der_type, ca_key_pair)
         .map_err(|e| CaError::Signing(format!("failed to construct issuer: {}", e)))?;
 
-    // 3. Set validity window on the leaf params.
     let mut final_params = csr_params.params;
     let not_before = OffsetDateTime::now_utc();
     let not_after = not_before + time::Duration::seconds(ttl_secs as i64);
     final_params.not_before = not_before;
     final_params.not_after = not_after;
 
-    // 4. Sign the certificate with the CA using the CSR's public key.
+    // Normal CA issuance is never degraded. Stamp the marker here (the CSR no
+    // longer carries it — see build_csr contract).
+    final_params
+        .custom_extensions
+        .push(oid::degraded_extension(false));
+
     let cert = final_params
         .signed_by(&csr_params.public_key, &issuer)
         .map_err(CaError::Rcgen)?;
 
     Ok(cert.der().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ca::trust_bundle::TrustBundle;
+
+    /// Regression for the CSR-parsing defect: a CSR produced by build_csr must
+    /// round-trip through sign_csr. Previously build_csr embedded FleetOS custom
+    /// OID extensions, which rcgen's from_der rejects.
+    #[test]
+    fn build_csr_then_sign_csr_round_trips() {
+        let bundle = TrustBundle::generate_root("test.example.internal").unwrap();
+        let csr_params = SvidParams {
+            spiffe_id: "spiffe://test.example.internal/ns/system/control/c1".to_owned(),
+            kind: SvidKind::Control,
+            role: None,
+            ordinal: None,
+            degraded: false,
+            ttl_secs: 3600,
+        };
+        let csr = build_csr(&csr_params).unwrap();
+        let cert_der = sign_csr(
+            &csr.csr_der,
+            &bundle.current_key,
+            &bundle.current_cert_der,
+            3600,
+        )
+        .expect("sign_csr must accept a build_csr-produced CSR");
+        assert!(!cert_der.is_empty());
+        // The issued SVID must validate against the issuing bundle.
+        assert!(bundle.validate_svid(&cert_der).unwrap());
+    }
 }
