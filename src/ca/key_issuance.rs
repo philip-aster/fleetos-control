@@ -71,7 +71,7 @@ pub fn issue_delegated_key(
     intermediate_params.distinguished_name = dn;
 
     // This is a CA certificate (but constrained via NameConstraints)
-    intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
 
     // CA key usages
     intermediate_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -235,5 +235,151 @@ impl PlacementVerifier for StoragePlacementVerifier {
             target_svid_id: target_svid_id.to_string(),
             target_ordinal: target_ordinal.unwrap_or(0),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ca::trust_bundle::TrustBundle;
+    use x509_parser::prelude::ParsedExtension;
+
+    /// Deserialization mirror of `fleetos_core::spiffe::DelegatedSigningKey`.
+    ///
+    /// The core struct carries no serde derives (its key material is opaque by
+    /// design — the fleetos-core addendum confirms core never parses it), so
+    /// tests read back the postcard layout via a shadow with identical field
+    /// names and types. Postcard serializes `&str`/`String` and `&[u8]`/
+    /// `Vec<u8>` identically, so this round-trips exactly.
+    #[derive(serde::Deserialize)]
+    struct DelegatedSigningKeyMirror {
+        node_id: String,
+        target_svid_id: String,
+        target_ordinal: Option<u32>,
+        issued_at_unix: u64,
+        expires_at_unix: u64,
+        signing_key: Vec<u8>,
+        intermediate_cert_der: Vec<u8>,
+    }
+
+    /// Test-only verifier that always passes placement, so these tests
+    /// isolate certificate-capability behavior from issuance gating.
+    struct AlwaysPlace;
+    impl PlacementVerifier for AlwaysPlace {
+        fn verify_placement(
+            &self,
+            _node_id: &SpiffeId,
+            _target_svid_id: &SpiffeId,
+            _target_ordinal: Option<u32>,
+        ) -> Result<(), CaError> {
+            Ok(())
+        }
+    }
+
+    fn delegation_request() -> DelegationRequest {
+        DelegationRequest {
+            node_id: "spiffe://fleet.example.internal/ns/system/node/agent-1"
+                .parse()
+                .unwrap(),
+            target_svid_id: "spiffe://fleet.example.internal/ns/tenant-1/sa/db"
+                .parse()
+                .unwrap(),
+            target_ordinal: Some(0),
+            ttl_secs: 3600,
+        }
+    }
+
+    /// Issue a delegated key against a fresh root and read back the issued
+    /// postcard layout so tests inspect the real artifact.
+    fn issue_and_deserialize() -> DelegatedSigningKeyMirror {
+        let bundle = TrustBundle::generate_root("fleet.example.internal").unwrap();
+        let trust_bundle = RwLock::new(bundle);
+        let issued =
+            issue_delegated_key(&delegation_request(), &trust_bundle, &AlwaysPlace).unwrap();
+        postcard::from_bytes(&issued.key_bytes)
+            .expect("issued bytes must deserialize into the delegated-key layout")
+    }
+
+    /// M-1 regression: the delegated intermediate must carry
+    /// pathLenConstraint = 0. Under `Unconstrained`, a compromised agent
+    /// could mint sub-CAs; the constraint makes that structurally impossible.
+    #[test]
+    fn delegated_intermediate_is_path_length_constrained() {
+        let key = issue_and_deserialize();
+
+        let (_, cert) = x509_parser::parse_x509_certificate(&key.intermediate_cert_der)
+            .expect("intermediate cert must parse");
+
+        let bc = cert
+            .extensions()
+            .iter()
+            .find_map(|ext| match ext.parsed_extension() {
+                ParsedExtension::BasicConstraints(bc) => Some(bc),
+                _ => None,
+            })
+            .expect("intermediate cert must carry BasicConstraints");
+
+        assert!(bc.ca, "delegated intermediate must be a CA");
+        assert_eq!(
+            bc.path_len_constraint,
+            Some(0),
+            "pathLenConstraint must be 0 — sub-CA chaining must be impossible"
+        );
+    }
+
+    /// The constraint must not break the legitimate path: signing an
+    /// end-entity workload SVID under a pathLen=0 intermediate.
+    ///
+    /// NOTE: builds a minimal CSR directly (SPIFFE URI SAN only) rather than
+    /// via `rcgen_impl::build_csr`, because `build_csr` embeds the FleetOS
+    /// custom OID extensions and `sign_with_delegated_key` currently cannot
+    /// parse custom-extension CSRs (separate pre-existing gap, tracked as a
+    /// new finding). The minimal CSR is enough to prove pathLen=0 does not
+    /// block end-entity signing.
+    #[test]
+    fn delegated_intermediate_still_signs_end_entity_svids() {
+        let key = issue_and_deserialize();
+
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let mut csr_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        csr_params.subject_alt_names.push(rcgen::SanType::URI(
+            "spiffe://fleet.example.internal/ns/tenant-1/sa/db"
+                .to_string()
+                .try_into()
+                .unwrap(),
+        ));
+        let csr_der = csr_params
+            .serialize_request(&key_pair)
+            .unwrap()
+            .der()
+            .to_vec();
+
+        let signed = crate::ca::delegated::sign_with_delegated_key(
+            &csr_der,
+            key.signing_key.as_slice(),
+            &key.intermediate_cert_der,
+        )
+        .expect("end-entity signing under a pathLen=0 intermediate must succeed");
+        assert!(!signed.is_empty());
+    }
+
+    /// The postcard wire layout must round-trip through the mirror with every
+    /// field intact — this is the contract any consumer of
+    /// `DelegatedKeyResponse.key_material` parses against (fleetos-agent's
+    /// degraded-mode renewal path, per the ledger).
+    #[test]
+    fn delegated_key_wire_layout_round_trips() {
+        let request = delegation_request();
+        let key = issue_and_deserialize();
+
+        assert_eq!(key.node_id, request.node_id.to_string());
+        assert_eq!(key.target_svid_id, request.target_svid_id.to_string());
+        assert_eq!(key.target_ordinal, Some(0));
+        assert!(key.issued_at_unix > 0);
+        assert_eq!(
+            key.expires_at_unix - key.issued_at_unix,
+            request.ttl_secs,
+            "expiry must be exactly issued_at + ttl_secs"
+        );
     }
 }
