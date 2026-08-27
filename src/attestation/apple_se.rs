@@ -7,6 +7,10 @@
 //! Requires `security-framework` crate (macOS only).
 //! Feature-gated: only compiled on `target_os = "macos"` with `apple-se` feature.
 
+//! SECURITY (Master findings M-2/S-11): until the verification TODO below is
+//! implemented, attestation checks are STRUCTURAL ONLY — nonce binding plus
+//! non-empty fields. Control-plane join is currently gated by join-token
+//! possession alone.
 use super::AttestationError;
 
 /// An Apple Secure Enclave attestation submission.

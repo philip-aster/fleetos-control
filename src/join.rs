@@ -88,10 +88,18 @@ pub async fn join_cluster(
 
     tracing::debug!(nonce_len = nonce.len(), "attestation nonce received");
 
-    // 3. SubmitQuote — construct a serialized TPM quote bound to the nonce.
-    //    The server deserializes this, extracts the nonce, and verifies it
-    //    against the NonceManager. Full hardware-quote signature verification
-    //    is enforced server-side via the TPM/Apple SE verifiers.
+    // 3. SubmitQuote — construct a TPM quote bound to the nonce. The server
+    //    deserializes it, extracts the nonce, and verifies it against the
+    //    NonceManager.
+    //
+    // SECURITY (Master findings M-2/S-11): the quote below is a STRUCTURAL
+    // PLACEHOLDER — zeroed quote/signature bytes. The server-side verifiers
+    // (attestation/tpm.rs, attestation/apple_se.rs) currently check structure
+    // and nonce binding only, not cryptographic signatures. Until real quote
+    // generation (client) and signature verification (server) land,
+    // control-plane join is gated by JOIN-TOKEN POSSESSION ALONE. Treat join
+    // tokens as high-value secrets: they are single-use and TTL-bounded
+    // (default 24h), but a leaked token yields a voter.
     let tpm_quote = crate::attestation::tpm::TpmQuote {
         quote_bytes: vec![0u8; 32],         // Placeholder TPM quote structure
         signature: vec![0u8; 64],           // Placeholder signature

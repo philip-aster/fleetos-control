@@ -126,11 +126,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- Phase 5: Core services initialization ---
-    let join_token_store = Arc::new(JoinTokenStore::new(keyspaces.join_tokens.clone()));
+    let join_token_store = Arc::new(JoinTokenStore::with_ttl(
+        keyspaces.join_tokens.clone(),
+        config.attestation.join_token_ttl_secs,
+    ));
+
     let dummy_ip_allocator = Arc::new(DummyIpAllocator::new(
         keyspaces.dummy_ips.clone(),
         config.dummy_ip.tenant_block_prefix,
     )?);
+
     let ordinal_tracker = Arc::new(OrdinalTracker::new(keyspaces.ordinals.clone()));
     let delegation_revocation = Arc::new(DelegationRevocationStore::new(
         keyspaces.active_delegations.clone(),

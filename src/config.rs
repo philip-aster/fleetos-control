@@ -37,6 +37,10 @@ pub struct ControlConfig {
     /// At-rest secret encryption.
     pub secrets: SecretsConfig,
 
+    /// Attestation and join-token custody.
+    #[serde(default)]
+    pub attestation: AttestationConfig,
+
     /// gRPC listener addresses.
     pub listeners: ListenerConfig,
 
@@ -319,6 +323,31 @@ pub struct SecretsConfig {
     /// Path to the master key file for envelope encryption (FileMasterKey).
     /// For v1, this is a raw key file. Future: KMS-backed via MasterKeyProvider trait.
     pub master_key_path: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// Attestation
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttestationConfig {
+    /// TTL for single-use join tokens (Master findings M-2/S-11).
+    /// Until hardware-quote signature verification lands, join-token
+    /// possession is the sole gate to cluster membership, so tokens must
+    /// expire. Default 1 hour.
+    #[serde(default = "default_join_token_ttl_secs")]
+    pub join_token_ttl_secs: u16,
+}
+
+impl Default for AttestationConfig {
+    fn default() -> Self {
+        Self {
+            join_token_ttl_secs: default_join_token_ttl_secs(),
+        }
+    }
+}
+
+fn default_join_token_ttl_secs() -> u16 {
+    3600
 }
 
 // ---------------------------------------------------------------------------

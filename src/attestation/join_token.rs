@@ -17,6 +17,13 @@ use rand::Rng;
 /// Length of join tokens in bytes (256 bits).
 const TOKEN_LENGTH: usize = 32;
 
+/// Default join-token TTL: 24 hours (Master findings M-2/S-11).
+///
+/// Until hardware-quote signature verification lands, possession of a join
+/// token is the SOLE gate to cluster membership. Tokens must therefore be
+/// both single-use AND time-bounded.
+pub const DEFAULT_JOIN_TOKEN_TTL_SECS: u16 = 3600;
+
 /// A stored join token with metadata.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JoinTokenRecord {
@@ -49,38 +56,46 @@ pub enum NodeKind {
 /// Manages join token storage and lifecycle.
 pub struct JoinTokenStore {
     keyspace: Keyspace,
+    /// TTL applied to minted tokens.
+    ttl_secs: u16,
 }
 
 impl JoinTokenStore {
     pub fn new(keyspace: Keyspace) -> Self {
-        Self { keyspace }
+        Self::with_ttl(keyspace, DEFAULT_JOIN_TOKEN_TTL_SECS)
+    }
+
+    /// Override the token TTL (config-driven or test hook).
+    pub fn with_ttl(keyspace: Keyspace, ttl_secs: u16) -> Self {
+        Self { keyspace, ttl_secs }
     }
 
     /// Generate a new cryptographically-random join token.
     ///
-    /// The token is stored in fjall and returned to the caller.
+    /// The token is single-use, carries a TTL, and is stored in fjall.
     pub fn generate(&self, node_kind: NodeKind) -> Result<Vec<u8>, AttestationError> {
+        // Opportunistic sweep of expired tokens (best-effort, M-2 custody).
+        let _ = self.sweep_expired();
+
         let mut token = vec![0u8; TOKEN_LENGTH];
         rand::rng().fill_bytes(&mut token);
-
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let record = JoinTokenRecord {
             token: token.clone(),
             node_kind,
-            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-            expires_at: None,
+            created_at: now,
+            expires_at: Some(now + self.ttl_secs as i64),
             consumed: false,
         };
-
         let serialized = postcard::to_allocvec(&record).map_err(AttestationError::Serialization)?;
         self.keyspace
             .insert(token.as_slice(), serialized.as_slice())
             .map_err(|e| AttestationError::Storage(crate::storage::StorageError::Storage(e)))?;
-
         tracing::info!(
             node_kind = ?node_kind,
+            expires_in_secs = self.ttl_secs,
             "generated join token"
         );
-
         Ok(token)
     }
 
@@ -157,17 +172,140 @@ impl JoinTokenStore {
 
         Ok(tokens)
     }
+
+    /// Remove expired tokens. Runs opportunistically on every mint; also
+    /// available for maintenance paths. Returns the number removed.
+    pub fn sweep_expired(&self) -> Result<usize, AttestationError> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut expired_keys = Vec::new();
+        for guard in self.keyspace.prefix(Vec::<u8>::new()) {
+            let Ok(value) = guard.value() else {
+                continue;
+            };
+            if let Ok(record) = postcard::from_bytes::<JoinTokenRecord>(value.as_ref()) {
+                if !record.consumed && record.expires_at.is_some_and(|exp| now > exp) {
+                    expired_keys.push(record.token);
+                }
+            }
+        }
+        for key in &expired_keys {
+            self.keyspace
+                .remove(key.as_slice())
+                .map_err(|e| AttestationError::Storage(crate::storage::StorageError::Storage(e)))?;
+        }
+        if !expired_keys.is_empty() {
+            tracing::debug!(count = expired_keys.len(), "swept expired join tokens");
+        }
+        Ok(expired_keys.len())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Note: Integration tests require a real fjall database.
-    // Unit tests for token generation logic would go here.
+    fn test_store(name: &str, ttl_secs: u16) -> (std::sync::Arc<fjall::Database>, JoinTokenStore) {
+        let dir = std::env::temp_dir().join(format!(
+            "fleetos-join-token-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = crate::storage::open_database(&dir).unwrap();
+        let keyspaces = crate::storage::init_keyspaces(&db).unwrap();
+        (
+            db,
+            JoinTokenStore::with_ttl(keyspaces.join_tokens.clone(), ttl_secs),
+        )
+    }
 
     #[test]
     fn token_length_is_correct() {
         assert_eq!(TOKEN_LENGTH, 32);
+    }
+
+    #[test]
+    fn default_ttl_is_24_hours() {
+        assert_eq!(DEFAULT_JOIN_TOKEN_TTL_SECS, 3600);
+    }
+
+    #[test]
+    fn generated_token_carries_expiry() {
+        let (_db, store) = test_store("expiry", DEFAULT_JOIN_TOKEN_TTL_SECS);
+        let token = store.generate(NodeKind::Agent).unwrap();
+        let bytes = store.keyspace.get(&token).unwrap().expect("token stored");
+        let record: JoinTokenRecord = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            record.expires_at,
+            Some(record.created_at + DEFAULT_JOIN_TOKEN_TTL_SECS as i64),
+            "token must expire at created_at + ttl"
+        );
+    }
+
+    #[test]
+    fn expired_token_is_rejected_and_removed() {
+        let (_db, store) = test_store("expired", DEFAULT_JOIN_TOKEN_TTL_SECS);
+
+        // Manually insert an already-expired token to avoid sleeping in tests.
+        let token = vec![0xAA; TOKEN_LENGTH];
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let record = JoinTokenRecord {
+            token: token.clone(),
+            node_kind: NodeKind::Agent,
+            created_at: now - (DEFAULT_JOIN_TOKEN_TTL_SECS as i64 + 7200),
+            expires_at: Some(now - DEFAULT_JOIN_TOKEN_TTL_SECS as i64), // expired 1 hour ago
+            consumed: false,
+        };
+        let serialized = postcard::to_allocvec(&record).unwrap();
+        store
+            .keyspace
+            .insert(token.as_slice(), serialized.as_slice())
+            .unwrap();
+
+        let result = store.validate_and_consume(&token);
+        assert!(matches!(result, Err(AttestationError::JoinToken(_))));
+        // Expired tokens must be deleted — no retry path.
+        assert!(store.keyspace.get(&token).unwrap().is_none());
+    }
+
+    #[test]
+    fn sweep_removes_expired_tokens_only() {
+        let (_db, store) = test_store("sweep", DEFAULT_JOIN_TOKEN_TTL_SECS);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+        // 1. Insert an expired token manually.
+        let expired_token = vec![0xAA; TOKEN_LENGTH];
+        let expired_record = JoinTokenRecord {
+            token: expired_token.clone(),
+            node_kind: NodeKind::Agent,
+            created_at: now - (DEFAULT_JOIN_TOKEN_TTL_SECS as i64 + 7200),
+            expires_at: Some(now - DEFAULT_JOIN_TOKEN_TTL_SECS as i64),
+            consumed: false,
+        };
+        let serialized = postcard::to_allocvec(&expired_record).unwrap();
+        store
+            .keyspace
+            .insert(expired_token.as_slice(), serialized.as_slice())
+            .unwrap();
+
+        // 2. Insert a live token.
+        let live_token = vec![0xBB; TOKEN_LENGTH];
+        let live_record = JoinTokenRecord {
+            token: live_token.clone(),
+            node_kind: NodeKind::Router,
+            created_at: now,
+            expires_at: Some(now + DEFAULT_JOIN_TOKEN_TTL_SECS as i64),
+            consumed: false,
+        };
+        let serialized = postcard::to_allocvec(&live_record).unwrap();
+        store
+            .keyspace
+            .insert(live_token.as_slice(), serialized.as_slice())
+            .unwrap();
+
+        let swept = store.sweep_expired().unwrap();
+        assert_eq!(swept, 1);
+        assert!(store.keyspace.get(&expired_token).unwrap().is_none());
+        assert!(store.keyspace.get(&live_token).unwrap().is_some());
     }
 }

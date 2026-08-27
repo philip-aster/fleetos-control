@@ -80,6 +80,14 @@ tenant_block_prefix = 16
 # Path to the master key file (FileMasterKey for v1).
 master_key_path = "/var/lib/fleetos/master.key"
 
+# ---------------------------------------------------------------------------
+# Attestation
+# ---------------------------------------------------------------------------
+[attestation]
+# TTL for single-use join tokens (M-2 custody). Tokens are the sole gate to
+# cluster membership until hardware-quote verification lands, so they expire.
+join_token_ttl_secs = 3600
+
 # -----------------------------------------------------------------------------
 # gRPC listeners
 # -----------------------------------------------------------------------------

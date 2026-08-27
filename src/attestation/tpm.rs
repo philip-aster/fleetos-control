@@ -8,6 +8,11 @@
 //! Compiling with `tpm` feature on Linux requires TPM2 TSS dev headers:
 //!   sudo apt install tpm2-tss-dev
 
+//! SECURITY (Master findings M-2/S-11): until the signature-verification TODO
+//! below is implemented, quote verification is STRUCTURAL ONLY — nonce binding
+//! plus non-empty quote/signature bytes. Combined with `join.rs`'s placeholder
+//! quote, control-plane join is currently gated by join-token possession alone.
+
 use super::AttestationError;
 
 /// A TPM quote submitted by a node for attestation.
