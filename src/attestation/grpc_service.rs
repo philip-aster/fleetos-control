@@ -1,4 +1,5 @@
 //! AttestationService gRPC implementation.
+
 use super::join_token::JoinTokenStore;
 use super::nonce::NonceManager;
 use super::pcr_policy::PcrPolicyStore;
@@ -17,6 +18,8 @@ pub struct AttestationServiceImpl {
     /// Keyspace mapping issued nonce -> claimed SPIFFE ID from RequestNonce.
     /// Persisted to fjall so claims survive control-plane restarts.
     nonce_claims_keyspace: fjall::Keyspace,
+    /// Single-use CSR issuance grants keyed by attested SPIFFE ID (M-3).
+    svid_grants_keyspace: fjall::Keyspace,
 }
 
 impl AttestationServiceImpl {
@@ -25,12 +28,14 @@ impl AttestationServiceImpl {
         join_token_store: Arc<JoinTokenStore>,
         pcr_store: Arc<PcrPolicyStore>,
         nonce_claims_keyspace: fjall::Keyspace,
+        svid_grants_keyspace: fjall::Keyspace,
     ) -> Self {
         Self {
             nonce_manager,
             join_token_store,
             pcr_store,
             nonce_claims_keyspace,
+            svid_grants_keyspace,
         }
     }
 
@@ -186,6 +191,24 @@ impl AttestationService for AttestationServiceImpl {
             .map_err(|e| Status::internal(format!("nonce claim cleanup failed: {}", e)))?;
 
         let now = time::OffsetDateTime::now_utc();
+
+        // M-3: mint the single-use CSR issuance grant bound to this attested
+        // identity. This grant is the ONLY path to SubmitCsr without mTLS;
+        // SubmitCsr consumes it. Note: grants are node-local — the join flow
+        // pins RequestNonce/SubmitQuote/SubmitCsr to one channel/target, so
+        // all three RPCs hit this node.
+        let grant = crate::ca::SvidGrantRecord {
+            spiffe_id: claimed_spiffe_id.clone(),
+            node_kind: token_record.node_kind as u8,
+            granted_at: now.unix_timestamp(),
+            expires_at: now.unix_timestamp() + crate::ca::SVID_GRANT_TTL_SECS,
+        };
+        let grant_bytes = postcard::to_allocvec(&grant)
+            .map_err(|e| Status::internal(format!("grant serialization failed: {}", e)))?;
+        self.svid_grants_keyspace
+            .insert(claimed_spiffe_id.as_bytes(), grant_bytes.as_slice())
+            .map_err(|e| Status::internal(format!("failed to persist CSR grant: {}", e)))?;
+
         tracing::info!(
             claimed_spiffe_id = %claimed_spiffe_id,
             node_kind = ?token_record.node_kind,

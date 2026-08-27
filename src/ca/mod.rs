@@ -40,6 +40,28 @@ pub struct SvidRecord {
     pub issued_at_unix: i64,
 }
 
+/// TTL for single-use CSR issuance grants (Master finding M-3, join path).
+/// Long enough to cover CSR generation + signing round-trip; short enough
+/// to bound exposure of an unused grant.
+pub const SVID_GRANT_TTL_SECS: i64 = 300;
+
+/// Single-use issuance grant written by `submit_quote` on successful
+/// attestation (Master finding M-3).
+///
+/// Stored in the `svid_grants` keyspace keyed by the attested SPIFFE ID
+/// string. `CaServiceImpl::submit_csr` consumes it when an unauthenticated
+/// caller (the join flow — no SVID yet) presents a CSR for exactly this
+/// identity. One grant, one issuance, five minutes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SvidGrantRecord {
+    /// The attested SPIFFE ID — the only identity this grant can issue.
+    pub spiffe_id: String,
+    /// Node kind from the consumed join token (audit context).
+    pub node_kind: u8,
+    pub granted_at: i64,
+    pub expires_at: i64,
+}
+
 /// Errors from CA operations.
 #[derive(Debug, Error)]
 pub enum CaError {

@@ -386,6 +386,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             join_token_store.clone(),
             pcr_store,
             keyspaces.nonce_claims.clone(),
+            keyspaces.svid_grants.clone(),
         );
 
     // CaService is only available when the local CA is loaded.
@@ -394,6 +395,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ca.data_control.clone(),
             config.svid.node_ttl_secs,
             keyspaces.svids.clone(),
+            keyspaces.svid_grants.clone(),
+            keyspaces.placements.clone(),
         )
     });
 
