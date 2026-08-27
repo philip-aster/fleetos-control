@@ -21,7 +21,6 @@ use tonic::{Request, Response, Status};
 use super::authz;
 use crate::attestation::join_token::{JoinTokenStore, NodeKind};
 use crate::controllers::cron_controller::CronController;
-use crate::controllers::workload_controller::WorkloadController;
 use crate::dummy_ip::allocator::DummyIpAllocator;
 use crate::storage::StorageEngine;
 
@@ -30,9 +29,6 @@ pub struct AdminServiceImpl {
     storage: Arc<StorageEngine>,
     join_token_store: Arc<JoinTokenStore>,
     dummy_ip_allocator: Arc<DummyIpAllocator>,
-    workload_controller: Arc<WorkloadController>,
-    #[allow(dead_code)]
-    cron_controller: Arc<CronController>,
     raft: Arc<openraft::Raft<FleetosRaftConfig>>,
 }
 
@@ -41,16 +37,12 @@ impl AdminServiceImpl {
         storage: Arc<StorageEngine>,
         join_token_store: Arc<JoinTokenStore>,
         dummy_ip_allocator: Arc<DummyIpAllocator>,
-        workload_controller: Arc<WorkloadController>,
-        cron_controller: Arc<CronController>,
         raft: Arc<openraft::Raft<FleetosRaftConfig>>,
     ) -> Self {
         Self {
             storage,
             join_token_store,
             dummy_ip_allocator,
-            workload_controller,
-            cron_controller,
             raft,
         }
     }
@@ -81,9 +73,6 @@ impl AdminServiceImpl {
 
 #[tonic::async_trait]
 impl AdminService for AdminServiceImpl {
-    /// Create a new tenant namespace.
-    ///
-    /// This allocates a dummy IP block for the tenant from the 240.0.0.0/4 space.
     async fn create_tenant(
         &self,
         request: Request<CreateTenantRequest>,
@@ -95,7 +84,7 @@ impl AdminService for AdminServiceImpl {
             return Err(Status::invalid_argument("tenant_id cannot be empty"));
         }
 
-        // Check if tenant already exists.
+        // Idempotency guard: check local state before proposing.
         let existing = self
             .storage
             .get_tenant(&tenant_id)
@@ -107,22 +96,30 @@ impl AdminService for AdminServiceImpl {
             )));
         }
 
-        // Allocate a dummy IP block for this tenant.
-        self.dummy_ip_allocator
-            .allocate_tenant_block(&tenant_id)
+        // Compute the dummy IP block allocation (read-only).
+        let block = self
+            .dummy_ip_allocator
+            .compute_tenant_block_allocation(&tenant_id)
             .map_err(|e| Status::internal(format!("failed to allocate dummy IP block: {}", e)))?;
 
-        // Persist the tenant record.
+        // Propose AllocateTenantBlock
+        self.raft
+            .client_write(crate::raft::FleetosCommand::AllocateTenantBlock { record: block })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        // Propose CreateTenant
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let record = crate::raft::records::TenantRecord {
             tenant_id: tenant_id.clone(),
             created_at: now,
         };
-        self.storage
-            .store_tenant(&record)
-            .map_err(|e| Status::internal(format!("failed to store tenant: {}", e)))?;
+        self.raft
+            .client_write(crate::raft::FleetosCommand::CreateTenant { record })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
 
-        tracing::info!(tenant_id = %tenant_id, "tenant created");
+        tracing::info!(tenant_id = %tenant_id, "tenant created via raft");
         Ok(Response::new(CreateTenantResponse { success: true }))
     }
 
@@ -139,35 +136,26 @@ impl AdminService for AdminServiceImpl {
         request: Request<WorkloadSpec>,
     ) -> Result<Response<WorkloadSpecAck>, Status> {
         self.verify_caller(&request)?;
-
         let spec = request.into_inner();
-
-        // Validate the WorkloadSpec.
-        if spec.tenant_id.is_empty() {
-            return Err(Status::invalid_argument("tenant_id cannot be empty"));
-        }
-        if spec.workload_id.is_empty() {
-            return Err(Status::invalid_argument("workload_id cannot be empty"));
-        }
-        if spec.image.is_empty() {
-            return Err(Status::invalid_argument("image cannot be empty"));
-        }
-        if spec.replicas.is_empty() {
-            return Err(Status::invalid_argument("replicas map cannot be empty"));
+        if spec.tenant_id.is_empty()
+            || spec.workload_id.is_empty()
+            || spec.image.is_empty()
+            || spec.replicas.is_empty()
+        {
+            return Err(Status::invalid_argument("invalid workload spec"));
         }
 
-        // Trigger the workload controller to expand and schedule.
-        self.workload_controller
-            .reconcile(&spec)
+        let record = crate::raft::records::WorkloadSpecRecord {
+            tenant_id: spec.tenant_id.clone(),
+            workload_id: spec.workload_id.clone(),
+            spec_bytes: prost::Message::encode_to_vec(&spec),
+        };
+        self.raft
+            .client_write(crate::raft::FleetosCommand::SubmitWorkloadSpec { record })
             .await
-            .map_err(|e| Status::internal(format!("workload reconciliation failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
 
-        tracing::info!(
-            tenant_id = %spec.tenant_id,
-            workload_id = %spec.workload_id,
-            "workload spec submitted"
-        );
-
+        tracing::info!(tenant_id = %spec.tenant_id, workload_id = %spec.workload_id, "workload spec submitted via raft");
         Ok(Response::new(WorkloadSpecAck { accepted: true }))
     }
 
@@ -238,10 +226,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<GenerateJoinTokenRequest>,
     ) -> Result<Response<GenerateJoinTokenResponse>, Status> {
         self.verify_caller(&request)?;
-
         let req = request.into_inner();
-
-        // Parse the node kind from the request string.
         let node_kind = match req.node_kind.as_str() {
             "agent" => NodeKind::Agent,
             "router" => NodeKind::Router,
@@ -250,24 +235,27 @@ impl AdminService for AdminServiceImpl {
             "fleetctl_proxy" => NodeKind::FleetctlProxy,
             other => {
                 return Err(Status::invalid_argument(format!(
-                    "invalid node_kind '{}': expected agent, router, gateway, control, or fleetctl_proxy",
+                    "invalid node_kind '{}'",
                     other
                 )));
             }
         };
 
-        // Generate a cryptographically random join token.
-        let token = self
+        let record = self
             .join_token_store
-            .generate(node_kind)
+            .compute_token_record(node_kind)
             .map_err(|e| Status::internal(format!("failed to generate join token: {}", e)))?;
+        let token_bytes = record.token.clone();
 
-        tracing::info!(
-            node_kind = %req.node_kind,
-            "join token generated"
-        );
+        self.raft
+            .client_write(crate::raft::FleetosCommand::MintJoinToken { record })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
 
-        Ok(Response::new(GenerateJoinTokenResponse { token }))
+        tracing::info!(node_kind = %req.node_kind, "join token minted via raft");
+        Ok(Response::new(GenerateJoinTokenResponse {
+            token: token_bytes,
+        }))
     }
 
     /// Submit a cron workload definition.
@@ -279,33 +267,22 @@ impl AdminService for AdminServiceImpl {
         request: Request<CronWorkload>,
     ) -> Result<Response<fleetos_core::proto::admin::CronWorkloadAck>, Status> {
         self.verify_caller(&request)?;
-
         let cron = request.into_inner();
-
-        // Validate the CronWorkload.
-        if cron.tenant_id.is_empty() {
-            return Err(Status::invalid_argument("tenant_id cannot be empty"));
+        if cron.tenant_id.is_empty() || cron.cron_workload_id.is_empty() {
+            return Err(Status::invalid_argument("invalid cron workload"));
         }
-        if cron.cron_workload_id.is_empty() {
-            return Err(Status::invalid_argument("cron_workload_id cannot be empty"));
-        }
-
-        // Validate the cron expression.
         if let Some(schedule) = &cron.schedule {
             CronController::validate_expression(&schedule.expression)
                 .map_err(|e| Status::invalid_argument(format!("invalid cron expression: {}", e)))?;
         } else {
             return Err(Status::invalid_argument("schedule cannot be empty"));
         }
-
-        // Validate the workload template.
         if cron.workload_template.is_none() {
             return Err(Status::invalid_argument(
                 "workload_template cannot be empty",
             ));
         }
 
-        // Persist the CronWorkload to storage with cron: prefix.
         let spec_bytes = prost::Message::encode_to_vec(&cron);
         let record = crate::raft::records::CronWorkloadRecord {
             tenant_id: cron.tenant_id.clone(),
@@ -317,20 +294,12 @@ impl AdminService for AdminServiceImpl {
                 .unwrap_or_default(),
             spec_bytes,
         };
-        let serialized = postcard::to_allocvec(&record)
-            .map_err(|e| Status::internal(format!("serialization failed: {}", e)))?;
-        let key = format!("cron:{}:{}", record.tenant_id, record.cron_workload_id);
-        self.storage
-            .workloads
-            .insert(key.as_bytes(), serialized.as_slice())
-            .map_err(|e| Status::internal(format!("storage write failed: {}", e)))?;
+        self.raft
+            .client_write(crate::raft::FleetosCommand::SubmitCronWorkload { record })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
 
-        tracing::info!(
-            tenant_id = %cron.tenant_id,
-            cron_workload_id = %cron.cron_workload_id,
-            "cron workload submitted"
-        );
-
+        tracing::info!(tenant_id = %cron.tenant_id, cron_workload_id = %cron.cron_workload_id, "cron workload submitted via raft");
         Ok(Response::new(fleetos_core::proto::admin::CronWorkloadAck {
             accepted: true,
         }))

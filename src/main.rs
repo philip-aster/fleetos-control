@@ -281,6 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             join_token_store.clone(),
             control_pool_manager.clone(),
             storage_engine.clone(),
+            raft_handle.raft.clone(),
         )
         .await
         {
@@ -409,8 +410,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage_engine.clone(),
         join_token_store.clone(),
         dummy_ip_allocator.clone(),
-        workload_controller.clone(),
-        cron_controller.clone(),
         raft_handle.raft.clone(),
     );
 

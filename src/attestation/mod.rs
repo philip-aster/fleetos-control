@@ -17,7 +17,6 @@ pub mod join_token;
 pub mod nonce;
 pub mod pcr_policy;
 pub mod tpm;
-use std::sync::Arc;
 use thiserror::Error;
 
 use fleetos_core::spiffe::SpiffeId;
@@ -79,72 +78,4 @@ pub struct AttestationResult {
 
     /// Timestamp of successful attestation.
     pub attested_at: time::OffsetDateTime,
-}
-
-/// The attestation service orchestrates the full join flow.
-pub struct AttestationService {
-    nonce_manager: Arc<nonce::NonceManager>,
-    join_token_store: join_token::JoinTokenStore,
-    pcr_store: pcr_policy::PcrPolicyStore,
-}
-
-impl AttestationService {
-    pub fn new(
-        join_tokens_keyspace: fjall::Keyspace,
-        pcr_policies_keyspace: fjall::Keyspace,
-        nonces_keyspace: fjall::Keyspace,
-    ) -> Self {
-        Self {
-            nonce_manager: Arc::new(nonce::NonceManager::new(nonces_keyspace)),
-            join_token_store: join_token::JoinTokenStore::new(join_tokens_keyspace),
-            pcr_store: pcr_policy::PcrPolicyStore::new(pcr_policies_keyspace),
-        }
-    }
-
-    /// Issue a fresh nonce for an attestation challenge.
-    ///
-    /// Every attestation attempt requires a nonce we generated.
-    /// A captured quote from a previous join is worthless without the matching nonce.
-    pub fn issue_nonce(&self) -> Result<Vec<u8>, AttestationError> {
-        self.nonce_manager.generate_nonce()
-    }
-
-    /// Validate a nonce that was previously issued.
-    ///
-    /// Returns true if the nonce is valid and has not been used.
-    /// Consumes the nonce (single-use).
-    pub fn validate_nonce(&self, nonce: &[u8]) -> Result<bool, AttestationError> {
-        self.nonce_manager.validate_and_consume(nonce)
-    }
-
-    /// Generate a new join token for a specific node kind.
-    ///
-    /// Called by `AdminService.GenerateJoinToken`.
-    pub fn generate_join_token(
-        &self,
-        node_kind: join_token::NodeKind,
-    ) -> Result<Vec<u8>, AttestationError> {
-        self.join_token_store.generate(node_kind)
-    }
-
-    /// Validate and consume a join token (strict single-use).
-    ///
-    /// Called during the attestation flow after quote verification.
-    pub fn consume_join_token(
-        &self,
-        token: &[u8],
-    ) -> Result<join_token::JoinTokenRecord, AttestationError> {
-        self.join_token_store.validate_and_consume(token)
-    }
-
-    /// Get the expected PCR values for a node.
-    ///
-    /// Called during TPM quote verification to check if the node's
-    /// firmware/bootloader/kernel measurements match the expected policy.
-    pub fn get_expected_pcrs(
-        &self,
-        node_id: &str,
-    ) -> Result<Option<Vec<tpm::PcrValue>>, AttestationError> {
-        self.pcr_store.get_expected_pcrs(node_id)
-    }
 }

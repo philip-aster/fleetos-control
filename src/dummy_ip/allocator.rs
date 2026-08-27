@@ -117,42 +117,58 @@ impl DummyIpAllocator {
         Ok(used)
     }
 
-    /// Allocate a block for a new tenant.
-    pub fn allocate_tenant_block(&self, tenant_id: &str) -> Result<TenantBlock, DummyIpError> {
-        // Idempotency guard: a tenant gets exactly one block.
+    /// Compute a block allocation for a new tenant (read-only).
+    ///
+    /// The caller (AdminService) must propose this to Raft; the state machine
+    /// performs the actual write to the dummy_ips keyspace.
+    pub fn compute_tenant_block_allocation(
+        &self,
+        tenant_id: &str,
+    ) -> Result<TenantBlock, DummyIpError> {
         if self.get_tenant_block(tenant_id)?.is_some() {
             return Err(DummyIpError::TenantAlreadyAllocated(tenant_id.to_owned()));
         }
-
-        // Find the first free block index (handles gaps from deleted tenants).
         let used = self.used_block_indices()?;
         let max_blocks = self.max_tenant_blocks();
         let block_index = (0..max_blocks)
             .find(|i| !used.contains(i))
             .ok_or(DummyIpError::TenantSpaceExhausted)?;
-
-        let block = TenantBlock {
+        Ok(TenantBlock {
             tenant_id: tenant_id.to_owned(),
             base: self.block_base(block_index),
             prefix: self.tenant_block_prefix,
             next_offset: 0,
+        })
+    }
+
+    /// Compute a service address allocation (read-only).
+    ///
+    /// Returns the updated TenantBlock and the new ServiceAddress. The caller
+    /// must propose both to Raft.
+    pub fn compute_service_address_allocation(
+        &self,
+        tenant_id: &str,
+        service: &str,
+        role: &str,
+    ) -> Result<(TenantBlock, ServiceAddress), DummyIpError> {
+        if let Some(existing) = self.get_service_address(tenant_id, service, role)? {
+            return Ok((self.get_tenant_block(tenant_id)?.unwrap(), existing));
+        }
+        let mut block = self
+            .get_tenant_block(tenant_id)?
+            .ok_or_else(|| DummyIpError::TenantNotFound(tenant_id.to_owned()))?;
+        if block.next_offset >= block.max_hosts() {
+            return Err(DummyIpError::ServiceSpaceExhausted(tenant_id.to_owned()));
+        }
+        let address = block.base + block.next_offset;
+        block.next_offset += 1;
+        let assignment = ServiceAddress {
+            tenant_id: tenant_id.to_owned(),
+            service: service.to_owned(),
+            role: role.to_owned(),
+            address,
         };
-
-        // Persist.
-        let key = format!("{}{}", TENANT_KEY_PREFIX, tenant_id);
-        let serialized = postcard::to_allocvec(&block).map_err(DummyIpError::Serialization)?;
-        self.keyspace
-            .insert(key.as_bytes(), serialized.as_slice())
-            .map_err(|e| DummyIpError::Storage(crate::storage::StorageError::Storage(e)))?;
-
-        tracing::info!(
-            tenant_id = %tenant_id,
-            base = %Ipv4Addr::from(block.base),
-            prefix = block.prefix,
-            "allocated tenant dummy-IP block"
-        );
-
-        Ok(block)
+        Ok((block, assignment))
     }
 
     /// Get a tenant's block.
@@ -170,66 +186,6 @@ impl DummyIpAllocator {
             }
             None => Ok(None),
         }
-    }
-
-    /// Allocate a dummy IP for a `(tenant, service, role)` tuple.
-    ///
-    /// Idempotent: if the tuple already has an address, returns the existing one.
-    pub fn allocate_service_address(
-        &self,
-        tenant_id: &str,
-        service: &str,
-        role: &str,
-    ) -> Result<ServiceAddress, DummyIpError> {
-        // Idempotency: return existing assignment if present.
-        if let Some(existing) = self.get_service_address(tenant_id, service, role)? {
-            return Ok(existing);
-        }
-
-        // Load the tenant's block.
-        let mut block = self
-            .get_tenant_block(tenant_id)?
-            .ok_or_else(|| DummyIpError::TenantNotFound(tenant_id.to_owned()))?;
-
-        // Check the block isn't exhausted.
-        if block.next_offset >= block.max_hosts() {
-            return Err(DummyIpError::ServiceSpaceExhausted(tenant_id.to_owned()));
-        }
-
-        let address = block.base + block.next_offset;
-        block.next_offset += 1;
-
-        // Persist updated block (next_offset incremented).
-        let tenant_key = format!("{}{}", TENANT_KEY_PREFIX, tenant_id);
-        let block_serialized =
-            postcard::to_allocvec(&block).map_err(DummyIpError::Serialization)?;
-        self.keyspace
-            .insert(tenant_key.as_bytes(), block_serialized.as_slice())
-            .map_err(|e| DummyIpError::Storage(crate::storage::StorageError::Storage(e)))?;
-
-        // Persist the service address assignment.
-        let assignment = ServiceAddress {
-            tenant_id: tenant_id.to_owned(),
-            service: service.to_owned(),
-            role: role.to_owned(),
-            address,
-        };
-        let service_key = format!("{}{}:{}:{}", SERVICE_KEY_PREFIX, tenant_id, service, role);
-        let assignment_serialized =
-            postcard::to_allocvec(&assignment).map_err(DummyIpError::Serialization)?;
-        self.keyspace
-            .insert(service_key.as_bytes(), assignment_serialized.as_slice())
-            .map_err(|e| DummyIpError::Storage(crate::storage::StorageError::Storage(e)))?;
-
-        tracing::debug!(
-            tenant_id = %tenant_id,
-            service = %service,
-            role = %role,
-            address = %assignment.ip(),
-            "allocated service dummy IP"
-        );
-
-        Ok(assignment)
     }
 
     /// Get a service address assignment.

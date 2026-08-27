@@ -14,6 +14,7 @@ use super::{
     BootstrapPayload, NodeLifecycleState, NodePoolRecord, ProvisioningConfig, ProvisioningError,
 };
 use crate::attestation::join_token::{JoinTokenStore, NodeKind};
+use openraft::Raft;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ pub struct ProvisioningReconciler {
     join_token_store: Arc<JoinTokenStore>,
     control_pool_manager: Arc<ControlPoolManager>,
     storage: Arc<crate::storage::StorageEngine>,
+    raft: Arc<Raft<crate::raft::FleetosRaftConfig>>,
 }
 
 impl ProvisioningReconciler {
@@ -35,6 +37,7 @@ impl ProvisioningReconciler {
         join_token_store: Arc<JoinTokenStore>,
         control_pool_manager: Arc<ControlPoolManager>,
         storage: Arc<crate::storage::StorageEngine>,
+        raft: Arc<Raft<crate::raft::FleetosRaftConfig>>,
     ) -> Result<Self, ProvisioningError> {
         if !config.is_enabled() {
             return Err(ProvisioningError::EndpointNotConfigured);
@@ -48,6 +51,7 @@ impl ProvisioningReconciler {
             join_token_store,
             control_pool_manager,
             storage,
+            raft,
         })
     }
 
@@ -115,11 +119,8 @@ impl ProvisioningReconciler {
             "pool status"
         );
 
-        // 3. If actual != desired, push desired state to provider.
         if running_count != pool.desired_count {
-            // Construct a fresh bootstrap payload with a new Join Token.
-            let bootstrap_payload = self.build_bootstrap_payload(pool.node_kind)?;
-
+            let bootstrap_payload = self.build_bootstrap_payload(pool.node_kind).await?;
             let _status = self
                 .client
                 .reconcile_node_pool(pool, bootstrap_payload)
@@ -142,14 +143,16 @@ impl ProvisioningReconciler {
         Ok(())
     }
 
-    /// Construct the opaque bootstrap payload for provisioned nodes.
-    ///
-    /// Contains a fresh Join Token + node-kind config.
-    /// The provider passes this through to the provisioned node untouched.
-    fn build_bootstrap_payload(&self, node_kind: NodeKind) -> Result<Vec<u8>, ProvisioningError> {
-        // Generate a fresh join token for this reconciliation cycle.
-        let token = self.join_token_store.generate(node_kind)?;
-
+    async fn build_bootstrap_payload(
+        &mut self,
+        node_kind: NodeKind,
+    ) -> Result<Vec<u8>, ProvisioningError> {
+        let record = self.join_token_store.compute_token_record(node_kind)?;
+        let token = record.token.clone();
+        self.raft
+            .client_write(crate::raft::FleetosCommand::MintJoinToken { record })
+            .await
+            .map_err(|e| ProvisioningError::Raft(e.to_string()))?;
         let payload = BootstrapPayload {
             join_token: token,
             node_kind: node_kind as u8,

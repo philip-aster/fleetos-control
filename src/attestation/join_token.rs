@@ -70,33 +70,24 @@ impl JoinTokenStore {
         Self { keyspace, ttl_secs }
     }
 
-    /// Generate a new cryptographically-random join token.
+    /// Compute a new join token record (read-only/random-gen).
     ///
-    /// The token is single-use, carries a TTL, and is stored in fjall.
-    pub fn generate(&self, node_kind: NodeKind) -> Result<Vec<u8>, AttestationError> {
-        // Opportunistic sweep of expired tokens (best-effort, M-2 custody).
-        let _ = self.sweep_expired();
-
+    /// The caller must propose this to Raft; the state machine performs the
+    /// actual write to the join_tokens keyspace.
+    pub fn compute_token_record(
+        &self,
+        node_kind: NodeKind,
+    ) -> Result<JoinTokenRecord, AttestationError> {
         let mut token = vec![0u8; TOKEN_LENGTH];
         rand::rng().fill_bytes(&mut token);
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let record = JoinTokenRecord {
-            token: token.clone(),
+        Ok(JoinTokenRecord {
+            token,
             node_kind,
             created_at: now,
             expires_at: Some(now + self.ttl_secs as i64),
             consumed: false,
-        };
-        let serialized = postcard::to_allocvec(&record).map_err(AttestationError::Serialization)?;
-        self.keyspace
-            .insert(token.as_slice(), serialized.as_slice())
-            .map_err(|e| AttestationError::Storage(crate::storage::StorageError::Storage(e)))?;
-        tracing::info!(
-            node_kind = ?node_kind,
-            expires_in_secs = self.ttl_secs,
-            "generated join token"
-        );
-        Ok(token)
+        })
     }
 
     /// Validate and consume a join token (strict single-use).
@@ -225,16 +216,16 @@ mod tests {
     }
 
     #[test]
-    fn default_ttl_is_24_hours() {
+    fn default_ttl_is_1_hour() {
         assert_eq!(DEFAULT_JOIN_TOKEN_TTL_SECS, 3600);
     }
 
     #[test]
     fn generated_token_carries_expiry() {
         let (_db, store) = test_store("expiry", DEFAULT_JOIN_TOKEN_TTL_SECS);
-        let token = store.generate(NodeKind::Agent).unwrap();
-        let bytes = store.keyspace.get(&token).unwrap().expect("token stored");
-        let record: JoinTokenRecord = postcard::from_bytes(&bytes).unwrap();
+        // Minting is Raft-replicated; compute_token_record returns the record
+        // the leader proposes via FleetosCommand::MintJoinToken.
+        let record = store.compute_token_record(NodeKind::Agent).unwrap();
         assert_eq!(
             record.expires_at,
             Some(record.created_at + DEFAULT_JOIN_TOKEN_TTL_SECS as i64),
