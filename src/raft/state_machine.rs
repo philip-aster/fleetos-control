@@ -214,7 +214,23 @@ impl FjallStateMachine {
                         );
                     }
                 }
-                Ok(ChangeKind::RevokedDelegations)
+                // 3. Remove all placements hosted on this node so eviction is
+                //    fully atomic (node + delegations + placements).
+                let mut placement_pod_ids = Vec::new();
+                for guard in self.keyspaces.placements.prefix(Vec::<u8>::new()) {
+                    let value = guard.value().map_err(read_err)?;
+                    if let Ok(placement) =
+                        postcard::from_bytes::<crate::scheduler::Placement>(value.as_ref())
+                    {
+                        if placement.node_id == node_spiffe {
+                            placement_pod_ids.push(placement.pod_id);
+                        }
+                    }
+                }
+                for pod_id in placement_pod_ids {
+                    batch.remove(&self.keyspaces.placements, pod_id.as_bytes());
+                }
+                Ok(ChangeKind::Eviction)
             }
 
             // --- Delegations ---
@@ -336,6 +352,49 @@ impl FjallStateMachine {
                 Ok(ChangeKind::SchedulingUpdate)
             }
 
+            FleetosCommand::RemovePlacement { pod_id } => {
+                batch.remove(&self.keyspaces.placements, pod_id.as_bytes());
+                Ok(ChangeKind::SchedulingUpdate)
+            }
+            FleetosCommand::ReassignPodId {
+                tenant_id,
+                service,
+                role,
+                ordinal,
+                new_pod_id,
+            } => {
+                // Deterministic read-modify-write: find the placement occupying the
+                // ordinal slot and swap its pod_id. No-op if the slot is empty.
+                let mut found: Option<crate::scheduler::Placement> = None;
+                for guard in self.keyspaces.placements.prefix(Vec::<u8>::new()) {
+                    let value = guard.value().map_err(read_err)?;
+                    if let Ok(placement) =
+                        postcard::from_bytes::<crate::scheduler::Placement>(value.as_ref())
+                    {
+                        if placement.tenant_id == *tenant_id
+                            && placement.service == *service
+                            && placement.role == *role
+                            && placement.ordinal == *ordinal
+                        {
+                            found = Some(placement);
+                            break;
+                        }
+                    }
+                }
+                if let Some(mut placement) = found {
+                    let old_pod_id = placement.pod_id.clone();
+                    placement.pod_id = new_pod_id.clone();
+                    let serialized = postcard::to_allocvec(&placement).map_err(ser_err)?;
+                    batch.remove(&self.keyspaces.placements, old_pod_id.as_bytes());
+                    batch.insert(
+                        &self.keyspaces.placements,
+                        new_pod_id.as_bytes(),
+                        serialized.as_slice(),
+                    );
+                }
+                Ok(ChangeKind::SchedulingUpdate)
+            }
+
             // --- Provisioning ---
             FleetosCommand::StoreNodePool { record } => {
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
@@ -357,6 +416,10 @@ impl FjallStateMachine {
     /// Called after each entry is committed so watch streams receive data.
     fn publish_event(&self, version: fleetos_core::MonotonicVersion, change_kind: &ChangeKind) {
         match change_kind {
+            ChangeKind::Eviction => {
+                self.publish_sag_update(version);
+                self.publish_schedule_update(version);
+            }
             ChangeKind::SagUpdate | ChangeKind::RevokedDelegations => {
                 self.publish_sag_update(version);
             }

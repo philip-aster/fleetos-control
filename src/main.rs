@@ -16,7 +16,6 @@ use fleetos_control::controllers::{
     CronController, WorkloadController, node_controller::NodeController,
     pod_controller::PodController,
 };
-use fleetos_control::delegation::revocation::DelegationRevocationStore;
 use fleetos_control::dummy_ip::allocator::DummyIpAllocator;
 use fleetos_control::provisioning::control_pool::ControlPoolManager;
 use fleetos_control::raft::raft_proto::raft_transport_server::RaftTransportServer;
@@ -137,10 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?);
 
     let ordinal_tracker = Arc::new(OrdinalTracker::new(keyspaces.ordinals.clone()));
-    let delegation_revocation = Arc::new(DelegationRevocationStore::new(
-        keyspaces.active_delegations.clone(),
-        keyspaces.revoked_delegations.clone(),
-    ));
+
     // The CA borrow of master_key ended in Phase 4, so ownership transfers
     // cleanly into the SecretStore here.
     let secret_store = Arc::new(SecretStore::new(
@@ -172,25 +168,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyspaces.node_pools.clone(),
     ));
 
-    let workload_controller = Arc::new(WorkloadController::new(
-        storage_engine.clone(),
-        ordinal_tracker.clone(),
-        broadcast_hub.clone(),
-    ));
-    let pod_controller = Arc::new(PodController::new(
-        storage_engine.clone(),
-        ordinal_tracker.clone(),
-    ));
-    let node_controller = Arc::new(NodeController::new(
-        storage_engine.clone(),
-        delegation_revocation.clone(),
-        broadcast_hub.clone(),
-    ));
-    let cron_controller = Arc::new(CronController::new(
-        storage_engine.clone(),
-        workload_controller.clone(),
-    ));
-
     // --- Phase 7: Raft cluster initialization ---
     let (raft_handle, shutdown_tx, join_info) = init_raft_cluster(
         &config,
@@ -200,6 +177,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         broadcast_hub.clone(),
     )
     .await?;
+
+    // --- Controllers (need the Raft handle; created after Raft init) ---
+    let workload_controller = Arc::new(WorkloadController::new(
+        storage_engine.clone(),
+        ordinal_tracker.clone(),
+        raft_handle.raft.clone(),
+    ));
+    let pod_controller = Arc::new(PodController::new(
+        ordinal_tracker.clone(),
+        raft_handle.raft.clone(),
+    ));
+    let node_controller = Arc::new(NodeController::new(raft_handle.raft.clone()));
+    let cron_controller = Arc::new(CronController::new(
+        workload_controller.clone(),
+        raft_handle.raft.clone(),
+    ));
 
     // --- Phase 7b: Raft transport listener (inbound consensus RPCs) ---
     // Required for ANY multi-node operation: replication, votes, snapshots,

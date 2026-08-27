@@ -103,6 +103,19 @@ pub enum FleetosCommand {
     CommitPlacement {
         record: crate::scheduler::Placement,
     },
+    /// Remove a placement by pod_id (scale-down / deletion).
+    RemovePlacement {
+        pod_id: String,
+    },
+    /// Atomically reassign the pod_id of the placement occupying the given
+    /// (tenant, service, role, ordinal) slot — replace-in-place semantics.
+    ReassignPodId {
+        tenant_id: String,
+        service: String,
+        role: String,
+        ordinal: u32,
+        new_pod_id: String,
+    },
     // --- Provisioning ---
     StoreNodePool {
         record: crate::provisioning::NodePoolRecord,

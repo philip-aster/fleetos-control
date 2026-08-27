@@ -31,6 +31,7 @@ pub enum ChangeKind {
     RevokedDelegations,
     SchedulingUpdate,
     DummyIpUpdate,
+    Eviction,
 }
 
 impl VersionedState {

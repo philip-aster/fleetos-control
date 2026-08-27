@@ -1,25 +1,24 @@
-//! Pod controller — per-ordinal reconciliation.
 use super::ControllerError;
+use crate::raft::{FleetosCommand, FleetosRaftConfig};
 use crate::scheduler::OrdinalTracker;
-use crate::storage::StorageEngine;
 use fleetos_core::spiffe::PodId;
+use openraft::Raft;
 use std::sync::Arc;
 
-/// The pod controller.
 pub struct PodController {
-    storage: Arc<StorageEngine>,
     ordinal_tracker: Arc<OrdinalTracker>,
+    raft: Arc<Raft<FleetosRaftConfig>>,
 }
 
 impl PodController {
-    pub fn new(storage: Arc<StorageEngine>, ordinal_tracker: Arc<OrdinalTracker>) -> Self {
+    pub fn new(ordinal_tracker: Arc<OrdinalTracker>, raft: Arc<Raft<FleetosRaftConfig>>) -> Self {
         Self {
-            storage,
             ordinal_tracker,
+            raft,
         }
     }
 
-    /// Reconcile a pod that has died or is missing.
+    /// Replace a dead pod in place: same ordinal slot, fresh pod_id.
     pub async fn reconcile_dead_pod(
         &self,
         tenant_id: &str,
@@ -27,8 +26,7 @@ impl PodController {
         role: &str,
         ordinal: u32,
     ) -> Result<(), ControllerError> {
-        // Look up the existing ordinal assignment.
-        let assignment = self
+        let _assignment = self
             .ordinal_tracker
             .get_assignment(tenant_id, workload_id, role, ordinal)?
             .ok_or_else(|| {
@@ -38,33 +36,26 @@ impl PodController {
                 )))
             })?;
 
-        // Generate a new pod_id for the replacement.
         let new_pod_id = PodId::new(format!("{}-{}-{}", workload_id, role, ordinal));
-
-        // Update the placement to point to the new pod_id (replace-in-place).
-        self.storage
-            .update_placement_pod_id(tenant_id, workload_id, role, ordinal, new_pod_id.as_str())
-            .map_err(ControllerError::Storage)?;
-
-        let old_pod_id_str = assignment
-            .current_pod_id
-            .as_deref()
-            .unwrap_or("<unassigned>");
+        self.raft
+            .client_write(FleetosCommand::ReassignPodId {
+                tenant_id: tenant_id.to_owned(),
+                service: workload_id.to_owned(),
+                role: role.to_owned(),
+                ordinal,
+                new_pod_id: new_pod_id.as_str().to_string(),
+            })
+            .await
+            .map_err(|e| ControllerError::Raft(e.to_string()))?;
 
         tracing::info!(
-            tenant = %tenant_id,
-            workload = %workload_id,
-            role = %role,
-            ordinal = ordinal,
-            old_pod_id = %old_pod_id_str,
-            new_pod_id = %new_pod_id.as_str(),
-            "pod replaced in place (ordinal preserved)"
+            tenant = %tenant_id, workload = %workload_id, role = %role, ordinal = ordinal,
+            new_pod_id = %new_pod_id.as_str(), "pod replaced in place (ordinal preserved)"
         );
-
         Ok(())
     }
 
-    /// Handle a scale-down event: free an ordinal.
+    /// Scale-down: free ordinal slots at/above new_count and remove placements.
     pub async fn handle_scale_down(
         &self,
         tenant_id: &str,
@@ -75,34 +66,36 @@ impl PodController {
         let assignments =
             self.ordinal_tracker
                 .get_assignments_for_service_role(tenant_id, workload_id, role)?;
-
         for assignment in assignments {
             if assignment.ordinal >= new_count {
-                // Free the ordinal slot.
-                self.ordinal_tracker.free_ordinal(
-                    tenant_id,
-                    workload_id,
-                    role,
-                    assignment.ordinal,
-                )?;
+                // Free the ordinal slot (record with no pod/node) via Raft.
+                let freed = crate::scheduler::ordinal::OrdinalAssignment {
+                    tenant_id: tenant_id.to_owned(),
+                    service: workload_id.to_owned(),
+                    role: role.to_owned(),
+                    ordinal: assignment.ordinal,
+                    current_pod_id: None,
+                    current_node_id: None,
+                };
+                self.raft
+                    .client_write(FleetosCommand::RecordOrdinalAssignment { record: freed })
+                    .await
+                    .map_err(|e| ControllerError::Raft(e.to_string()))?;
 
-                // Remove the placement from storage.
                 if let Some(ref pod_id) = assignment.current_pod_id {
-                    self.storage
-                        .delete_placement(pod_id)
-                        .map_err(ControllerError::Storage)?;
+                    self.raft
+                        .client_write(FleetosCommand::RemovePlacement {
+                            pod_id: pod_id.clone(),
+                        })
+                        .await
+                        .map_err(|e| ControllerError::Raft(e.to_string()))?;
                 }
-
                 tracing::info!(
-                    tenant = %tenant_id,
-                    workload = %workload_id,
-                    role = %role,
-                    ordinal = assignment.ordinal,
-                    "ordinal freed (scale-down)"
+                    tenant = %tenant_id, workload = %workload_id, role = %role,
+                    ordinal = assignment.ordinal, "ordinal freed (scale-down)"
                 );
             }
         }
-
         Ok(())
     }
 }

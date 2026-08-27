@@ -1,100 +1,68 @@
 //! Workload controller — expands WorkloadSpec into PodSpecs and schedules them.
 use super::ControllerError;
+use crate::raft::{FleetosCommand, FleetosRaftConfig};
 use crate::scheduler::{
     ClusterState, OrdinalTracker, PendingPod, Scheduler, engine::DefaultScheduler,
     ordinal::OrdinalAssignment,
 };
 use crate::storage::StorageEngine;
-use crate::watch::broadcast::{BroadcastHub, ScheduleUpdateEvent};
-use fleetos_core::MonotonicVersion;
 use fleetos_core::proto::workload::{PodSpec, WorkloadSpec};
 use fleetos_core::spiffe::PodId;
-use prost::Message;
+use openraft::Raft;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The workload controller.
 pub struct WorkloadController {
     storage: Arc<StorageEngine>,
     ordinal_tracker: Arc<OrdinalTracker>,
     scheduler: DefaultScheduler,
-    broadcast_hub: Arc<BroadcastHub>,
+    raft: Arc<Raft<FleetosRaftConfig>>,
 }
 
 impl WorkloadController {
     pub fn new(
         storage: Arc<StorageEngine>,
         ordinal_tracker: Arc<OrdinalTracker>,
-        broadcast_hub: Arc<BroadcastHub>,
+        raft: Arc<Raft<FleetosRaftConfig>>,
     ) -> Self {
         Self {
             storage,
             ordinal_tracker,
             scheduler: DefaultScheduler::new(),
-            broadcast_hub,
+            raft,
         }
     }
 
-    /// Reconcile a WorkloadSpec: expand into PodSpecs, schedule, and persist.
+    /// Reconcile a WorkloadSpec: expand into PodSpecs and schedule them.
+    ///
+    /// The spec itself is persisted by whoever submitted it (AdminService or the
+    /// cron controller) via `FleetosCommand::SubmitWorkloadSpec`. This method only
+    /// schedules: it proposes ordinal assignments and placements through Raft.
+    /// Schedule broadcasts are emitted by the state machine on apply.
     pub async fn reconcile(&self, spec: &WorkloadSpec) -> Result<(), ControllerError> {
         let replicas: BTreeMap<String, u32> =
             spec.replicas.iter().map(|(k, v)| (k.clone(), *v)).collect();
         let tenant_id = spec.tenant_id.clone();
         let workload_id = spec.workload_id.clone();
 
-        // 1. Persist the WorkloadSpec using prost (proto types don't implement serde).
-        let spec_bytes = spec.encode_to_vec();
-        self.storage
-            .store_workload_spec(&tenant_id, &workload_id, &spec_bytes)
-            .map_err(ControllerError::Storage)?;
-
-        // 2. Build ClusterState from storage for scheduling decisions.
         let cluster_state = self.build_cluster_state()?;
-
-        // 3. Expand each (role, count) into individual PodSpecs.
-        let mut new_assignments: Vec<(String, PendingPod)> = Vec::new();
 
         for (role_str, count) in &replicas {
             for ordinal in 0..*count {
-                // Check if this ordinal already exists (preservation across restarts).
                 let existing = self.ordinal_tracker.get_assignment(
                     &tenant_id,
                     &workload_id,
                     role_str,
                     ordinal,
                 )?;
-
                 if existing.is_some() {
-                    tracing::debug!(
-                        tenant = %tenant_id,
-                        workload = %workload_id,
-                        role = %role_str,
-                        ordinal = ordinal,
-                        "ordinal already assigned, preserving"
-                    );
                     continue;
                 }
 
-                // Generate a new pod_id.
                 let pod_id = PodId::new(format!("{}-{}-{}", workload_id, role_str, ordinal));
-
-                // Build the PodSpec, overwriting the six trusted fields.
                 let pod_spec =
                     self.build_pod_spec(spec, &pod_id, &tenant_id, &workload_id, role_str, ordinal);
 
-                // Record the ordinal assignment.
-                let assignment = OrdinalAssignment {
-                    tenant_id: tenant_id.clone(),
-                    service: workload_id.clone(),
-                    role: role_str.clone(),
-                    ordinal,
-                    current_pod_id: Some(pod_id.as_str().to_string()),
-                    current_node_id: None,
-                };
-                self.ordinal_tracker.record_assignment(&assignment)?;
-
-                // 4. Build PendingPod for scheduling (convert proto ResourceRequirements
-                //    to scheduler ResourceSpec: vcpus→millicores, memory_mb→bytes).
                 let resources = pod_spec.resources.as_ref().map_or(
                     crate::scheduler::ResourceSpec {
                         cpu_millicores: 500,
@@ -118,7 +86,23 @@ impl WorkloadController {
 
                 match self.scheduler.schedule(&pending_pod, &cluster_state) {
                     Ok(decision) => {
-                        // 5. Persist the placement.
+                        // Record the ordinal assignment (with node) via Raft.
+                        let assignment = OrdinalAssignment {
+                            tenant_id: tenant_id.clone(),
+                            service: workload_id.clone(),
+                            role: role_str.clone(),
+                            ordinal,
+                            current_pod_id: Some(pod_id.as_str().to_string()),
+                            current_node_id: Some(decision.node_id.to_string()),
+                        };
+                        self.raft
+                            .client_write(FleetosCommand::RecordOrdinalAssignment {
+                                record: assignment,
+                            })
+                            .await
+                            .map_err(|e| ControllerError::Raft(e.to_string()))?;
+
+                        // Commit the placement via Raft.
                         let placement = crate::scheduler::Placement {
                             pod_id: pod_id.as_str().to_string(),
                             tenant_id: tenant_id.clone(),
@@ -128,54 +112,28 @@ impl WorkloadController {
                             node_id: decision.node_id.clone(),
                             resources: pending_pod.resources,
                         };
-                        self.storage
-                            .store_placement(&placement)
-                            .map_err(ControllerError::Storage)?;
-
-                        // Update the ordinal assignment with the node.
-                        self.ordinal_tracker.update_placement(
-                            &tenant_id,
-                            &workload_id,
-                            role_str,
-                            ordinal,
-                            pod_id.as_str(),
-                            &decision.node_id.to_string(),
-                        )?;
-
-                        new_assignments.push((pod_id.as_str().to_string(), pending_pod));
+                        self.raft
+                            .client_write(FleetosCommand::CommitPlacement { record: placement })
+                            .await
+                            .map_err(|e| ControllerError::Raft(e.to_string()))?;
 
                         tracing::info!(
-                            tenant = %tenant_id,
-                            workload = %workload_id,
-                            role = %role_str,
-                            ordinal = ordinal,
-                            pod_id = %pod_id.as_str(),
-                            node = %decision.node_id,
-                            "scheduled PodSpec"
+                            tenant = %tenant_id, workload = %workload_id, role = %role_str,
+                            ordinal = ordinal, pod_id = %pod_id.as_str(),
+                            node = %decision.node_id, "scheduled PodSpec"
                         );
                     }
                     Err(e) => {
+                        // Ordinal intentionally NOT recorded here so the next
+                        // reconcile retries scheduling for this slot.
                         tracing::warn!(
-                            pod_id = %pod_id.as_str(),
-                            error = %e,
+                            pod_id = %pod_id.as_str(), error = %e,
                             "scheduling failed, will retry on next reconcile"
                         );
                     }
                 }
             }
         }
-
-        // 6. Publish schedule update if any new assignments were made.
-        if !new_assignments.is_empty() {
-            let assignments_bytes =
-                postcard::to_allocvec(&new_assignments).map_err(ControllerError::Serialization)?;
-            self.broadcast_hub
-                .publish_schedule_update(ScheduleUpdateEvent {
-                    version: MonotonicVersion::new(0),
-                    assignments_bytes,
-                });
-        }
-
         Ok(())
     }
 
