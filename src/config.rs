@@ -56,6 +56,10 @@ pub struct ControlConfig {
     /// Raft tuning (snapshot cadence, log purge).
     #[serde(default)]
     pub raft: RaftTuningConfig,
+
+    /// OpenTelemetry push telemetry (metrics + traces + logs).
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -384,6 +388,42 @@ impl Default for AttestationConfig {
 
 fn default_join_token_ttl_secs() -> u16 {
     3600
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry (OpenTelemetry / OTLP push)
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelemetryConfig {
+    /// Master switch. When false, no OTel providers are created and the
+    /// control plane runs with console logging only.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP gRPC endpoint of the collector (e.g. "http://otel-collector:4317").
+    /// Outbound-only — the control plane never listens for scrapes.
+    #[serde(default = "default_otlp_endpoint")]
+    pub otlp_endpoint: String,
+    /// Metrics push interval in seconds.
+    #[serde(default = "default_push_interval_secs")]
+    pub push_interval_secs: u64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            otlp_endpoint: default_otlp_endpoint(),
+            push_interval_secs: default_push_interval_secs(),
+        }
+    }
+}
+
+fn default_otlp_endpoint() -> String {
+    String::new()
+}
+
+fn default_push_interval_secs() -> u64 {
+    15
 }
 
 // ---------------------------------------------------------------------------

@@ -16,5 +16,6 @@ pub mod revocation;
 pub mod scheduler;
 pub mod secrets;
 pub mod storage;
+pub mod telemetry;
 pub mod tls;
 pub mod watch;

@@ -129,3 +129,14 @@ purge_batch_size = 1024
 # Empty string means provisioning is disabled.
 endpoint = ""
 provision_poll_interval_secs = 30
+
+# ---------------------------------------------------------------------------
+# Telemetry (OpenTelemetry / OTLP push)
+# ---------------------------------------------------------------------------
+[telemetry]
+# Push metrics, traces, and logs to an OTLP collector. The control plane
+# never exposes an inbound scrape endpoint (dark overlay); everything is
+# pushed outbound. Prometheus sits behind the collector via remote-write.
+enabled = false
+otlp_endpoint = "http://otel-collector:4317"
+push_interval_secs = 15

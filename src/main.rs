@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use fleetos_control::attestation::join_token::JoinTokenStore;
 use fleetos_control::ca::CaService;
@@ -53,17 +55,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .install_default()
         .expect("failed to install rustls ring crypto provider");
 
-    // Initialize tracing.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+    // Parse CLI and load config BEFORE initializing the tracing subscriber,
+    // because the subscriber now carries OTel layers that need config.
+    let cli = Cli::parse();
+    let config = match ControlConfig::load(&cli.config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to load config {}: {}", cli.config.display(), e);
+            return Err(e.into());
+        }
+    };
+
+    // OpenTelemetry providers (metrics + traces + logs), if enabled.
+    let telemetry = fleetos_control::telemetry::init_providers(&config)?;
+
+    // Tracing subscriber: console output always; OTel trace + log bridges when
+    // telemetry is enabled.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let mut layers: Vec<
+        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+    > = Vec::new();
+    layers.push(Box::new(tracing_subscriber::fmt::layer()));
+    if let Some(ref t) = telemetry {
+        layers.push(Box::new(
+            tracing_opentelemetry::layer().with_tracer(fleetos_control::telemetry::tracer(t)),
+        ));
+        layers.push(Box::new(
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                &t.logger_provider,
+            ),
+        ));
+    }
+    tracing_subscriber::registry()
+        .with(layers)
+        .with(env_filter)
         .init();
 
-    let cli = Cli::parse();
-    tracing::info!(config = %cli.config.display(), "loading configuration");
-
-    let config = ControlConfig::load(&cli.config)?;
+    tracing::info!(config = %cli.config.display(), "configuration loaded");
     tracing::info!(
         node_name = %config.node.name,
         cluster_mode = ?config.cluster.mode,
@@ -177,6 +205,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ca_service.as_ref(),
     )
     .await?;
+
+    // --- OTel metrics registration (G-1) ---
+    // Register observable gauges now that the Raft handle exists.
+    if let Some(ref t) = telemetry {
+        fleetos_control::telemetry::register_metrics(
+            &t.meter_provider,
+            versioned_state.clone(),
+            broadcast_hub.clone(),
+            raft_handle.raft.clone(),
+        );
+    }
 
     // --- Controllers (need the Raft handle; created after Raft init) ---
     let workload_controller = Arc::new(WorkloadController::new(
@@ -686,6 +725,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Signal all components to shut down
     let _ = shutdown_tx.send(true);
+
+    // Flush all OTel providers before exit so final metrics/traces/logs are exported.
+    if let Some(ref t) = telemetry {
+        fleetos_control::telemetry::shutdown(t);
+    }
 
     tracing::info!("fleetos-control shutdown complete");
     Ok(())

@@ -130,4 +130,15 @@ impl BroadcastHub {
     pub fn subscribe_routes(&self) -> broadcast::Receiver<RouteUpdateEvent> {
         self.route_tx.subscribe()
     }
+
+    /// Subscriber counts per channel, for telemetry (G-1).
+    /// Order: (watch, sag, schedule, routes).
+    pub fn subscriber_counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.watch_tx.receiver_count(),
+            self.sag_tx.receiver_count(),
+            self.schedule_tx.receiver_count(),
+            self.route_tx.receiver_count(),
+        )
+    }
 }
