@@ -1,6 +1,8 @@
 //! X.509 certificate signing implementation using `rcgen` + `rustls`.
 use super::CaError;
 use super::oid;
+use fleetos_core::spiffe::SpiffeId;
+use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, SanType,
@@ -49,6 +51,17 @@ pub fn build_csr(params: &SvidParams) -> Result<CsrBundle, CaError> {
         .try_into()
         .map_err(|_| CaError::Validation("invalid SPIFFE ID for URI SAN".to_owned()))?;
     cert_params.subject_alt_names.push(SanType::URI(spiffe_uri));
+
+    // Control SVIDs additionally carry the trust domain as a DNS SAN so the
+    // raft transport can satisfy hostname verification (Step 17 / S-2). The
+    // CA preserves CSR SANs when signing, so this flows through submit_csr.
+    if params.kind == SvidKind::Control {
+        if let Ok(spiffe) = params.spiffe_id.parse::<SpiffeId>() {
+            if let Ok(dns) = Ia5String::try_from(spiffe.trust_domain.clone()) {
+                cert_params.subject_alt_names.push(SanType::DnsName(dns));
+            }
+        }
+    }
 
     // Set distinguished name.
     let mut dn = DistinguishedName::new();
@@ -119,6 +132,17 @@ pub fn sign_svid(
         .try_into()
         .map_err(|_| CaError::Validation("invalid SPIFFE ID for URI SAN".to_owned()))?;
     leaf_params.subject_alt_names.push(SanType::URI(spiffe_uri));
+
+    // Control SVIDs additionally carry the trust domain as a DNS SAN so the
+    // raft transport (which dials peers by IP) can satisfy rustls hostname
+    // verification via tonic's `domain_name`. See Step 17 (S-2).
+    if params.kind == SvidKind::Control {
+        if let Ok(spiffe) = params.spiffe_id.parse::<SpiffeId>() {
+            if let Ok(dns) = Ia5String::try_from(spiffe.trust_domain.clone()) {
+                leaf_params.subject_alt_names.push(SanType::DnsName(dns));
+            }
+        }
+    }
 
     // DN with CN = SPIFFE ID.
     let mut dn = DistinguishedName::new();

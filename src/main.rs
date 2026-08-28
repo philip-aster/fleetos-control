@@ -43,7 +43,6 @@ struct Cli {
 /// Everything main() needs from a first-boot join flow.
 struct JoinInfo {
     node_id: u64,
-    join_result: fleetos_control::join::JoinResult,
 }
 
 #[tokio::main]
@@ -169,12 +168,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // --- Phase 7: Raft cluster initialization ---
-    let (raft_handle, shutdown_tx, join_info) = init_raft_cluster(
+    let (raft_handle, shutdown_tx, join_info, dc_mtls) = init_raft_cluster(
         &config,
         db.clone(),
         keyspaces.clone(),
         versioned_state.clone(),
         broadcast_hub.clone(),
+        ca_service.as_ref(),
     )
     .await?;
 
@@ -200,14 +200,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_addr: std::net::SocketAddr = config.listeners.raft.parse()?;
     let raft_transport_impl =
         fleetos_control::raft::server::RaftTransportServerImpl::new(raft_handle.raft.clone());
+    let raft_server_config =
+        std::sync::Arc::new(fleetos_control::tls::mtls::build_server_config(&dc_mtls)?);
+    let raft_tls_acceptor = tokio_rustls::TlsAcceptor::from(raft_server_config);
+    let raft_td_config =
+        fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
     tokio::spawn(async move {
-        tracing::info!(addr = %raft_addr, "starting Raft transport listener");
+        tracing::info!(addr = %raft_addr, "starting Raft transport listener (mTLS)");
+        let listener = match tokio::net::TcpListener::bind(raft_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to bind Raft transport listener");
+                return;
+            }
+        };
+        let incoming = async_stream::stream! {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        let acceptor = raft_tls_acceptor.clone();
+                        let td_config = raft_td_config.clone();
+                        yield async move {
+                            let tls_stream = acceptor.accept(stream).await.map_err(|e| {
+                                tracing::warn!(error = %e, addr = %addr, "raft TLS handshake failed");
+                                std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e)
+                            })?;
+                            let (_, server_conn) = tls_stream.get_ref();
+                            let peer_certs = server_conn.peer_certificates().ok_or_else(|| {
+                                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no peer certificate")
+                            })?;
+                            let peer_cert_der = peer_certs.first().ok_or_else(|| {
+                                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "empty cert chain")
+                            })?;
+                            let spiffe_uri = fleetos_control::tls::mtls::extract_spiffe_uri_san(peer_cert_der)
+                                .map_err(|e| {
+                                    tracing::warn!(addr = %addr, error = %e, "raft SPIFFE extraction failed");
+                                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+                                })?;
+                            fleetos_control::tls::trust_domains::validate_peer_identity(
+                                &spiffe_uri,
+                                fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
+                                &td_config,
+                            ).map_err(|e| {
+                                tracing::warn!(addr = %addr, spiffe = %spiffe_uri, error = %e, "raft peer identity rejected");
+                                std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+                            })?;
+                            let spiffe_id: SpiffeId = spiffe_uri.parse().map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                            })?;
+                            // G-7: Raft peers MUST be control-kind. This gates RequestJoin.
+                            if spiffe_id.kind != fleetos_core::spiffe::IdKind::Control {
+                                tracing::warn!(addr = %addr, spiffe = %spiffe_id, "raft peer is not control-kind");
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "raft peers must be control-kind",
+                                ));
+                            }
+                            tracing::debug!(addr = %addr, spiffe = %spiffe_id, "raft peer authenticated");
+                            Ok::<_, std::io::Error>(PeerAuthenticatedStream {
+                                inner: tls_stream,
+                                spiffe_id: Some(spiffe_id),
+                            })
+                        }.await;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to accept raft connection");
+                    }
+                }
+            }
+        };
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(RaftTransportServer::new(raft_transport_impl))
-            .serve(raft_addr)
+            .serve_with_incoming(incoming)
             .await
         {
-            tracing::error!(error = %e, "Raft transport listener failed");
+            tracing::error!(error = %e, "Raft transport server failed");
         }
     });
 
@@ -293,56 +360,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Phase 11: gRPC Servers ---
-
-    // Data/Control SVID: the join-flow SVID on a first join boot, otherwise
-    // freshly minted from the local CA (bootstrap, or join-restart after the
-    // CA has been replicated to us).
-    let dc_mtls = if let Some(ref info) = join_info {
-        fleetos_control::tls::mtls::MtlsConfig {
-            cert_chain: vec![rustls::pki_types::CertificateDer::from(
-                info.join_result.svid_cert_der.clone(),
-            )],
-            private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
-                rustls::pki_types::PrivatePkcs8KeyDer::from(info.join_result.svid_key_der.clone()),
-            ),
-            trust_bundle_pem: info.join_result.trust_bundle_pem.clone(),
-            role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
-        }
-    } else {
-        let ca = ca_service
-            .as_ref()
-            .expect("CA must be available when no join flow ran");
-        let (dc_svid, dc_root_pem) = {
-            let dc_bundle = ca.data_control.read();
-            let dc_params = fleetos_control::ca::rcgen_impl::SvidParams {
-                spiffe_id: format!(
-                    "spiffe://{}/ns/system/control/{}",
-                    config.trust_domains.data_control, config.node.name
-                ),
-                kind: fleetos_control::ca::rcgen_impl::SvidKind::Control,
-                role: None,
-                ordinal: None,
-                degraded: false,
-                ttl_secs: config.svid.node_ttl_secs,
-            };
-            let svid = fleetos_control::ca::rcgen_impl::sign_svid(
-                &dc_params,
-                &dc_bundle.current_key,
-                &dc_bundle.current_cert_der,
-            )?;
-            (svid, dc_bundle.trust_bundle_pem())
-        };
-        fleetos_control::tls::mtls::MtlsConfig {
-            cert_chain: vec![rustls::pki_types::CertificateDer::from(dc_svid.cert_der)],
-            private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
-                rustls::pki_types::PrivatePkcs8KeyDer::from(dc_svid.private_key_der.to_vec()),
-            ),
-            // Root CA PEM — NOT the leaf cert. The root store must contain the
-            // CA that signed peer certs.
-            trust_bundle_pem: dc_root_pem,
-            role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
-        }
-    };
 
     // Optional client auth on Data/Control: attestation is inherently pre-SVID.
     // Authenticated peers are still fully validated; unauthenticated peers get
@@ -711,26 +728,32 @@ async fn init_raft_cluster(
     keyspaces: fleetos_control::storage::Keyspaces,
     versioned_state: VersionedState,
     broadcast_hub: Arc<BroadcastHub>,
-) -> Result<(RaftHandle, watch::Sender<bool>, Option<JoinInfo>), Box<dyn std::error::Error>> {
+    ca_service: Option<&CaService>,
+) -> Result<
+    (
+        RaftHandle,
+        watch::Sender<bool>,
+        Option<JoinInfo>,
+        fleetos_control::tls::mtls::MtlsConfig,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let raft_config = Config {
         heartbeat_interval: 500,
         election_timeout_min: 1500,
         election_timeout_max: 3000,
         ..Default::default()
     };
-
     let raft_config =
         Arc::new(raft_config.validate().map_err(|e| {
             Box::<dyn std::error::Error>::from(format!("invalid raft config: {}", e))
         })?);
 
-    // Create log storage and state machine
     let log_storage = FjallLogStorage::new(
         db.clone(),
         keyspaces.raft_log.clone(),
         keyspaces.raft_log_meta.clone(),
     );
-
     let state_machine = FjallStateMachine::new(
         db.clone(),
         keyspaces.clone(),
@@ -738,10 +761,6 @@ async fn init_raft_cluster(
         broadcast_hub,
     );
 
-    // Create network factory.
-    // Bootstrap: static map from config. Join: empty — peers are discovered
-    // via replicated membership (the network factory falls back to the address
-    // openraft passes to new_client).
     let peer_addresses = match config.cluster.mode {
         ClusterMode::Bootstrap => config
             .cluster
@@ -751,11 +770,7 @@ async fn init_raft_cluster(
             .collect(),
         ClusterMode::Join => std::collections::HashMap::new(),
     };
-    let network_factory = TonicRaftNetworkFactory::new(peer_addresses);
 
-    // Node ID: bootstrap uses the configured member id; join derives a
-    // deterministic id from the node name so the joiner and the leader agree
-    // on it (same derivation the CONTROL-pool provisioner uses).
     let node_id = match config.cluster.mode {
         ClusterMode::Bootstrap => config
             .cluster
@@ -766,65 +781,101 @@ async fn init_raft_cluster(
         ClusterMode::Join => fleetos_control::raft::derive_raft_node_id(&config.node.name),
     };
 
-    let raft = Raft::new(
-        node_id,
-        raft_config,
-        network_factory,
-        log_storage,
-        state_machine,
-    )
-    .await
-    .map_err(|e| Box::<dyn std::error::Error>::from(format!("raft init failed: {}", e)))?;
-
+    // Build the Data/Control mTLS material (control SVID + trust bundle) once.
     let mut join_info: Option<JoinInfo> = None;
-
-    match config.cluster.mode {
+    let dc_mtls: fleetos_control::tls::mtls::MtlsConfig = match config.cluster.mode {
         ClusterMode::Bootstrap => {
-            let members: BTreeMap<u64, openraft::BasicNode> = config
-                .cluster
-                .initial_members
-                .iter()
-                .map(|m| {
-                    (
-                        m.id,
-                        openraft::BasicNode {
-                            addr: m.address.clone(),
-                        },
-                    )
-                })
-                .collect();
-
-            raft.initialize(members).await.map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("raft bootstrap failed: {}", e))
-            })?;
-            tracing::info!("raft cluster bootstrapped");
+            let ca = ca_service.expect("CA service required for bootstrap");
+            let (cert_der, key_der, trust_pem) = {
+                let dc_bundle = ca.data_control.read();
+                let params = fleetos_control::ca::rcgen_impl::SvidParams {
+                    spiffe_id: format!(
+                        "spiffe://{}/ns/system/control/{}",
+                        config.trust_domains.data_control, config.node.name
+                    ),
+                    kind: fleetos_control::ca::rcgen_impl::SvidKind::Control,
+                    role: None,
+                    ordinal: None,
+                    degraded: false,
+                    ttl_secs: config.svid.node_ttl_secs,
+                };
+                let svid = fleetos_control::ca::rcgen_impl::sign_svid(
+                    &params,
+                    &dc_bundle.current_key,
+                    &dc_bundle.current_cert_der,
+                )
+                .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+                (
+                    svid.cert_der,
+                    svid.private_key_der.to_vec(),
+                    dc_bundle.trust_bundle_pem(),
+                )
+            };
+            fleetos_control::tls::mtls::MtlsConfig {
+                cert_chain: vec![rustls::pki_types::CertificateDer::from(cert_der)],
+                private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+                ),
+                trust_bundle_pem: trust_pem,
+                role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
+            }
         }
         ClusterMode::Join => {
-            // Restart detection: a persisted raft log means we already joined
-            // once — openraft resumes from persisted vote/log/membership.
-            let is_restart = keyspaces.raft_log.first_key_value().is_some();
+            let join_target = config.cluster.join_target.as_deref().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "cluster.join_target is required when mode = \"join\"",
+                )
+            })?;
+            config.cluster.join_raft_target.as_deref().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "cluster.join_raft_target is required when mode = \"join\"",
+                )
+            })?;
+            if config.cluster.join_token.is_empty() {
+                return Err(Box::<dyn std::error::Error>::from(
+                    "cluster.join_token is required when mode = \"join\"",
+                ));
+            }
 
+            let is_restart = keyspaces.raft_log.first_key_value().is_some();
             if is_restart {
                 tracing::info!("join mode: persisted raft state found, resuming membership");
-            } else {
-                let join_target = config.cluster.join_target.as_deref().ok_or_else(|| {
-                    Box::<dyn std::error::Error>::from(
-                        "cluster.join_target is required when mode = \"join\"",
+                let ca = ca_service.expect("CA service required for join restart");
+                let (cert_der, key_der, trust_pem) = {
+                    let dc_bundle = ca.data_control.read();
+                    let params = fleetos_control::ca::rcgen_impl::SvidParams {
+                        spiffe_id: format!(
+                            "spiffe://{}/ns/system/control/{}",
+                            config.trust_domains.data_control, config.node.name
+                        ),
+                        kind: fleetos_control::ca::rcgen_impl::SvidKind::Control,
+                        role: None,
+                        ordinal: None,
+                        degraded: false,
+                        ttl_secs: config.svid.node_ttl_secs,
+                    };
+                    let svid = fleetos_control::ca::rcgen_impl::sign_svid(
+                        &params,
+                        &dc_bundle.current_key,
+                        &dc_bundle.current_cert_der,
                     )
-                })?;
-                config.cluster.join_raft_target.as_deref().ok_or_else(|| {
-                    Box::<dyn std::error::Error>::from(
-                        "cluster.join_raft_target is required when mode = \"join\"",
+                    .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+                    (
+                        svid.cert_der,
+                        svid.private_key_der.to_vec(),
+                        dc_bundle.trust_bundle_pem(),
                     )
-                })?;
-                if config.cluster.join_token.is_empty() {
-                    return Err(Box::<dyn std::error::Error>::from(
-                        "cluster.join_token is required when mode = \"join\"",
-                    ));
+                };
+                fleetos_control::tls::mtls::MtlsConfig {
+                    cert_chain: vec![rustls::pki_types::CertificateDer::from(cert_der)],
+                    private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
+                        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+                    ),
+                    trust_bundle_pem: trust_pem,
+                    role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
                 }
-
+            } else {
                 tracing::info!(join_target = %join_target, "join mode: attesting to existing cluster");
-
                 let join_result = fleetos_control::join::join_cluster(
                     join_target,
                     &config.cluster.join_token,
@@ -841,25 +892,82 @@ async fn init_raft_cluster(
                     "join attestation complete, SVID acquired"
                 );
 
-                join_info = Some(JoinInfo {
-                    node_id,
-                    join_result,
-                });
+                let mtls = fleetos_control::tls::mtls::MtlsConfig {
+                    cert_chain: vec![rustls::pki_types::CertificateDer::from(
+                        join_result.svid_cert_der.clone(),
+                    )],
+                    private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
+                        rustls::pki_types::PrivatePkcs8KeyDer::from(
+                            join_result.svid_key_der.clone(),
+                        ),
+                    ),
+                    trust_bundle_pem: join_result.trust_bundle_pem.clone(),
+                    role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
+                };
 
-                // NOTE: we do NOT call raft.initialize() here. The node starts
-                // with no membership and waits to be added as a learner. The
-                // membership request is sent from main() once the raft
-                // transport listener is up.
+                join_info = Some(JoinInfo { node_id });
+                mtls
             }
+        }
+    };
+
+    let raft_client_tls = fleetos_control::raft::network::RaftClientTls {
+        cert_der: dc_mtls
+            .cert_chain
+            .first()
+            .map(|c| c.to_vec())
+            .unwrap_or_default(),
+        key_der: match &dc_mtls.private_key {
+            rustls::pki_types::PrivateKeyDer::Pkcs8(k) => k.secret_pkcs8_der().to_vec(),
+            rustls::pki_types::PrivateKeyDer::Pkcs1(k) => k.secret_pkcs1_der().to_vec(),
+            rustls::pki_types::PrivateKeyDer::Sec1(k) => k.secret_sec1_der().to_vec(),
+            _ => Vec::new(),
+        },
+        trust_bundle_pem: dc_mtls.trust_bundle_pem.clone(),
+        domain: config.trust_domains.data_control.clone(),
+    };
+    let network_factory = TonicRaftNetworkFactory::new(peer_addresses, raft_client_tls);
+
+    let raft = Raft::new(
+        node_id,
+        raft_config,
+        network_factory,
+        log_storage,
+        state_machine,
+    )
+    .await
+    .map_err(|e| Box::<dyn std::error::Error>::from(format!("raft init failed: {}", e)))?;
+
+    match config.cluster.mode {
+        ClusterMode::Bootstrap => {
+            let members: BTreeMap<u64, openraft::BasicNode> = config
+                .cluster
+                .initial_members
+                .iter()
+                .map(|m| {
+                    (
+                        m.id,
+                        openraft::BasicNode {
+                            addr: m.address.clone(),
+                        },
+                    )
+                })
+                .collect();
+            raft.initialize(members).await.map_err(|e| {
+                Box::<dyn std::error::Error>::from(format!("raft bootstrap failed: {}", e))
+            })?;
+            tracing::info!("raft cluster bootstrapped");
+        }
+        ClusterMode::Join => {
+            // NOTE: we do NOT call raft.initialize() here for first-boot joins.
         }
     }
 
     let raft_handle = RaftHandle {
         raft: Arc::new(raft),
     };
-
     let (shutdown_tx, _) = watch::channel(false);
-    Ok((raft_handle, shutdown_tx, join_info))
+    Ok((raft_handle, shutdown_tx, join_info, dc_mtls))
 }
 
 /// Factory for creating controller tasks when this node becomes leader.

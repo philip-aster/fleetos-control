@@ -13,9 +13,22 @@ use openraft::raft::{
 use openraft::{RaftNetwork, RaftNetworkFactory, Snapshot, Vote};
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
-use tonic::transport::Channel;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use super::{FleetosRaftConfig, RaftRpc, RaftTransportClient};
+
+fn der_to_pem(der: &[u8], label: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let b64 = STANDARD.encode(der);
+    let mut pem = String::new();
+    pem.push_str(&format!("-----BEGIN {}-----\n", label));
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {}-----\n", label));
+    pem
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SnapshotWire {
@@ -23,14 +36,26 @@ pub struct SnapshotWire {
     data: Vec<u8>,
 }
 
+/// Client TLS material for the Raft transport (Step 17 / S-2).
+#[derive(Clone)]
+pub struct RaftClientTls {
+    pub cert_der: Vec<u8>,
+    pub key_der: Vec<u8>,
+    pub trust_bundle_pem: String,
+    /// Trust domain used as the TLS `domain_name`; control SVIDs carry it as a DNS SAN.
+    pub domain: String,
+}
+
 pub struct TonicRaftNetworkFactory {
     peer_addresses: Arc<Mutex<HashMap<u64, String>>>,
+    tls: RaftClientTls,
 }
 
 impl TonicRaftNetworkFactory {
-    pub fn new(peer_addresses: HashMap<u64, String>) -> Self {
+    pub fn new(peer_addresses: HashMap<u64, String>, tls: RaftClientTls) -> Self {
         Self {
             peer_addresses: Arc::new(Mutex::new(peer_addresses)),
+            tls,
         }
     }
 }
@@ -39,8 +64,6 @@ impl RaftNetworkFactory<FleetosRaftConfig> for TonicRaftNetworkFactory {
     type Network = TonicRaftNetwork;
 
     async fn new_client(&mut self, target: u64, node: &openraft::BasicNode) -> Self::Network {
-        // Prefer the static config map (bootstrap); fall back to the address
-        // openraft learned from membership changes (join mode).
         let address = {
             let peers = self.peer_addresses.lock();
             peers
@@ -51,6 +74,7 @@ impl RaftNetworkFactory<FleetosRaftConfig> for TonicRaftNetworkFactory {
         TonicRaftNetwork {
             target,
             address,
+            tls: self.tls.clone(),
             client: Arc::new(AsyncMutex::new(None)),
         }
     }
@@ -59,6 +83,7 @@ impl RaftNetworkFactory<FleetosRaftConfig> for TonicRaftNetworkFactory {
 pub struct TonicRaftNetwork {
     target: u64,
     address: String,
+    tls: RaftClientTls,
     client: Arc<AsyncMutex<Option<RaftTransportClient<Channel>>>>,
 }
 
@@ -66,12 +91,24 @@ impl TonicRaftNetwork {
     async fn get_client(&self) -> Result<RaftTransportClient<Channel>, std::io::Error> {
         let mut client_guard = self.client.lock().await;
         if client_guard.is_none() {
-            let endpoint = if self.address.starts_with("http") {
-                self.address.clone()
-            } else {
-                format!("http://{}", self.address)
-            };
-            let channel = Channel::from_shared(endpoint)
+            let cert_pem = der_to_pem(&self.tls.cert_der, "CERTIFICATE");
+            let key_pem = der_to_pem(&self.tls.key_der, "PRIVATE KEY");
+            let identity = Identity::from_pem(cert_pem, key_pem);
+            let ca = Certificate::from_pem(&self.tls.trust_bundle_pem);
+            let tls_config = ClientTlsConfig::new()
+                .identity(identity)
+                .ca_certificate(ca)
+                .domain_name(self.tls.domain.clone());
+
+            let endpoint_str = format!(
+                "https://{}",
+                self.address
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://")
+            );
+            let channel = Endpoint::from_shared(endpoint_str)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
+                .tls_config(tls_config)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
                 .connect()
                 .await
