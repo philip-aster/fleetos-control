@@ -47,6 +47,9 @@ pub struct SagUpdateEvent {
 
     /// Full set of currently-revoked delegation IDs (serialized DelegationId bytes).
     pub revoked_delegation_ids: Vec<Vec<u8>>,
+
+    /// SPIFFE IDs of revoked node SVIDs
+    pub revoked_spiffe_ids: Vec<String>,
 }
 
 /// Events broadcast over the SchedulerService stream (WatchSchedule).

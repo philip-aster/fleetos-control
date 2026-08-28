@@ -104,6 +104,9 @@ pub fn init_keyspaces(db: &Database) -> Result<Keyspaces, StorageError> {
         svid_grants: db
             .keyspace(tables::SVID_GRANT_KEYSPACE, opts)
             .map_err(StorageError::Open)?,
+        revoked_svids: db
+            .keyspace(tables::REVOKED_SVID_KEYSPACE, opts)
+            .map_err(StorageError::Open)?,
     })
 }
 
@@ -134,6 +137,7 @@ pub struct Keyspaces {
     pub nonces: fjall::Keyspace,
     pub nonce_claims: fjall::Keyspace,
     pub svid_grants: fjall::Keyspace,
+    pub revoked_svids: fjall::Keyspace,
 }
 
 impl Keyspaces {
@@ -165,6 +169,7 @@ impl Keyspaces {
             (tables::NODE_POOL_KEYSPACE, &self.node_pools),
             (tables::RAFT_STATE_KEYSPACE, &self.raft_state),
             (tables::TRUST_BUNDLE_KEYSPACE, &self.trust_bundles),
+            (tables::REVOKED_SVID_KEYSPACE, &self.revoked_svids),
         ]
     }
 }

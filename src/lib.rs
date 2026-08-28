@@ -12,6 +12,7 @@ pub mod policy;
 pub mod proto;
 pub mod provisioning;
 pub mod raft;
+pub mod revocation;
 pub mod scheduler;
 pub mod secrets;
 pub mod storage;

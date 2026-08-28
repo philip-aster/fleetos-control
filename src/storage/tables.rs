@@ -33,3 +33,4 @@ pub const TRUST_BUNDLE_KEYSPACE: &str = "app_trust_bundles";
 pub const NONCE_KEYSPACE: &str = "app_nonces";
 pub const NONCE_CLAIM_KEYSPACE: &str = "app_nonce_claims";
 pub const SVID_GRANT_KEYSPACE: &str = "app_svid_grants";
+pub const REVOKED_SVID_KEYSPACE: &str = "app_revoked_svids";

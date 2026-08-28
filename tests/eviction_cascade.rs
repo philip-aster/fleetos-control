@@ -114,6 +114,7 @@ async fn eviction_cascade_revokes_delegations_and_removes_placements() {
         5,
         FleetosCommand::EvictNode {
             node_id: node_spiffe.to_string(),
+            svid_expires_at_unix: 20000,
         },
     )])
     .await
@@ -151,4 +152,14 @@ async fn eviction_cascade_revokes_delegations_and_removes_placements() {
         active_count += 1;
     }
     assert_eq!(active_count, 0, "no active delegations should remain");
+
+    // 8. Verify the evicted node's own SVID is recorded as revoked (G-4 / CR-5).
+    let revoked_svid = keyspaces
+        .revoked_svids
+        .get(node_spiffe.to_string().as_bytes())
+        .unwrap();
+    assert!(
+        revoked_svid.is_some(),
+        "evicted node's SVID must be recorded as revoked"
+    );
 }

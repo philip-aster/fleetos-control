@@ -55,10 +55,16 @@ pub enum FleetosCommand {
     RegisterNode {
         record: records::NodeRecord,
     },
-    /// Evicts a node AND revokes ALL of its delegations in a single batch.
-    /// This is one command (not two) so the one-to-many eviction invariant is atomic.
+    /// Evicts a node, revokes ALL its delegations, removes its placements,
+    /// and records its own SVID as revoked — atomically (G-4 / CR-5).
     EvictNode {
         node_id: String,
+        svid_expires_at_unix: i64,
+    },
+    /// Remove revoked-SVID entries whose expiry is past `cutoff_unix`.
+    /// The leader supplies the cutoff so application stays deterministic.
+    PruneExpiredRevokedSvids {
+        cutoff_unix: i64,
     },
     SetNodeSchedulable {
         node_id: String,

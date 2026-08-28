@@ -160,7 +160,10 @@ impl FjallStateMachine {
                 batch.insert(&self.keyspaces.nodes, node_id.as_bytes(), value.as_slice());
                 Ok(ChangeKind::SchedulingUpdate)
             }
-            FleetosCommand::EvictNode { node_id } => {
+            FleetosCommand::EvictNode {
+                node_id,
+                svid_expires_at_unix,
+            } => {
                 let node_spiffe = parse_spiffe(node_id)?;
 
                 // 1. Mark the node evicted (read-modify-write).
@@ -230,7 +233,40 @@ impl FjallStateMachine {
                 for pod_id in placement_pod_ids {
                     batch.remove(&self.keyspaces.placements, pod_id.as_bytes());
                 }
+
+                // 4. Record the node's own SVID as revoked so peers reject it (G-4 / CR-5).
+                let revoked_record = records::RevokedSvidRecord {
+                    spiffe_id: node_id.clone(),
+                    expires_at_unix: *svid_expires_at_unix,
+                };
+                let revoked_value = postcard::to_allocvec(&revoked_record).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.revoked_svids,
+                    node_id.as_bytes(),
+                    revoked_value.as_slice(),
+                );
                 Ok(ChangeKind::Eviction)
+            }
+
+            FleetosCommand::PruneExpiredRevokedSvids { cutoff_unix } => {
+                let mut to_remove = Vec::new();
+                for guard in self.keyspaces.revoked_svids.prefix(Vec::<u8>::new()) {
+                    let value = match guard.value() {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if let Ok(record) =
+                        postcard::from_bytes::<records::RevokedSvidRecord>(value.as_ref())
+                    {
+                        if record.expires_at_unix < *cutoff_unix {
+                            to_remove.push(record.spiffe_id);
+                        }
+                    }
+                }
+                for spiffe_id in to_remove {
+                    batch.remove(&self.keyspaces.revoked_svids, spiffe_id.as_bytes());
+                }
+                Ok(ChangeKind::SagUpdate)
             }
 
             // --- Delegations ---
@@ -468,10 +504,23 @@ impl FjallStateMachine {
             }
         }
 
+        // Collect revoked node SVIDs (G-4 / CR-5).
+        let mut revoked_spiffe_ids: Vec<String> = Vec::new();
+        for guard in self.keyspaces.revoked_svids.prefix(Vec::<u8>::new()) {
+            let value = match guard.value() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Ok(record) = postcard::from_bytes::<records::RevokedSvidRecord>(value.as_ref()) {
+                revoked_spiffe_ids.push(record.spiffe_id);
+            }
+        }
+
         self.broadcast_hub.publish_sag_update(SagUpdateEvent {
             version,
             rules_bytes,
             revoked_delegation_ids: revoked_ids,
+            revoked_spiffe_ids,
         });
     }
 

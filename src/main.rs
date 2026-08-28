@@ -188,7 +188,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ordinal_tracker.clone(),
         raft_handle.raft.clone(),
     ));
-    let node_controller = Arc::new(NodeController::new(raft_handle.raft.clone()));
+    let node_controller = Arc::new(NodeController::new(
+        raft_handle.raft.clone(),
+        config.svid.node_ttl_secs,
+    ));
     let cron_controller = Arc::new(CronController::new(
         workload_controller.clone(),
         raft_handle.raft.clone(),
@@ -205,6 +208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_tls_acceptor = tokio_rustls::TlsAcceptor::from(raft_server_config);
     let raft_td_config =
         fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
+    let raft_revoked_svids = keyspaces.revoked_svids.clone();
+
     tokio::spawn(async move {
         tracing::info!(addr = %raft_addr, "starting Raft transport listener (mTLS)");
         let listener = match tokio::net::TcpListener::bind(raft_addr).await {
@@ -220,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok((stream, addr)) => {
                         let acceptor = raft_tls_acceptor.clone();
                         let td_config = raft_td_config.clone();
+                        let revoked_ks = raft_revoked_svids.clone();
                         yield async move {
                             let tls_stream = acceptor.accept(stream).await.map_err(|e| {
                                 tracing::warn!(error = %e, addr = %addr, "raft TLS handshake failed");
@@ -254,6 +260,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::PermissionDenied,
                                     "raft peers must be control-kind",
+                                ));
+                            }
+
+                            if fleetos_control::revocation::is_svid_revoked(&revoked_ks, &spiffe_id.to_string()) {
+                                tracing::warn!(addr = %addr, spiffe = %spiffe_id, "raft peer SVID is revoked");
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "raft peer SVID has been revoked",
                                 ));
                             }
                             tracing::debug!(addr = %addr, spiffe = %spiffe_id, "raft peer authenticated");
@@ -429,6 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn Data/Control listener with custom TLS (optional client auth)
     let dc_tls_acceptor = tokio_rustls::TlsAcceptor::from(dc_server_config);
     let dc_td_config = fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
+    let dc_revoked_svids = keyspaces.revoked_svids.clone();
 
     tokio::spawn(async move {
         tracing::info!(addr = %dc_addr, "starting Data/Control gRPC listener");
@@ -446,6 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok((stream, addr)) => {
                         let acceptor = dc_tls_acceptor.clone();
                         let td_config = dc_td_config.clone();
+                        let revoked_ks = dc_revoked_svids.clone();
 
                         yield async move {
                             let tls_stream = acceptor.accept(stream).await
@@ -478,6 +494,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
                                     tracing::debug!(addr = %addr, spiffe = %id, "peer authenticated");
+                                    if fleetos_control::revocation::is_svid_revoked(&revoked_ks, &id.to_string()) {
+                                        tracing::warn!(addr = %addr, spiffe = %id, "peer SVID is revoked");
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::PermissionDenied,
+                                            "peer SVID has been revoked",
+                                        ));
+                                    }
                                     Some(id)
                                 }
                                 None => {
@@ -558,6 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let admin_tls_acceptor = tokio_rustls::TlsAcceptor::from(admin_server_config);
         let admin_td_config =
             fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
+        let admin_revoked_svids = keyspaces.revoked_svids.clone();
 
         tokio::spawn(async move {
             tracing::info!(addr = %admin_addr, "starting Admin gRPC listener");
@@ -575,6 +599,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok((stream, addr)) => {
                             let acceptor = admin_tls_acceptor.clone();
                             let td_config = admin_td_config.clone();
+                            let revoked_ks = admin_revoked_svids.clone();
 
                             yield async move {
                                 let tls_stream = acceptor.accept(stream).await
@@ -616,6 +641,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     })?;
 
                                 tracing::debug!(addr = %addr, spiffe = %spiffe_id, "admin peer authenticated");
+
+                                if fleetos_control::revocation::is_svid_revoked(&revoked_ks, &spiffe_id.to_string()) {
+                                    tracing::warn!(addr = %addr, spiffe = %spiffe_id, "admin peer SVID is revoked");
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "admin peer SVID has been revoked",
+                                    ));
+                                }
 
                                 Ok::<_, std::io::Error>(PeerAuthenticatedStream {
                                     inner: tls_stream,

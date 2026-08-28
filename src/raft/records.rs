@@ -83,3 +83,14 @@ pub struct SecretRecord {
     /// postcard-encoded `secrets::acl::SecretAcl`.
     pub acl_bytes: Vec<u8>,
 }
+
+/// A revoked node SVID (G-4 / CR-5). Stored keyed by SPIFFE ID string.
+///
+/// Enforcement is set-membership only; `expires_at_unix` exists solely so the
+/// replicated `PruneExpiredRevokedSvids` command can bound the set without any
+/// wall-clock reads in the state machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokedSvidRecord {
+    pub spiffe_id: String,
+    pub expires_at_unix: i64,
+}
