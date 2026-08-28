@@ -64,10 +64,10 @@ impl AttestationService for AttestationServiceImpl {
             ));
         }
 
-        let nonce = self
-            .nonce_manager
-            .generate_nonce()
-            .map_err(|e| Status::internal(format!("nonce generation failed: {}", e)))?;
+        let nonce = self.nonce_manager.generate_nonce().map_err(|e| match e {
+            super::AttestationError::RateLimited(msg) => Status::resource_exhausted(msg),
+            other => Status::internal(format!("nonce generation failed: {}", other)),
+        })?;
 
         // Persist the claim for this nonce: nonce -> claimed SPIFFE ID.
         self.nonce_claims_keyspace

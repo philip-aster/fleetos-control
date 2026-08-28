@@ -45,6 +45,9 @@ pub enum AttestationError {
     #[error("attestation backend not available: {0}")]
     BackendUnavailable(String),
 
+    #[error("rate limit exceeded: {0}")]
+    RateLimited(String),
+
     #[error("storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),
 

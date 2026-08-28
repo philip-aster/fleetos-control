@@ -113,6 +113,14 @@ node_check_interval_secs = 15
 # Interval between pod reconciliation checks.
 pod_check_interval_secs = 20
 
+# ---------------------------------------------------------------------------
+# Raft tuning
+# ---------------------------------------------------------------------------
+[raft]
+# Snapshot cadence + log purge.
+snapshot_logs_since_last = 10000
+purge_batch_size = 1024
+
 # -----------------------------------------------------------------------------
 # Provisioning
 # -----------------------------------------------------------------------------

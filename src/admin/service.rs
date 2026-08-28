@@ -32,6 +32,34 @@ pub struct AdminServiceImpl {
     raft: Arc<openraft::Raft<FleetosRaftConfig>>,
 }
 
+/// Admission hardening (G-12): identifiers must be DNS-label-shaped so they
+/// remain safe as SPIFFE path segments, storage key prefixes, and dummy-IP
+/// tenant keys. Rejects empty, oversized, and non-[a-z0-9-] values.
+fn validate_identifier(value: &str, field: &str) -> Result<(), Status> {
+    if value.is_empty() || value.len() > 63 {
+        return Err(Status::invalid_argument(format!(
+            "{} must be 1-63 characters",
+            field
+        )));
+    }
+    let valid = value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !value.starts_with('-')
+        && !value.ends_with('-');
+    if !valid {
+        return Err(Status::invalid_argument(format!(
+            "{} must match [a-z0-9-] and not start/end with '-'",
+            field
+        )));
+    }
+    Ok(())
+}
+
+const MAX_REPLICAS_PER_ROLE: u32 = 1024;
+const MAX_ROLES_PER_WORKLOAD: usize = 16;
+const MAX_SPEC_BYTES: usize = 1024 * 1024;
+
 impl AdminServiceImpl {
     pub fn new(
         storage: Arc<StorageEngine>,
@@ -80,10 +108,7 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
         let req = request.into_inner();
         let tenant_id = req.tenant_id;
-        if tenant_id.is_empty() {
-            return Err(Status::invalid_argument("tenant_id cannot be empty"));
-        }
-
+        validate_identifier(&tenant_id, "tenant_id")?;
         // Idempotency guard: check local state before proposing.
         let existing = self
             .storage
@@ -137,12 +162,31 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<WorkloadSpecAck>, Status> {
         self.verify_caller(&request)?;
         let spec = request.into_inner();
-        if spec.tenant_id.is_empty()
-            || spec.workload_id.is_empty()
-            || spec.image.is_empty()
-            || spec.replicas.is_empty()
-        {
-            return Err(Status::invalid_argument("invalid workload spec"));
+        validate_identifier(&spec.tenant_id, "tenant_id")?;
+        validate_identifier(&spec.workload_id, "workload_id")?;
+        if spec.image.is_empty() {
+            return Err(Status::invalid_argument("image cannot be empty"));
+        }
+        if spec.replicas.is_empty() {
+            return Err(Status::invalid_argument("replicas map cannot be empty"));
+        }
+        if spec.replicas.len() > MAX_ROLES_PER_WORKLOAD {
+            return Err(Status::invalid_argument(format!(
+                "too many roles: max {} per workload",
+                MAX_ROLES_PER_WORKLOAD
+            )));
+        }
+        for (role, count) in &spec.replicas {
+            validate_identifier(role, "role")?;
+            if *count == 0 || *count > MAX_REPLICAS_PER_ROLE {
+                return Err(Status::invalid_argument(format!(
+                    "replica count for role '{}' must be 1-{}",
+                    role, MAX_REPLICAS_PER_ROLE
+                )));
+            }
+        }
+        if prost::Message::encoded_len(&spec) > MAX_SPEC_BYTES {
+            return Err(Status::invalid_argument("workload spec exceeds 1 MiB"));
         }
 
         let record = crate::raft::records::WorkloadSpecRecord {
@@ -268,19 +312,13 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<fleetos_core::proto::admin::CronWorkloadAck>, Status> {
         self.verify_caller(&request)?;
         let cron = request.into_inner();
-        if cron.tenant_id.is_empty() || cron.cron_workload_id.is_empty() {
-            return Err(Status::invalid_argument("invalid cron workload"));
-        }
+        validate_identifier(&cron.tenant_id, "tenant_id")?;
+        validate_identifier(&cron.cron_workload_id, "cron_workload_id")?;
         if let Some(schedule) = &cron.schedule {
             CronController::validate_expression(&schedule.expression)
                 .map_err(|e| Status::invalid_argument(format!("invalid cron expression: {}", e)))?;
         } else {
             return Err(Status::invalid_argument("schedule cannot be empty"));
-        }
-        if cron.workload_template.is_none() {
-            return Err(Status::invalid_argument(
-                "workload_template cannot be empty",
-            ));
         }
 
         let spec_bytes = prost::Message::encode_to_vec(&cron);
@@ -395,5 +433,23 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<QuotaResponse>, Status> {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifier_validation() {
+        assert!(validate_identifier("tenant-1", "tenant_id").is_ok());
+        assert!(validate_identifier("a", "x").is_ok());
+        assert!(validate_identifier("db-replica-0", "x").is_ok());
+        assert!(validate_identifier("", "x").is_err());
+        assert!(validate_identifier("Tenant", "x").is_err());
+        assert!(validate_identifier("-leading", "x").is_err());
+        assert!(validate_identifier("trailing-", "x").is_err());
+        assert!(validate_identifier("has space", "x").is_err());
+        assert!(validate_identifier(&"a".repeat(64), "x").is_err());
     }
 }

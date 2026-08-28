@@ -52,6 +52,10 @@ pub struct ControlConfig {
 
     #[serde(default)]
     pub health: HealthConfig,
+
+    /// Raft tuning (snapshot cadence, log purge).
+    #[serde(default)]
+    pub raft: RaftTuningConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +106,38 @@ fn default_pod_check_interval() -> u64 {
 
 fn default_provision_poll() -> u64 {
     30
+}
+
+// ---------------------------------------------------------------------------
+// Raft tuning
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Deserialize)]
+pub struct RaftTuningConfig {
+    /// Trigger a state-machine snapshot after this many applied log entries
+    /// since the last snapshot. Bounds raft log growth and gives slow
+    /// followers a catch-up path (G-14).
+    #[serde(default = "default_snapshot_logs_since_last")]
+    pub snapshot_logs_since_last: u64,
+    /// Number of compacted log entries to purge per batch after a snapshot.
+    #[serde(default = "default_purge_batch_size")]
+    pub purge_batch_size: u64,
+}
+
+impl Default for RaftTuningConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_logs_since_last: default_snapshot_logs_since_last(),
+            purge_batch_size: default_purge_batch_size(),
+        }
+    }
+}
+
+fn default_snapshot_logs_since_last() -> u64 {
+    10_000
+}
+
+fn default_purge_batch_size() -> u64 {
+    1_024
 }
 
 // ---------------------------------------------------------------------------

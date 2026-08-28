@@ -742,6 +742,12 @@ async fn init_raft_cluster(
         heartbeat_interval: 500,
         election_timeout_min: 1500,
         election_timeout_max: 3000,
+        // Bound raft log growth and give lagging followers a snapshot
+        // catch-up path.
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+            config.raft.snapshot_logs_since_last,
+        ),
+        purge_batch_size: config.raft.purge_batch_size,
         ..Default::default()
     };
     let raft_config =
