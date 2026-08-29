@@ -3,8 +3,6 @@
 //! This is the *only* API surface for `fleetctl-proxy`.
 //! All methods require `ctrl`-kind SVID authorization.
 
-use std::sync::Arc;
-
 use crate::raft::FleetosRaftConfig;
 use fleetos_core::proto::admin::AdminService;
 use fleetos_core::proto::admin::ClusterStatus;
@@ -16,9 +14,10 @@ use fleetos_core::proto::admin::{
     SecretAck, SecretAclChange, StoreSecretRequest, UpsertSagRuleRequest, WorkloadSpecAck,
 };
 use fleetos_core::proto::workload::{CronWorkload, WorkloadSpec};
+use rand::Rng;
+use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
-use super::authz;
 use crate::attestation::join_token::{JoinTokenStore, NodeKind};
 use crate::controllers::cron_controller::CronController;
 use crate::dummy_ip::allocator::DummyIpAllocator;
@@ -75,14 +74,11 @@ impl AdminServiceImpl {
         }
     }
 
-    /// Verify the caller is authorized (ctrl-kind SVID).
+    /// Verify the caller is authorized (ctrl or operator SVID).
     ///
     /// This is defense-in-depth — the primary enforcement is at the mTLS layer
     /// (Admin trust bundle validation). But we check here too.
     fn verify_caller<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        // Extract the caller's SpiffeId from the connection info.
-        // Tonic automatically makes `ConnectInfo` available in request extensions
-        // when the stream implements `Connected`.
         let connect_info = request
             .extensions()
             .get::<crate::tls::PeerConnectInfo>()
@@ -92,10 +88,41 @@ impl AdminServiceImpl {
             .as_ref()
             .ok_or_else(|| Status::unauthenticated("no peer certificate found"))?;
 
-        authz::verify_admin_caller(spiffe_id)
-            .map_err(|_| Status::permission_denied("caller SVID kind is not ctrl"))?;
+        match spiffe_id.kind {
+            fleetos_core::spiffe::IdKind::Ctrl => Ok(()),
+            fleetos_core::spiffe::IdKind::Operator => Ok(()),
+            _ => Err(Status::permission_denied(
+                "caller SVID kind is not ctrl or operator",
+            )),
+        }
+    }
 
-        Ok(())
+    /// G-3: generate a unique request ID for correlation.
+    fn generate_request_id() -> String {
+        let mut bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut bytes);
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Build the audit context for an admin request (G-2 / G-3).
+    /// Must be called BEFORE `request.into_inner()` consumes the Request.
+    fn build_audit_context<T>(
+        &self,
+        request: &Request<T>,
+        target: &str,
+    ) -> crate::raft::records::AuditContext {
+        let actor = request
+            .extensions()
+            .get::<crate::tls::PeerConnectInfo>()
+            .and_then(|ci| ci.spiffe_id.as_ref())
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "unknown".to_owned());
+        crate::raft::records::AuditContext {
+            request_id: Self::generate_request_id(),
+            actor,
+            target: target.to_owned(),
+            timestamp_unix: time::OffsetDateTime::now_utc().unix_timestamp() as u64,
+        }
     }
 }
 
@@ -106,9 +133,11 @@ impl AdminService for AdminServiceImpl {
         request: Request<CreateTenantRequest>,
     ) -> Result<Response<CreateTenantResponse>, Status> {
         self.verify_caller(&request)?;
-        let req = request.into_inner();
-        let tenant_id = req.tenant_id;
+
+        // 1. Extract target BEFORE consuming the request
+        let tenant_id = request.get_ref().tenant_id.clone();
         validate_identifier(&tenant_id, "tenant_id")?;
+        let audit = self.build_audit_context(&request, &tenant_id);
         // Idempotency guard: check local state before proposing.
         let existing = self
             .storage
@@ -121,26 +150,33 @@ impl AdminService for AdminServiceImpl {
             )));
         }
 
-        // Compute the dummy IP block allocation (read-only).
+        // 2. NOW consume the request
+        let _req = request.into_inner();
+
         let block = self
             .dummy_ip_allocator
             .compute_tenant_block_allocation(&tenant_id)
             .map_err(|e| Status::internal(format!("failed to allocate dummy IP block: {}", e)))?;
 
-        // Propose AllocateTenantBlock
         self.raft
-            .client_write(crate::raft::FleetosCommand::AllocateTenantBlock { record: block })
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::AllocateTenantBlock { record: block },
+                audit: Some(audit.clone()),
+            })
             .await
             .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
 
-        // Propose CreateTenant
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let record = crate::raft::records::TenantRecord {
             tenant_id: tenant_id.clone(),
             created_at: now,
         };
+
         self.raft
-            .client_write(crate::raft::FleetosCommand::CreateTenant { record })
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::CreateTenant { record },
+                audit: Some(audit),
+            })
             .await
             .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
 
@@ -148,19 +184,14 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(CreateTenantResponse { success: true }))
     }
 
-    /// Submit a workload definition.
-    ///
-    /// This triggers the workload controller to expand the WorkloadSpec
-    /// into concrete PodSpecs per role/ordinal.
-    ///
-    /// CRITICAL: The six trusted fields (tenant_id, workload_id, role, image,
-    /// ordinal, pod_id) are unconditionally overwritten during expansion.
-    /// Caller-submitted values in the template are ignored.
     async fn submit_workload_spec(
         &self,
         request: Request<WorkloadSpec>,
     ) -> Result<Response<WorkloadSpecAck>, Status> {
         self.verify_caller(&request)?;
+
+        let workload_id = request.get_ref().workload_id.clone();
+        let audit = self.build_audit_context(&request, &workload_id);
         let spec = request.into_inner();
         validate_identifier(&spec.tenant_id, "tenant_id")?;
         validate_identifier(&spec.workload_id, "workload_id")?;
@@ -194,8 +225,12 @@ impl AdminService for AdminServiceImpl {
             workload_id: spec.workload_id.clone(),
             spec_bytes: prost::Message::encode_to_vec(&spec),
         };
+
         self.raft
-            .client_write(crate::raft::FleetosCommand::SubmitWorkloadSpec { record })
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::SubmitWorkloadSpec { record },
+                audit: Some(audit),
+            })
             .await
             .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
 
@@ -203,43 +238,29 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(WorkloadSpecAck { accepted: true }))
     }
 
-    /// List all fleetos-agent nodes and their status.
-    ///
-    /// Returns SPIFFE IDs of all registered nodes except evicted ones.
     async fn list_nodes(
         &self,
         request: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
         self.verify_caller(&request)?;
-
         let records = self
             .storage
             .list_node_records()
             .map_err(|e| Status::internal(format!("node registry query failed: {}", e)))?;
-
         let node_svids: Vec<String> = records
             .iter()
             .filter(|r| r.status != crate::raft::records::NodeStatus::Evicted)
             .map(|r| r.node_id.clone())
             .collect();
-
         Ok(Response::new(ListNodesResponse { node_svids }))
     }
 
-    /// Get overall cluster health and capacity.
-    ///
-    /// Reports the current Raft term and the count of nodes in Active status.
     async fn get_cluster_status(
         &self,
         request: Request<GetClusterStatusRequest>,
     ) -> Result<Response<ClusterStatus>, Status> {
         self.verify_caller(&request)?;
-
-        // Current Raft term from live metrics.
         let raft_term = self.raft.metrics().borrow().current_term;
-
-        // Healthy = nodes in Active status (cordoned nodes are healthy but
-        // not schedulable; evicted nodes are gone).
         let records = self
             .storage
             .list_node_records()
@@ -248,28 +269,20 @@ impl AdminService for AdminServiceImpl {
             .iter()
             .filter(|r| r.status == crate::raft::records::NodeStatus::Active)
             .count() as u32;
-
         Ok(Response::new(ClusterStatus {
             raft_term,
             healthy_nodes,
         }))
     }
 
-    /// Mint a Join Token for bootstrapping new infrastructure.
-    ///
-    /// The token is cryptographically random, strictly single-use,
-    /// and stored in the join_tokens keyspace.
-    ///
-    /// GenerateJoinToken routes to the correct trust domain root at
-    /// issuance time based on requested node kind:
-    /// - AGENT/ROUTER/GATEWAY → Data/Control domain
-    /// - CONTROL → Data/Control domain (Raft peers are in Data/Control)
-    /// - FLEETCTL_PROXY → Admin domain
     async fn generate_join_token(
         &self,
         request: Request<GenerateJoinTokenRequest>,
     ) -> Result<Response<GenerateJoinTokenResponse>, Status> {
         self.verify_caller(&request)?;
+
+        let node_kind_str = request.get_ref().node_kind.clone();
+        let audit = self.build_audit_context(&request, &node_kind_str);
         let req = request.into_inner();
         let node_kind = match req.node_kind.as_str() {
             "agent" => NodeKind::Agent,
@@ -292,7 +305,10 @@ impl AdminService for AdminServiceImpl {
         let token_bytes = record.token.clone();
 
         self.raft
-            .client_write(crate::raft::FleetosCommand::MintJoinToken { record })
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::MintJoinToken { record },
+                audit: Some(audit),
+            })
             .await
             .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
 
@@ -302,15 +318,14 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    /// Submit a cron workload definition.
-    ///
-    /// This stores the CronWorkload and triggers the cron controller
-    /// to evaluate its schedule.
     async fn submit_cron_workload(
         &self,
         request: Request<CronWorkload>,
     ) -> Result<Response<fleetos_core::proto::admin::CronWorkloadAck>, Status> {
         self.verify_caller(&request)?;
+
+        let cron_id = request.get_ref().cron_workload_id.clone();
+        let audit = self.build_audit_context(&request, &cron_id);
         let cron = request.into_inner();
         validate_identifier(&cron.tenant_id, "tenant_id")?;
         validate_identifier(&cron.cron_workload_id, "cron_workload_id")?;
@@ -332,8 +347,12 @@ impl AdminService for AdminServiceImpl {
                 .unwrap_or_default(),
             spec_bytes,
         };
+
         self.raft
-            .client_write(crate::raft::FleetosCommand::SubmitCronWorkload { record })
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::SubmitCronWorkload { record },
+                audit: Some(audit),
+            })
             .await
             .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
 
@@ -344,6 +363,7 @@ impl AdminService for AdminServiceImpl {
     }
 
     // --- v0.1.5-rc.1 AdminService surface (stubs pending Step 16/20) ---
+    // (Keep your existing stubs exactly as they are)
 
     async fn upsert_sag_rule(
         &self,
@@ -352,7 +372,6 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16/20"))
     }
-
     async fn delete_sag_rule(
         &self,
         request: Request<DeleteSagRuleRequest>,
@@ -360,7 +379,6 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16/20"))
     }
-
     async fn store_secret(
         &self,
         request: Request<StoreSecretRequest>,
@@ -368,7 +386,6 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16/20"))
     }
-
     async fn grant_secret_access(
         &self,
         request: Request<SecretAclChange>,
@@ -376,7 +393,6 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16/20"))
     }
-
     async fn revoke_secret_access(
         &self,
         request: Request<SecretAclChange>,
@@ -384,7 +400,6 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16/20"))
     }
-
     async fn request_delegated_key(
         &self,
         request: Request<DelegatedKeyRequest>,
@@ -392,7 +407,6 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 20"))
     }
-
     async fn delete_workload(
         &self,
         request: Request<DeleteWorkloadRequest>,
@@ -400,7 +414,6 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16"))
     }
-
     async fn scale_workload(
         &self,
         request: Request<ScaleWorkloadRequest>,
@@ -408,17 +421,14 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16"))
     }
-
     async fn cordon_node(&self, request: Request<NodeId>) -> Result<Response<NodeAck>, Status> {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16"))
     }
-
     async fn evict_node(&self, request: Request<NodeId>) -> Result<Response<NodeAck>, Status> {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16"))
     }
-
     async fn set_quota(
         &self,
         request: Request<QuotaRequest>,
@@ -426,13 +436,81 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16"))
     }
-
     async fn get_quota(
         &self,
         request: Request<QuotaRequest>,
     ) -> Result<Response<QuotaResponse>, Status> {
         self.verify_caller(&request)?;
         Err(Status::unimplemented("scheduled for Step 16"))
+    }
+
+    // --- CR-8: Operator JIT Access (Stubs for Step 25) ---
+
+    async fn grant_operator_access(
+        &self,
+        request: Request<fleetos_core::proto::admin::GrantOperatorAccessRequest>,
+    ) -> Result<Response<fleetos_core::proto::admin::OperatorAccessAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 25"))
+    }
+
+    async fn revoke_operator_access(
+        &self,
+        request: Request<fleetos_core::proto::admin::RevokeOperatorAccessRequest>,
+    ) -> Result<Response<fleetos_core::proto::admin::OperatorAccessAck>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 25"))
+    }
+
+    async fn list_operator_access(
+        &self,
+        request: Request<fleetos_core::proto::admin::ListOperatorAccessRequest>,
+    ) -> Result<Response<fleetos_core::proto::admin::ListOperatorAccessResponse>, Status> {
+        self.verify_caller(&request)?;
+        Err(Status::unimplemented("scheduled for Step 25"))
+    }
+
+    // --- CR-9: Replicated Audit Log (Read Path) ---
+    async fn list_audit_log(
+        &self,
+        request: Request<fleetos_core::proto::admin::ListAuditLogRequest>,
+    ) -> Result<Response<fleetos_core::proto::admin::ListAuditLogResponse>, Status> {
+        self.verify_caller(&request)?;
+
+        let req = request.into_inner();
+        let from_version = req.from_version;
+        let max_entries = if req.max_entries == 0 {
+            1000
+        } else {
+            req.max_entries as usize
+        };
+
+        let start_key = from_version.to_be_bytes().to_vec();
+        let mut entries = Vec::new();
+
+        for guard in self.storage.audit_log.range(start_key..) {
+            if entries.len() >= max_entries {
+                break;
+            }
+            let value = guard
+                .value()
+                .map_err(|e| Status::internal(format!("storage error: {}", e)))?;
+            let record: crate::raft::records::AuditRecord = postcard::from_bytes(value.as_ref())
+                .map_err(|e| Status::internal(format!("deserialization error: {}", e)))?;
+
+            entries.push(fleetos_core::proto::admin::AuditEntry {
+                version: record.version,
+                request_id: record.request_id,
+                actor: record.actor,
+                action: record.action,
+                target: record.target,
+                timestamp_unix: record.timestamp_unix,
+            });
+        }
+
+        Ok(Response::new(
+            fleetos_core::proto::admin::ListAuditLogResponse { entries },
+        ))
     }
 }
 

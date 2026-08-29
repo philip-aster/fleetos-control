@@ -1,7 +1,7 @@
 //! Hard invariant: a snapshot built from one state machine, when installed
 //! into a fresh state machine, reproduces all application state exactly.
 use fleetos_control::raft::records::{NodeRecord, NodeStatus, TenantRecord};
-use fleetos_control::raft::{FleetosCommand, FleetosRaftConfig};
+use fleetos_control::raft::{AuditedCommand, FleetosCommand, FleetosRaftConfig};
 use fleetos_control::scheduler::{Placement, ResourceSpec};
 use fleetos_core::spiffe::SpiffeId;
 use openraft::storage::RaftStateMachine;
@@ -9,7 +9,7 @@ use openraft::{Entry, EntryPayload, LeaderId, LogId};
 use std::io::Cursor;
 use tempfile::tempdir;
 
-fn make_entry(index: u64, cmd: FleetosCommand) -> Entry<FleetosRaftConfig> {
+fn make_entry(index: u64, cmd: AuditedCommand) -> Entry<FleetosRaftConfig> {
     Entry {
         log_id: LogId::new(LeaderId::new(1, 1), index),
         payload: EntryPayload::Normal(cmd),
@@ -50,7 +50,7 @@ async fn snapshot_round_trip_preserves_state() {
     src_sm
         .apply(vec![make_entry(
             1,
-            FleetosCommand::CreateTenant { record: tenant },
+            AuditedCommand::system(FleetosCommand::CreateTenant { record: tenant }),
         )])
         .await
         .unwrap();
@@ -72,9 +72,9 @@ async fn snapshot_round_trip_preserves_state() {
     src_sm
         .apply(vec![make_entry(
             2,
-            FleetosCommand::RegisterNode {
+            AuditedCommand::system(FleetosCommand::RegisterNode {
                 record: node_record,
-            },
+            }),
         )])
         .await
         .unwrap();
@@ -94,7 +94,7 @@ async fn snapshot_round_trip_preserves_state() {
     src_sm
         .apply(vec![make_entry(
             3,
-            FleetosCommand::CommitPlacement { record: placement },
+            AuditedCommand::system(FleetosCommand::CommitPlacement { record: placement }),
         )])
         .await
         .unwrap();

@@ -56,7 +56,9 @@ impl CronController {
             spec_bytes: prost::Message::encode_to_vec(&spec),
         };
         self.raft
-            .client_write(FleetosCommand::SubmitWorkloadSpec { record })
+            .client_write(crate::raft::AuditedCommand::system(
+                FleetosCommand::SubmitWorkloadSpec { record },
+            ))
             .await
             .map_err(|e| ControllerError::Raft(e.to_string()))?;
 

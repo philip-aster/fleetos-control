@@ -193,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyspaces.secrets.clone(),
         keyspaces.sag_rules.clone(),
         keyspaces.node_pools.clone(),
+        keyspaces.audit_log.clone(),
     ));
 
     // --- Phase 7: Raft cluster initialization ---

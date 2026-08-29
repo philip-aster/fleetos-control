@@ -30,6 +30,7 @@ pub struct StorageEngine {
     pub secrets: Keyspace,
     pub sags: Keyspace,
     pub node_pools: Keyspace,
+    pub audit_log: Keyspace,
 }
 
 impl StorageEngine {
@@ -55,6 +56,7 @@ impl StorageEngine {
         secrets: Keyspace,
         sags: Keyspace,
         node_pools: Keyspace,
+        audit_log: Keyspace,
     ) -> Self {
         Self {
             version,
@@ -77,6 +79,7 @@ impl StorageEngine {
             secrets,
             sags,
             node_pools,
+            audit_log,
         }
     }
 

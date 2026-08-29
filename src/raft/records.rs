@@ -94,3 +94,33 @@ pub struct RevokedSvidRecord {
     pub spiffe_id: String,
     pub expires_at_unix: i64,
 }
+
+/// Context for replicated audit logging (G-2 / G-3).
+///
+/// Captured by the leader BEFORE proposing so application is deterministic.
+/// Travels inside the replicated command so the audit record commits in the
+/// same batch as the mutation it describes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditContext {
+    /// Unique per-request correlation ID (G-3).
+    pub request_id: String,
+    /// SPIFFE ID of the caller, or "system" for controller-initiated actions.
+    pub actor: String,
+    /// The resource being acted on (tenant_id, workload_id, node_id, etc.).
+    pub target: String,
+    /// Unix timestamp captured by the leader (deterministic across nodes).
+    pub timestamp_unix: u64,
+}
+
+/// A single replicated audit log entry, keyed by MonotonicVersion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditRecord {
+    /// The MonotonicVersion of the mutation this entry describes.
+    pub version: u64,
+    pub request_id: String,
+    pub actor: String,
+    /// Command name, derived by the state machine from the applied command.
+    pub action: String,
+    pub target: String,
+    pub timestamp_unix: u64,
+}

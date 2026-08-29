@@ -618,6 +618,36 @@ fn parse_spiffe(s: &str) -> Result<SpiffeId, StorageError<u64>> {
     })
 }
 
+/// Derive a stable action name from a command for the audit log.
+fn command_action(cmd: &FleetosCommand) -> &'static str {
+    match cmd {
+        FleetosCommand::CreateTenant { .. } => "CreateTenant",
+        FleetosCommand::DeleteTenant { .. } => "DeleteTenant",
+        FleetosCommand::SubmitWorkloadSpec { .. } => "SubmitWorkloadSpec",
+        FleetosCommand::SubmitCronWorkload { .. } => "SubmitCronWorkload",
+        FleetosCommand::MintJoinToken { .. } => "MintJoinToken",
+        FleetosCommand::ConsumeJoinToken { .. } => "ConsumeJoinToken",
+        FleetosCommand::SetPcrPolicy { .. } => "SetPcrPolicy",
+        FleetosCommand::RegisterNode { .. } => "RegisterNode",
+        FleetosCommand::EvictNode { .. } => "EvictNode",
+        FleetosCommand::PruneExpiredRevokedSvids { .. } => "PruneExpiredRevokedSvids",
+        FleetosCommand::SetNodeSchedulable { .. } => "SetNodeSchedulable",
+        FleetosCommand::IssueDelegation { .. } => "IssueDelegation",
+        FleetosCommand::RevokeDelegation { .. } => "RevokeDelegation",
+        FleetosCommand::UpsertSagRule { .. } => "UpsertSagRule",
+        FleetosCommand::DeleteSagRule { .. } => "DeleteSagRule",
+        FleetosCommand::AllocateTenantBlock { .. } => "AllocateTenantBlock",
+        FleetosCommand::AllocateServiceAddress { .. } => "AllocateServiceAddress",
+        FleetosCommand::StoreSecret { .. } => "StoreSecret",
+        FleetosCommand::RecordOrdinalAssignment { .. } => "RecordOrdinalAssignment",
+        FleetosCommand::CommitPlacement { .. } => "CommitPlacement",
+        FleetosCommand::RemovePlacement { .. } => "RemovePlacement",
+        FleetosCommand::ReassignPodId { .. } => "ReassignPodId",
+        FleetosCommand::StoreNodePool { .. } => "StoreNodePool",
+        FleetosCommand::DeleteNodePool { .. } => "DeleteNodePool",
+    }
+}
+
 impl RaftStateMachine<FleetosRaftConfig> for FjallStateMachine {
     type SnapshotBuilder = FjallSnapshotBuilder;
 
@@ -653,7 +683,7 @@ impl RaftStateMachine<FleetosRaftConfig> for FjallStateMachine {
         I::IntoIter: Send,
     {
         let mut responses = Vec::new();
-
+        let mut pending_audit: Option<(records::AuditContext, String)> = None;
         for entry in entries {
             let log_id = *entry.get_log_id();
 
@@ -666,8 +696,22 @@ impl RaftStateMachine<FleetosRaftConfig> for FjallStateMachine {
                 EntryPayload::Blank => {
                     // No-op entry (e.g., first entry of a new term). Still bumps the version.
                 }
-                EntryPayload::Normal(cmd) => {
-                    change_kind = self.apply_command(cmd, &mut batch)?;
+                EntryPayload::Normal(audited) => {
+                    // G-2: write the audit record in the SAME batch as the mutation.
+                    let ctx = audited
+                        .audit
+                        .clone()
+                        .unwrap_or_else(|| records::AuditContext {
+                            request_id: String::new(),
+                            actor: "system".to_owned(),
+                            target: String::new(),
+                            timestamp_unix: 0, // backfilled below from the leader-captured value if present
+                        });
+                    // Apply the command first so `change_kind` is set.
+                    change_kind = self.apply_command(&audited.cmd, &mut batch)?;
+                    // Build the audit record. The version is allocated below, so we
+                    // stash the pieces and write the record after version allocation.
+                    pending_audit = Some((ctx, command_action(&audited.cmd).to_owned()));
                 }
                 EntryPayload::Membership(membership) => {
                     let stored = StoredMembership::new(Some(log_id), membership.clone());
@@ -695,6 +739,24 @@ impl RaftStateMachine<FleetosRaftConfig> for FjallStateMachine {
                 .persist_version(new_version.get(), &mut batch)
                 .map_err(storage_err)?;
 
+            // G-2: persist the audit record keyed by the allocated version,
+            // in the same batch as the mutation (atomic-apply invariant).
+            if let Some((ctx, action)) = pending_audit.take() {
+                let audit_record = records::AuditRecord {
+                    version: new_version.get(),
+                    request_id: ctx.request_id,
+                    actor: ctx.actor,
+                    action,
+                    target: ctx.target,
+                    timestamp_unix: ctx.timestamp_unix,
+                };
+                let audit_bytes = postcard::to_allocvec(&audit_record).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.audit_log,
+                    new_version.get().to_be_bytes(),
+                    audit_bytes.as_slice(),
+                );
+            }
             // Commit this entry's mutations atomically.
             batch.commit().map_err(commit_err)?;
 
@@ -710,7 +772,6 @@ impl RaftStateMachine<FleetosRaftConfig> for FjallStateMachine {
                 version: new_version.get(),
             });
         }
-
         Ok(responses)
     }
 

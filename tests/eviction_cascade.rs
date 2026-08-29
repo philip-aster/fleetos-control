@@ -2,14 +2,14 @@
 //! removes its placements, and marks it evicted — atomically.
 use fleetos_control::delegation::DelegationRecord;
 use fleetos_control::raft::records::{NodeRecord, NodeStatus};
-use fleetos_control::raft::{FleetosCommand, FleetosRaftConfig};
+use fleetos_control::raft::{AuditedCommand, FleetosCommand, FleetosRaftConfig};
 use fleetos_control::scheduler::{Placement, ResourceSpec};
 use fleetos_core::spiffe::SpiffeId;
 use openraft::storage::RaftStateMachine;
 use openraft::{Entry, EntryPayload, LeaderId, LogId};
 use tempfile::tempdir;
 
-fn make_entry(index: u64, cmd: FleetosCommand) -> Entry<FleetosRaftConfig> {
+fn make_entry(index: u64, cmd: fleetos_control::raft::AuditedCommand) -> Entry<FleetosRaftConfig> {
     Entry {
         log_id: LogId::new(LeaderId::new(1, 1), index),
         payload: EntryPayload::Normal(cmd),
@@ -63,9 +63,9 @@ async fn eviction_cascade_revokes_delegations_and_removes_placements() {
     };
     sm.apply(vec![make_entry(
         1,
-        FleetosCommand::RegisterNode {
+        AuditedCommand::system(FleetosCommand::RegisterNode {
             record: node_record,
-        },
+        }),
     )])
     .await
     .unwrap();
@@ -83,7 +83,7 @@ async fn eviction_cascade_revokes_delegations_and_removes_placements() {
         };
         sm.apply(vec![make_entry(
             2 + i as u64,
-            FleetosCommand::IssueDelegation { record: delegation },
+            AuditedCommand::system(FleetosCommand::IssueDelegation { record: delegation }),
         )])
         .await
         .unwrap();
@@ -104,7 +104,7 @@ async fn eviction_cascade_revokes_delegations_and_removes_placements() {
     };
     sm.apply(vec![make_entry(
         4,
-        FleetosCommand::CommitPlacement { record: placement },
+        AuditedCommand::system(FleetosCommand::CommitPlacement { record: placement }),
     )])
     .await
     .unwrap();
@@ -112,10 +112,10 @@ async fn eviction_cascade_revokes_delegations_and_removes_placements() {
     // 4. Evict the node.
     sm.apply(vec![make_entry(
         5,
-        FleetosCommand::EvictNode {
+        AuditedCommand::system(FleetosCommand::EvictNode {
             node_id: node_spiffe.to_string(),
             svid_expires_at_unix: 20000,
-        },
+        }),
     )])
     .await
     .unwrap();

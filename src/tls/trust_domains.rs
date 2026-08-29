@@ -94,13 +94,11 @@ pub fn validate_peer_identity(
             }
         }
         TrustDomainRole::Admin => {
-            // Accept ONLY: ctrl (fleetctl-proxy's identity kind).
-            // A valid `sa` or `node` SVID hitting this endpoint must be rejected
-            // at the TLS/mTLS layer, not just at the application layer.
+            // Accept: ctrl (fleetctl-proxy) and operator (human operators via JIT).
             match kind {
-                Some("ctrl") => Ok(()),
+                Some("ctrl") | Some("operator") => Ok(()),
                 Some(other) => Err(TlsError::IdentityKindMismatch {
-                    expected: "ctrl".to_owned(),
+                    expected: "ctrl/operator".to_owned(),
                     actual: other.to_owned(),
                 }),
                 None => Err(TlsError::SpiffeParse(

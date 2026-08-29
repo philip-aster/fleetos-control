@@ -131,6 +131,25 @@ pub enum FleetosCommand {
     },
 }
 
+/// Wraps a `FleetosCommand` with optional audit context so the audit record
+/// is replicated in the same Raft entry as the mutation (G-2 / G-3).
+///
+/// Commands proposed by the AdminService carry `Some(ctx)`; internal/system
+/// proposals may carry `None`, in which case the state machine still logs the
+/// action with a "system" actor.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AuditedCommand {
+    pub cmd: FleetosCommand,
+    pub audit: Option<records::AuditContext>,
+}
+
+impl AuditedCommand {
+    /// Convenience for system/controller-initiated commands with no request context.
+    pub fn system(cmd: FleetosCommand) -> Self {
+        Self { cmd, audit: None }
+    }
+}
+
 /// Application-level response returned after applying a command.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FleetosResponse {
@@ -140,7 +159,7 @@ pub struct FleetosResponse {
 // Raft type configuration for fleetos-control.
 declare_raft_types!(
     pub FleetosRaftConfig:
-        D            = FleetosCommand,
+        D            = AuditedCommand,
         R            = FleetosResponse,
         NodeId       = u64,
         Node         = openraft::BasicNode,

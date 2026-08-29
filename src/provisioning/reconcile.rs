@@ -150,7 +150,9 @@ impl ProvisioningReconciler {
         let record = self.join_token_store.compute_token_record(node_kind)?;
         let token = record.token.clone();
         self.raft
-            .client_write(crate::raft::FleetosCommand::MintJoinToken { record })
+            .client_write(crate::raft::AuditedCommand::system(
+                crate::raft::FleetosCommand::MintJoinToken { record },
+            ))
             .await
             .map_err(|e| ProvisioningError::Raft(e.to_string()))?;
         let payload = BootstrapPayload {

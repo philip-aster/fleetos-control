@@ -96,9 +96,9 @@ impl WorkloadController {
                             current_node_id: Some(decision.node_id.to_string()),
                         };
                         self.raft
-                            .client_write(FleetosCommand::RecordOrdinalAssignment {
-                                record: assignment,
-                            })
+                            .client_write(crate::raft::AuditedCommand::system(
+                                FleetosCommand::RecordOrdinalAssignment { record: assignment },
+                            ))
                             .await
                             .map_err(|e| ControllerError::Raft(e.to_string()))?;
 
@@ -113,7 +113,9 @@ impl WorkloadController {
                             resources: pending_pod.resources,
                         };
                         self.raft
-                            .client_write(FleetosCommand::CommitPlacement { record: placement })
+                            .client_write(crate::raft::AuditedCommand::system(
+                                FleetosCommand::CommitPlacement { record: placement },
+                            ))
                             .await
                             .map_err(|e| ControllerError::Raft(e.to_string()))?;
 

@@ -1,13 +1,13 @@
 //! Hard invariant: StoreSecret broadcasts a SecretRotationNotification
 //! carrying the target_spiffe_id, so agents know which identity's secret rotated.
 use fleetos_control::raft::records::SecretRecord;
-use fleetos_control::raft::{FleetosCommand, FleetosRaftConfig};
+use fleetos_control::raft::{AuditedCommand, FleetosCommand, FleetosRaftConfig};
 use fleetos_control::watch::broadcast::WatchEvent;
 use openraft::storage::RaftStateMachine;
 use openraft::{Entry, EntryPayload, LeaderId, LogId};
 use tempfile::tempdir;
 
-fn make_entry(index: u64, cmd: FleetosCommand) -> Entry<FleetosRaftConfig> {
+fn make_entry(index: u64, cmd: AuditedCommand) -> Entry<FleetosRaftConfig> {
     Entry {
         log_id: LogId::new(LeaderId::new(1, 1), index),
         payload: EntryPayload::Normal(cmd),
@@ -42,10 +42,10 @@ async fn store_secret_broadcasts_rotation_with_target_spiffe_id() {
 
     sm.apply(vec![make_entry(
         1,
-        FleetosCommand::StoreSecret {
+        AuditedCommand::system(FleetosCommand::StoreSecret {
             record,
             target_spiffe_id: target_spiffe_id.clone(),
-        },
+        }),
     )])
     .await
     .unwrap();

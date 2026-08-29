@@ -38,13 +38,15 @@ impl PodController {
 
         let new_pod_id = PodId::new(format!("{}-{}-{}", workload_id, role, ordinal));
         self.raft
-            .client_write(FleetosCommand::ReassignPodId {
-                tenant_id: tenant_id.to_owned(),
-                service: workload_id.to_owned(),
-                role: role.to_owned(),
-                ordinal,
-                new_pod_id: new_pod_id.as_str().to_string(),
-            })
+            .client_write(crate::raft::AuditedCommand::system(
+                FleetosCommand::ReassignPodId {
+                    tenant_id: tenant_id.to_owned(),
+                    service: workload_id.to_owned(),
+                    role: role.to_owned(),
+                    ordinal,
+                    new_pod_id: new_pod_id.as_str().to_string(),
+                },
+            ))
             .await
             .map_err(|e| ControllerError::Raft(e.to_string()))?;
 
@@ -78,15 +80,19 @@ impl PodController {
                     current_node_id: None,
                 };
                 self.raft
-                    .client_write(FleetosCommand::RecordOrdinalAssignment { record: freed })
+                    .client_write(crate::raft::AuditedCommand::system(
+                        FleetosCommand::RecordOrdinalAssignment { record: freed },
+                    ))
                     .await
                     .map_err(|e| ControllerError::Raft(e.to_string()))?;
 
                 if let Some(ref pod_id) = assignment.current_pod_id {
                     self.raft
-                        .client_write(FleetosCommand::RemovePlacement {
-                            pod_id: pod_id.clone(),
-                        })
+                        .client_write(crate::raft::AuditedCommand::system(
+                            FleetosCommand::RemovePlacement {
+                                pod_id: pod_id.clone(),
+                            },
+                        ))
                         .await
                         .map_err(|e| ControllerError::Raft(e.to_string()))?;
                 }
