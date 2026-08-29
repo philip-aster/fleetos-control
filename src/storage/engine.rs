@@ -32,6 +32,7 @@ pub struct StorageEngine {
     pub node_pools: Keyspace,
     pub audit_log: Keyspace,
     pub operator_grants: Keyspace,
+    pub workload_status: Keyspace,
 }
 
 impl StorageEngine {
@@ -59,6 +60,7 @@ impl StorageEngine {
         node_pools: Keyspace,
         audit_log: Keyspace,
         operator_grants: Keyspace,
+        workload_status: Keyspace,
     ) -> Self {
         Self {
             version,
@@ -83,6 +85,7 @@ impl StorageEngine {
             node_pools,
             audit_log,
             operator_grants,
+            workload_status,
         }
     }
 
@@ -384,5 +387,26 @@ impl StorageEngine {
             }
         }
         Ok(records)
+    }
+
+    /// Get the latest workload status for a pod (G-10).
+    pub fn get_workload_status(
+        &self,
+        pod_id: &str,
+    ) -> Result<Option<crate::raft::records::WorkloadStatusRecord>, crate::storage::StorageError>
+    {
+        match self
+            .workload_status
+            .get(pod_id.as_bytes())
+            .map_err(crate::storage::StorageError::Storage)?
+        {
+            Some(bytes) => {
+                let record: crate::raft::records::WorkloadStatusRecord =
+                    postcard::from_bytes(&bytes)
+                        .map_err(crate::storage::StorageError::Serialization)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
     }
 }

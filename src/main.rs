@@ -195,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyspaces.node_pools.clone(),
         keyspaces.audit_log.clone(),
         keyspaces.operator_grants.clone(),
+        keyspaces.workload_status.clone(),
     ));
 
     // JoinHandles for the gRPC listeners, awaited during graceful shutdown.
@@ -384,6 +385,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_lease_timeout_secs: config.health.node_lease_timeout_secs,
         node_check_interval_secs: config.health.node_check_interval_secs,
         pod_check_interval_secs: config.health.pod_check_interval_secs,
+        workload_status_staleness_secs: config.health.workload_status_staleness_secs,
     });
 
     let leader_gate = LeaderGate::new(raft_handle.raft.as_ref().clone());
@@ -446,7 +448,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("setting up gRPC servers");
 
     // Initialize gRPC services
-    let status_service = fleetos_control::watch::status_service::WorkloadStatusServiceImpl::new();
+    let status_service = fleetos_control::watch::status_service::WorkloadStatusServiceImpl::new(
+        raft_handle.raft.clone(),
+    );
     let policy_service =
         fleetos_control::watch::policy_stream::PolicyServiceImpl::new(broadcast_hub.clone());
     let watch_service =
@@ -1212,6 +1216,7 @@ struct FleetosControllerFactory {
     node_lease_timeout_secs: i64,
     node_check_interval_secs: u64,
     pod_check_interval_secs: u64,
+    workload_status_staleness_secs: i64,
 }
 
 impl ControllerFactory for FleetosControllerFactory {
@@ -1262,6 +1267,7 @@ impl ControllerFactory for FleetosControllerFactory {
         let pc = self.pod_controller.clone();
         let se_pod = self.storage_engine.clone();
         let pod_interval_secs = self.pod_check_interval_secs;
+        let staleness_secs = self.workload_status_staleness_secs;
         join_set.spawn(async move {
             tracing::info!("pod controller started");
             let mut interval =
@@ -1278,20 +1284,35 @@ impl ControllerFactory for FleetosControllerFactory {
                                 };
                             for (role, count) in &spec.replicas {
                                 for ordinal in 0..*count {
-                                    // Check if a placement exists for this ordinal.
-                                    let has_placement = se_pod
-                                        .list_placements()
-                                        .map(|placements| {
-                                            placements.iter().any(|p| {
+                                    let placement =
+                                        se_pod.list_placements().ok().and_then(|placements| {
+                                            placements.into_iter().find(|p| {
                                                 p.tenant_id == spec.tenant_id
                                                     && p.service == spec.workload_id
                                                     && p.role == *role
                                                     && p.ordinal == ordinal
                                             })
-                                        })
-                                        .unwrap_or(false);
+                                        });
 
-                                    if !has_placement {
+                                    // G-10: a pod is dead if its placement is missing,
+                                    // its latest status reports live=false, or its
+                                    // status report is stale (agent stopped reporting).
+                                    let is_dead = match &placement {
+                                        None => true,
+                                        Some(p) => match se_pod.get_workload_status(&p.pod_id) {
+                                            Ok(Some(status)) => {
+                                                let now = time::OffsetDateTime::now_utc()
+                                                    .unix_timestamp();
+                                                let stale = (now - status.observed_at_unix)
+                                                    > staleness_secs;
+                                                !status.live || stale
+                                            }
+                                            // No status reported yet — assume alive.
+                                            _ => false,
+                                        },
+                                    };
+
+                                    if is_dead {
                                         tracing::info!(
                                             tenant = %spec.tenant_id,
                                             workload = %spec.workload_id,

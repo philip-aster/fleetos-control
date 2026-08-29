@@ -48,6 +48,11 @@ pub enum FleetosCommand {
         workload_record: records::WorkloadSpecRecord,
         checkpoint: records::CronCheckpointRecord,
     },
+    /// Upsert the latest liveness/readiness report for a pod (G-10).
+    /// Keyed by pod_id so the keyspace stays bounded.
+    UpsertWorkloadStatus {
+        record: records::WorkloadStatusRecord,
+    },
     // --- Attestation / join ---
     MintJoinToken {
         record: crate::attestation::join_token::JoinTokenRecord,

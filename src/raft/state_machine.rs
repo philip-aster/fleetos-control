@@ -117,6 +117,16 @@ impl FjallStateMachine {
                 Ok(ChangeKind::SchedulingUpdate)
             }
 
+            FleetosCommand::UpsertWorkloadStatus { record } => {
+                let value = postcard::to_allocvec(record).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.workload_status,
+                    record.pod_id.as_bytes(),
+                    value.as_slice(),
+                );
+                Ok(ChangeKind::SchedulingUpdate)
+            }
+
             // --- Attestation / join ---
             FleetosCommand::MintJoinToken { record } => {
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
@@ -743,6 +753,7 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::StoreNodePool { .. } => "StoreNodePool",
         FleetosCommand::DeleteNodePool { .. } => "DeleteNodePool",
         FleetosCommand::TriggerCronWorkload { .. } => "TriggerCronWorkload",
+        FleetosCommand::UpsertWorkloadStatus { .. } => "UpsertWorkloadStatus",
         FleetosCommand::GrantOperatorAccess { .. } => "GrantOperatorAccess",
         FleetosCommand::RevokeOperatorAccess { .. } => "RevokeOperatorAccess",
     }

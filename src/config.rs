@@ -94,6 +94,10 @@ pub struct HealthConfig {
     /// Interval between pod reconciliation checks.
     #[serde(default = "default_pod_check_interval")]
     pub pod_check_interval_secs: u64,
+    /// Seconds after which a workload status report is considered stale
+    /// (agent stopped reporting). Default 60.
+    #[serde(default = "default_workload_status_staleness")]
+    pub workload_status_staleness_secs: i64,
 }
 
 impl Default for HealthConfig {
@@ -102,6 +106,7 @@ impl Default for HealthConfig {
             node_lease_timeout_secs: default_node_lease_timeout(),
             node_check_interval_secs: default_node_check_interval(),
             pod_check_interval_secs: default_pod_check_interval(),
+            workload_status_staleness_secs: default_workload_status_staleness(),
         }
     }
 }
@@ -118,6 +123,10 @@ fn default_pod_check_interval() -> u64 {
 
 fn default_provision_poll() -> u64 {
     30
+}
+
+fn default_workload_status_staleness() -> i64 {
+    60
 }
 
 // ---------------------------------------------------------------------------

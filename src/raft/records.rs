@@ -148,3 +148,15 @@ pub struct OperatorAccessGrantRecord {
     pub read_only: bool,
     pub tenants: Vec<String>,
 }
+
+/// A workload liveness/readiness report (G-10). Upserted by pod_id so the
+/// keyspace stays bounded at one record per live pod.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkloadStatusRecord {
+    pub pod_id: String,
+    pub workload_id: String,
+    pub tenant_id: String,
+    pub ready: bool,
+    pub live: bool,
+    pub observed_at_unix: i64,
+}
