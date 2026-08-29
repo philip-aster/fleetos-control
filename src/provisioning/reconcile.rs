@@ -17,6 +17,7 @@ use crate::attestation::join_token::{JoinTokenStore, NodeKind};
 use openraft::Raft;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 /// The provisioning reconciler.
 ///
@@ -59,23 +60,22 @@ impl ProvisioningReconciler {
     ///
     /// This task runs for the lifetime of the process (while leader).
     /// It polls the provider every `reconcile_interval_seconds`.
-    pub async fn run_loop(&mut self) {
+    pub async fn run_loop(&mut self, mut shutdown: watch::Receiver<bool>) {
         let interval_duration = Duration::from_secs(self.config.poll_interval_secs);
         let mut interval = tokio::time::interval(interval_duration);
-
-        tracing::info!(
-            endpoint = %self.config.endpoint,
-            interval_secs = self.config.poll_interval_secs,
-            "provisioning reconciler started"
-        );
-
         loop {
-            interval.tick().await;
-
-            if let Err(e) = self.reconcile_all().await {
-                // Log and continue. Provider failures are transient.
-                // The next cycle will retry.
-                tracing::error!(error = %e, "provisioning reconciliation cycle failed");
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        tracing::info!("provisioning reconciler shutting down");
+                        return;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(e) = self.reconcile_all().await {
+                        tracing::error!(error = %e, "provisioning reconciliation cycle failed");
+                    }
+                }
             }
         }
     }

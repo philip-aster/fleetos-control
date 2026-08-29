@@ -121,6 +121,13 @@ pod_check_interval_secs = 20
 snapshot_logs_since_last = 10000
 purge_batch_size = 1024
 
+# ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+[graceful_shutdown]
+# Seconds to let in-flight work drain before forcing shutdown.
+grace_period_secs = 10
+
 # -----------------------------------------------------------------------------
 # Provisioning
 # -----------------------------------------------------------------------------

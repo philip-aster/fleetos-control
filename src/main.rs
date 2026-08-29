@@ -196,6 +196,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyspaces.audit_log.clone(),
     ));
 
+    // JoinHandles for the gRPC listeners, awaited during graceful shutdown.
+    let mut server_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // --- Phase 7: Raft cluster initialization ---
     let (raft_handle, shutdown_tx, join_info, dc_mtls) = init_raft_cluster(
         &config,
@@ -240,6 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Phase 7b: Raft transport listener (inbound consensus RPCs) ---
     // Required for ANY multi-node operation: replication, votes, snapshots,
     // and RequestJoin from joining nodes.
+    // --- Phase 7b: Raft transport listener (inbound consensus RPCs) ---
     let raft_addr: std::net::SocketAddr = config.listeners.raft.parse()?;
     let raft_transport_impl =
         fleetos_control::raft::server::RaftTransportServerImpl::new(raft_handle.raft.clone());
@@ -250,7 +254,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
     let raft_revoked_svids = keyspaces.revoked_svids.clone();
 
-    tokio::spawn(async move {
+    // 1. Subscribe BEFORE the spawn (in main)
+    let raft_shutdown_rx = shutdown_tx.subscribe();
+
+    // 2. Spawn the task (ONLY ONE SPAWN)
+    let raft_server_handle = tokio::spawn(async move {
         tracing::info!(addr = %raft_addr, "starting Raft transport listener (mTLS)");
         let listener = match tokio::net::TcpListener::bind(raft_addr).await {
             Ok(l) => l,
@@ -294,7 +302,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let spiffe_id: SpiffeId = spiffe_uri.parse().map_err(|e| {
                                 std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                             })?;
-                            // G-7: Raft peers MUST be control-kind. This gates RequestJoin.
                             if spiffe_id.kind != fleetos_core::spiffe::IdKind::Control {
                                 tracing::warn!(addr = %addr, spiffe = %spiffe_id, "raft peer is not control-kind");
                                 return Err(std::io::Error::new(
@@ -302,7 +309,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "raft peers must be control-kind",
                                 ));
                             }
-
                             if fleetos_control::revocation::is_svid_revoked(&revoked_ks, &spiffe_id.to_string()) {
                                 tracing::warn!(addr = %addr, spiffe = %spiffe_id, "raft peer SVID is revoked");
                                 return Err(std::io::Error::new(
@@ -323,14 +329,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         };
+
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(RaftTransportServer::new(raft_transport_impl))
-            .serve_with_incoming(incoming)
+            .serve_with_incoming_shutdown(incoming, wait_for_shutdown_flag(raft_shutdown_rx))
             .await
         {
             tracing::error!(error = %e, "Raft transport server failed");
         }
-    });
+    }); // <-- End of the single spawn
+
+    // 3. Push the handle AFTER the spawn (in main)
+    server_handles.push(raft_server_handle);
 
     // --- Phase 7c: First-boot join — request cluster membership ---
     // Sent AFTER the raft listener is spawned so the leader's blocking
@@ -400,8 +410,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         {
             Ok(mut reconciler) => {
+                let provisioning_shutdown_rx = shutdown_tx.subscribe();
                 tokio::spawn(async move {
-                    reconciler.run_loop().await;
+                    reconciler.run_loop(provisioning_shutdown_rx).await;
                 });
                 tracing::info!("provisioning reconciler started");
             }
@@ -485,7 +496,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dc_td_config = fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
     let dc_revoked_svids = keyspaces.revoked_svids.clone();
 
-    tokio::spawn(async move {
+    // 1. Subscribe BEFORE the spawn (in main)
+    let dc_shutdown_rx = shutdown_tx.subscribe();
+
+    // 2. Spawn the task (ONLY ONE SPAWN)
+    let dc_server_handle = tokio::spawn(async move {
         tracing::info!(addr = %dc_addr, "starting Data/Control gRPC listener");
         let listener = match tokio::net::TcpListener::bind(dc_addr).await {
             Ok(l) => l,
@@ -502,17 +517,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let acceptor = dc_tls_acceptor.clone();
                         let td_config = dc_td_config.clone();
                         let revoked_ks = dc_revoked_svids.clone();
-
                         yield async move {
                             let tls_stream = acceptor.accept(stream).await
                                 .map_err(|e| {
                                     tracing::warn!(error = %e, addr = %addr, "TLS handshake failed");
                                     std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e)
                                 })?;
-
                             let (_, server_conn) = tls_stream.get_ref();
-
-                            // Optional client auth: peer cert may be absent (pre-SVID attestation).
                             let spiffe_id = match server_conn.peer_certificates().and_then(|c| c.first()) {
                                 Some(peer_cert_der) => {
                                     let spiffe_uri = fleetos_control::tls::mtls::extract_spiffe_uri_san(peer_cert_der)
@@ -520,7 +531,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             tracing::warn!(addr = %addr, error = %e, "SPIFFE extraction failed");
                                             std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
                                         })?;
-
                                     fleetos_control::tls::trust_domains::validate_peer_identity(
                                         &spiffe_uri,
                                         fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
@@ -529,10 +539,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         tracing::warn!(addr = %addr, spiffe = %spiffe_uri, error = %e, "peer identity rejected");
                                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
                                     })?;
-
                                     let id: SpiffeId = spiffe_uri.parse()
                                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
                                     tracing::debug!(addr = %addr, spiffe = %id, "peer authenticated");
                                     if fleetos_control::revocation::is_svid_revoked(&revoked_ks, &id.to_string()) {
                                         tracing::warn!(addr = %addr, spiffe = %id, "peer SVID is revoked");
@@ -548,7 +556,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     None
                                 }
                             };
-
                             Ok::<_, std::io::Error>(PeerAuthenticatedStream {
                                 inner: tls_stream,
                                 spiffe_id,
@@ -577,14 +584,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        if let Err(e) = server.serve_with_incoming(incoming).await {
+        if let Err(e) = server
+            .serve_with_incoming_shutdown(incoming, wait_for_shutdown_flag(dc_shutdown_rx))
+            .await
+        {
             tracing::error!(error = %e, "Data/Control gRPC server failed");
         }
-    });
+    }); // <-- End of the single spawn
+
+    // 3. Push the handle AFTER the spawn (in main)
+    server_handles.push(dc_server_handle);
 
     // Spawn Admin listener with custom TLS (strict mTLS, Admin domain).
     // Disabled on a first join boot — the Admin CA isn't available until the
     // cluster state (including CAs) has been replicated to this node.
+    // Spawn Admin listener with custom TLS (strict mTLS, Admin domain).
     if let Some(ref ca) = ca_service {
         let (admin_svid, admin_root_pem) = {
             let admin_bundle = ca.admin.read();
@@ -623,7 +637,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
         let admin_revoked_svids = keyspaces.revoked_svids.clone();
 
-        tokio::spawn(async move {
+        // 1. Subscribe BEFORE the spawn (in main)
+        let admin_shutdown_rx = shutdown_tx.subscribe();
+
+        // 2. Spawn the task (ONLY ONE SPAWN)
+        let admin_server_handle = tokio::spawn(async move {
             tracing::info!(addr = %admin_addr, "starting Admin gRPC listener");
             let listener = match tokio::net::TcpListener::bind(admin_addr).await {
                 Ok(l) => l,
@@ -640,32 +658,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let acceptor = admin_tls_acceptor.clone();
                             let td_config = admin_td_config.clone();
                             let revoked_ks = admin_revoked_svids.clone();
-
                             yield async move {
                                 let tls_stream = acceptor.accept(stream).await
                                     .map_err(|e| {
                                         tracing::warn!(error = %e, addr = %addr, "TLS handshake failed");
                                         std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e)
                                     })?;
-
                                 let (_, server_conn) = tls_stream.get_ref();
                                 let peer_certs = server_conn.peer_certificates()
                                     .ok_or_else(|| {
                                         tracing::warn!(addr = %addr, "no peer certificates");
                                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no peer cert")
                                     })?;
-
                                 let peer_cert_der = peer_certs.first()
                                     .ok_or_else(|| {
                                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, "empty cert chain")
                                     })?;
-
                                 let spiffe_uri = fleetos_control::tls::mtls::extract_spiffe_uri_san(peer_cert_der)
                                     .map_err(|e| {
                                         tracing::warn!(addr = %addr, error = %e, "SPIFFE extraction failed");
                                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
                                     })?;
-
                                 fleetos_control::tls::trust_domains::validate_peer_identity(
                                     &spiffe_uri,
                                     fleetos_control::tls::trust_domains::TrustDomainRole::Admin,
@@ -674,14 +687,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     tracing::warn!(addr = %addr, spiffe = %spiffe_uri, error = %e, "peer identity rejected");
                                     std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
                                 })?;
-
                                 let spiffe_id: SpiffeId = spiffe_uri.parse()
                                     .map_err(|e| {
                                         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                                     })?;
-
                                 tracing::debug!(addr = %addr, spiffe = %spiffe_id, "admin peer authenticated");
-
                                 if fleetos_control::revocation::is_svid_revoked(&revoked_ks, &spiffe_id.to_string()) {
                                     tracing::warn!(addr = %addr, spiffe = %spiffe_id, "admin peer SVID is revoked");
                                     return Err(std::io::Error::new(
@@ -689,7 +699,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         "admin peer SVID has been revoked",
                                     ));
                                 }
-
                                 Ok::<_, std::io::Error>(PeerAuthenticatedStream {
                                     inner: tls_stream,
                                     spiffe_id: Some(spiffe_id),
@@ -703,31 +712,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // Admin listener ONLY registers the AdminService
             let server = tonic::transport::Server::builder().add_service(
                 fleetos_core::proto::fleetos::admin_service_server::AdminServiceServer::new(
                     admin_service,
                 ),
             );
 
-            if let Err(e) = server.serve_with_incoming(incoming).await {
+            if let Err(e) = server
+                .serve_with_incoming_shutdown(incoming, wait_for_shutdown_flag(admin_shutdown_rx))
+                .await
+            {
                 tracing::error!(error = %e, "Admin gRPC server failed");
             }
-        });
+        }); // <-- End of the single spawn
+
+        // 3. Push the handle AFTER the spawn (in main)
+        server_handles.push(admin_server_handle);
     } else {
         tracing::warn!("admin listener disabled until the CA is replicated (join mode first boot)");
     }
 
     tracing::info!("fleetos-control fully initialized, awaiting shutdown");
 
-    // Wait for shutdown signal.
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutdown signal received");
+    // Wait for SIGINT (Ctrl+C) or SIGTERM.
+    // tokio::select! does not support #[cfg] attributes on its branches, so
+    // we split the signal-wait block by target OS.
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received SIGINT");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM");
+            }
+        }
+    }
 
-    // Signal all components to shut down
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        tracing::info!("received SIGINT");
+    }
+
+    tracing::info!("beginning graceful shutdown");
+
+    // 1. Signal leader-gated controllers and the provisioning reconciler to
+    //    stop proposing new work.
     let _ = shutdown_tx.send(true);
 
-    // Flush all OTel providers before exit so final metrics/traces/logs are exported.
+    // 2. Grace period for controllers and in-flight requests to finish.
+    let grace = std::time::Duration::from_secs(config.graceful_shutdown.grace_period_secs);
+    tracing::info!(grace_secs = grace.as_secs(), "draining in-flight work");
+
+    // 3. Wait for the gRPC listeners to drain. They stop accepting new
+    //    connections when the shutdown flag fires and let in-flight requests
+    //    (including pending Raft proposals) complete.
+    let drain = async {
+        for handle in server_handles {
+            let _ = handle.await;
+        }
+    };
+    if tokio::time::timeout(grace, drain).await.is_err() {
+        tracing::warn!("grace period expired before all listeners drained");
+    }
+
+    // 4. Shut down the Raft node. If this node is the leader it steps down,
+    //    letting the remaining voters elect a new leader.
+    if let Err(e) = raft_handle.raft.shutdown().await {
+        tracing::warn!(error = ?e, "raft shutdown returned error");
+    }
+    tracing::info!("raft node shut down");
+
+    // 5. Flush all OTel providers before exit.
     if let Some(ref t) = telemetry {
         fleetos_control::telemetry::shutdown(t);
     }
@@ -795,6 +854,19 @@ where
     fn connect_info(&self) -> Self::ConnectInfo {
         PeerConnectInfo {
             spiffe_id: self.spiffe_id.clone(),
+        }
+    }
+}
+
+/// Resolves once the shutdown watch flag becomes true (or the sender drops).
+/// Used as the shutdown signal for `serve_with_incoming_shutdown`.
+async fn wait_for_shutdown_flag(mut rx: watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
         }
     }
 }

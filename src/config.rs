@@ -60,6 +60,10 @@ pub struct ControlConfig {
     /// OpenTelemetry push telemetry (metrics + traces + logs).
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+
+    /// Graceful shutdown behavior.
+    #[serde(default)]
+    pub graceful_shutdown: GracefulShutdownConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -424,6 +428,29 @@ fn default_otlp_endpoint() -> String {
 
 fn default_push_interval_secs() -> u64 {
     15
+}
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Deserialize)]
+pub struct GracefulShutdownConfig {
+    /// Seconds to wait for in-flight work (controllers, gRPC requests, Raft
+    /// proposals) to finish before forcing shutdown.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub grace_period_secs: u64,
+}
+
+impl Default for GracefulShutdownConfig {
+    fn default() -> Self {
+        Self {
+            grace_period_secs: default_shutdown_grace_secs(),
+        }
+    }
+}
+
+fn default_shutdown_grace_secs() -> u64 {
+    10
 }
 
 // ---------------------------------------------------------------------------
