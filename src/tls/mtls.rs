@@ -7,6 +7,10 @@ use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, ServerConfig};
 use x509_parser::prelude::*;
 
+use parking_lot::RwLock;
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
+
 use super::TlsError;
 use super::trust_domains::TrustDomainRole;
 
@@ -227,4 +231,86 @@ pub struct FleetosExtensions {
     pub role: Option<String>,
     pub ordinal: Option<u32>,
     pub is_degraded: bool,
+}
+
+/// Hot-swappable server certificate resolver for SVID renewal (G-5).
+#[derive(Debug)]
+pub struct DynamicCertResolver {
+    key: Arc<RwLock<Arc<CertifiedKey>>>,
+}
+
+impl DynamicCertResolver {
+    pub fn new(initial: CertifiedKey) -> Self {
+        Self {
+            key: Arc::new(RwLock::new(Arc::new(initial))),
+        }
+    }
+
+    pub fn update(&self, new_key: CertifiedKey) {
+        *self.key.write() = Arc::new(new_key);
+    }
+}
+
+impl ResolvesServerCert for DynamicCertResolver {
+    fn resolve(&self, _client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        Some(self.key.read().clone())
+    }
+}
+
+/// Build a `CertifiedKey` from raw DER cert + private key bytes.
+pub fn certified_key_from_der(cert_der: &[u8], key_der: &[u8]) -> Result<CertifiedKey, TlsError> {
+    let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der.to_vec()),
+    );
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&private_key)
+        .map_err(|e| TlsError::Certificate(format!("signing key parse failed: {}", e)))?;
+    Ok(CertifiedKey::new(
+        vec![rustls::pki_types::CertificateDer::from(cert_der.to_vec())],
+        signing_key,
+    ))
+}
+
+/// Like `build_server_config` but uses a dynamic cert resolver for hot-swap.
+pub fn build_server_config_dynamic(
+    trust_bundle_pem: &str,
+    resolver: Arc<DynamicCertResolver>,
+) -> Result<rustls::ServerConfig, TlsError> {
+    let mut root_store = rustls::RootCertStore::empty();
+    let certs = rustls_pemfile::certs(&mut trust_bundle_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TlsError::Certificate(format!("PEM parse error: {}", e)))?;
+    for cert in certs {
+        root_store
+            .add(cert)
+            .map_err(|e| TlsError::Certificate(format!("root store add failed: {}", e)))?;
+    }
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+        .build()
+        .map_err(|e| TlsError::Certificate(format!("client verifier build failed: {}", e)))?;
+    Ok(rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_cert_resolver(resolver))
+}
+
+/// Like `build_server_config_optional_auth` but uses a dynamic cert resolver.
+pub fn build_server_config_optional_auth_dynamic(
+    trust_bundle_pem: &str,
+    resolver: Arc<DynamicCertResolver>,
+) -> Result<rustls::ServerConfig, TlsError> {
+    let mut root_store = rustls::RootCertStore::empty();
+    let certs = rustls_pemfile::certs(&mut trust_bundle_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TlsError::Certificate(format!("PEM parse error: {}", e)))?;
+    for cert in certs {
+        root_store
+            .add(cert)
+            .map_err(|e| TlsError::Certificate(format!("root store add failed: {}", e)))?;
+    }
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| TlsError::Certificate(format!("client verifier build failed: {}", e)))?;
+    Ok(rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_cert_resolver(resolver))
 }

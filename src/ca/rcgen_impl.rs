@@ -1,13 +1,16 @@
 //! X.509 certificate signing implementation using `rcgen` + `rustls`.
 use super::CaError;
 use super::oid;
+use crate::ca::Arc;
 use fleetos_core::spiffe::SpiffeId;
 use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
-use rustls::pki_types::CertificateDer;
+use rustls::crypto::ring::sign::any_supported_type;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::sign::SigningKey;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
@@ -337,4 +340,16 @@ mod tests {
         // The issued SVID must validate against the issuing bundle.
         assert!(bundle.validate_svid(&cert_der).unwrap());
     }
+}
+
+/// Convert a DER-encoded PKCS#8 private key into a rustls `CertifiedKey` signing key.
+pub fn certified_key_from_der(der: &[u8]) -> Result<Arc<dyn SigningKey>, CaError> {
+    let private_key_der =
+        PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(der.to_vec()));
+    any_supported_type(&private_key_der).map_err(|e| {
+        CaError::Signing(format!(
+            "failed to parse private key for certified key: {}",
+            e
+        ))
+    })
 }

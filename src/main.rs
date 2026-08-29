@@ -200,15 +200,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // --- Phase 7: Raft cluster initialization ---
-    let (raft_handle, shutdown_tx, join_info, dc_mtls) = init_raft_cluster(
-        &config,
-        db.clone(),
-        keyspaces.clone(),
-        versioned_state.clone(),
-        broadcast_hub.clone(),
-        ca_service.as_ref(),
-    )
-    .await?;
+    let (raft_handle, shutdown_tx, join_info, dc_mtls, dc_resolver, raft_resolver) =
+        init_raft_cluster(
+            &config,
+            db.clone(),
+            keyspaces.clone(),
+            versioned_state.clone(),
+            broadcast_hub.clone(),
+            ca_service.as_ref(),
+        )
+        .await?;
 
     // --- OTel metrics registration (G-1) ---
     // Register observable gauges now that the Raft handle exists.
@@ -248,7 +249,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_transport_impl =
         fleetos_control::raft::server::RaftTransportServerImpl::new(raft_handle.raft.clone());
     let raft_server_config =
-        std::sync::Arc::new(fleetos_control::tls::mtls::build_server_config(&dc_mtls)?);
+        std::sync::Arc::new(fleetos_control::tls::mtls::build_server_config_dynamic(
+            &dc_mtls.trust_bundle_pem,
+            raft_resolver.clone(),
+        )?);
     let raft_tls_acceptor = tokio_rustls::TlsAcceptor::from(raft_server_config);
     let raft_td_config =
         fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
@@ -430,7 +434,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Authenticated peers are still fully validated; unauthenticated peers get
     // spiffe_id = None and are rejected by every identity-gated service.
     let dc_server_config = std::sync::Arc::new(
-        fleetos_control::tls::mtls::build_server_config_optional_auth(&dc_mtls)?,
+        fleetos_control::tls::mtls::build_server_config_optional_auth_dynamic(
+            &dc_mtls.trust_bundle_pem,
+            dc_resolver.clone(),
+        )?,
     );
 
     tracing::info!("setting up gRPC servers");
@@ -620,7 +627,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             (svid, admin_bundle.trust_bundle_pem())
         };
-
+        let admin_initial_key = fleetos_control::tls::mtls::certified_key_from_der(
+            &admin_svid.cert_der,
+            &admin_svid.private_key_der,
+        )?;
         let admin_mtls = fleetos_control::tls::mtls::MtlsConfig {
             cert_chain: vec![rustls::pki_types::CertificateDer::from(admin_svid.cert_der)],
             private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -629,9 +639,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             trust_bundle_pem: admin_root_pem,
             role: fleetos_control::tls::trust_domains::TrustDomainRole::Admin,
         };
-        let admin_server_config = std::sync::Arc::new(
-            fleetos_control::tls::mtls::build_server_config(&admin_mtls)?,
-        );
+
+        let admin_resolver = Arc::new(fleetos_control::tls::mtls::DynamicCertResolver::new(
+            admin_initial_key,
+        ));
+        let admin_server_config =
+            std::sync::Arc::new(fleetos_control::tls::mtls::build_server_config_dynamic(
+                &admin_mtls.trust_bundle_pem,
+                admin_resolver.clone(),
+            )?);
         let admin_tls_acceptor = tokio_rustls::TlsAcceptor::from(admin_server_config);
         let admin_td_config =
             fleetos_control::tls::trust_domains::TrustDomainConfig::from_config(&config);
@@ -726,8 +742,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }); // <-- End of the single spawn
 
-        // 3. Push the handle AFTER the spawn (in main)
+        // 3. Push the handle AFTER the spawn
         server_handles.push(admin_server_handle);
+
+        // --- G-5: Control SVID Renewal Task ---
+        let renewer = fleetos_control::ca::renewal::ControlSvidRenewer::new(
+            config.node.name.clone(),
+            config.trust_domains.data_control.clone(),
+            config.trust_domains.admin.clone(),
+            config.svid.node_ttl_secs,
+            config.svid.admin_ttl_secs,
+            ca.data_control.clone(),
+            Some(ca.admin.clone()),
+            dc_resolver.clone(),
+            raft_resolver.clone(),
+            Some(admin_resolver),
+        );
+        let renewer_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            renewer.run_loop(renewer_shutdown_rx).await;
+        });
+        tracing::info!("control SVID renewal task started (G-5)");
     } else {
         tracing::warn!("admin listener disabled until the CA is replicated (join mode first boot)");
     }
@@ -885,6 +920,8 @@ async fn init_raft_cluster(
         watch::Sender<bool>,
         Option<JoinInfo>,
         fleetos_control::tls::mtls::MtlsConfig,
+        Arc<fleetos_control::tls::mtls::DynamicCertResolver>,
+        Arc<fleetos_control::tls::mtls::DynamicCertResolver>,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -1123,7 +1160,41 @@ async fn init_raft_cluster(
         raft: Arc::new(raft),
     };
     let (shutdown_tx, _) = watch::channel(false);
-    Ok((raft_handle, shutdown_tx, join_info, dc_mtls))
+
+    // G-5: Build dynamic cert resolvers for hot-swap renewal.
+    // Both the Raft and DC listeners get their own resolver so they can be
+    // independently addressed, but they start with the same CertifiedKey.
+    let initial_key = fleetos_control::tls::mtls::certified_key_from_der(
+        &dc_mtls
+            .cert_chain
+            .first()
+            .map(|c| c.to_vec())
+            .unwrap_or_default(),
+        match &dc_mtls.private_key {
+            rustls::pki_types::PrivateKeyDer::Pkcs8(k) => k.secret_pkcs8_der().to_vec(),
+            rustls::pki_types::PrivateKeyDer::Pkcs1(k) => k.secret_pkcs1_der().to_vec(),
+            rustls::pki_types::PrivateKeyDer::Sec1(k) => k.secret_sec1_der().to_vec(),
+            _ => Vec::new(),
+        }
+        .as_slice(),
+    )
+    .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+
+    let dc_resolver = Arc::new(fleetos_control::tls::mtls::DynamicCertResolver::new(
+        initial_key.clone(),
+    ));
+    let raft_resolver = Arc::new(fleetos_control::tls::mtls::DynamicCertResolver::new(
+        initial_key,
+    ));
+
+    Ok((
+        raft_handle,
+        shutdown_tx,
+        join_info,
+        dc_mtls,
+        dc_resolver,
+        raft_resolver,
+    ))
 }
 
 /// Factory for creating controller tasks when this node becomes leader.

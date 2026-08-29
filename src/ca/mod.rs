@@ -13,6 +13,7 @@ pub mod key_issuance;
 pub mod name_constraints;
 pub mod oid;
 pub mod rcgen_impl;
+pub mod renewal;
 pub mod trust_bundle;
 use crate::ca::trust_bundle::TrustBundleRecord;
 use std::sync::Arc;
