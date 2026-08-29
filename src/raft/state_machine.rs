@@ -77,10 +77,40 @@ impl FjallStateMachine {
                 batch.insert(&self.keyspaces.workloads, key.as_bytes(), value.as_slice());
                 Ok(ChangeKind::SchedulingUpdate)
             }
-            FleetosCommand::SubmitCronWorkload { record } => {
+            FleetosCommand::SubmitCronWorkload { record, checkpoint } => {
                 let key = format!("cron:{}:{}", record.tenant_id, record.cron_workload_id);
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
                 batch.insert(&self.keyspaces.workloads, key.as_bytes(), value.as_slice());
+                // Initial checkpoint so the cron controller has a baseline (G-11).
+                let cp_key = format!("{}:{}", checkpoint.tenant_id, checkpoint.cron_workload_id);
+                let cp_value = postcard::to_allocvec(checkpoint).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.cron_checkpoints,
+                    cp_key.as_bytes(),
+                    cp_value.as_slice(),
+                );
+                Ok(ChangeKind::SchedulingUpdate)
+            }
+
+            FleetosCommand::TriggerCronWorkload {
+                workload_record,
+                checkpoint,
+            } => {
+                // Store the instantiated run's workload spec.
+                let key = format!(
+                    "{}:{}",
+                    workload_record.tenant_id, workload_record.workload_id
+                );
+                let value = postcard::to_allocvec(workload_record).map_err(ser_err)?;
+                batch.insert(&self.keyspaces.workloads, key.as_bytes(), value.as_slice());
+                // Advance the checkpoint in the SAME batch (atomic, G-11).
+                let cp_key = format!("{}:{}", checkpoint.tenant_id, checkpoint.cron_workload_id);
+                let cp_value = postcard::to_allocvec(checkpoint).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.cron_checkpoints,
+                    cp_key.as_bytes(),
+                    cp_value.as_slice(),
+                );
                 Ok(ChangeKind::SchedulingUpdate)
             }
 
@@ -645,6 +675,7 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::ReassignPodId { .. } => "ReassignPodId",
         FleetosCommand::StoreNodePool { .. } => "StoreNodePool",
         FleetosCommand::DeleteNodePool { .. } => "DeleteNodePool",
+        FleetosCommand::TriggerCronWorkload { .. } => "TriggerCronWorkload",
     }
 }
 

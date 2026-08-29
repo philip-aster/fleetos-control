@@ -239,6 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cron_controller = Arc::new(CronController::new(
         workload_controller.clone(),
         raft_handle.raft.clone(),
+        keyspaces.cron_checkpoints.clone(),
     ));
 
     // --- Phase 7b: Raft transport listener (inbound consensus RPCs) ---
@@ -1395,11 +1396,11 @@ impl ControllerFactory for FleetosControllerFactory {
                         for record in cron_workloads {
                             match prost::Message::decode(record.spec_bytes.as_slice()) {
                                 Ok(cron) => {
-                                    if let Err(e) = cc.trigger(&cron).await {
+                                    if let Err(e) = cc.evaluate_and_trigger(&cron).await {
                                         tracing::warn!(
                                             cron_id = %record.cron_workload_id,
                                             error = %e,
-                                            "cron trigger failed"
+                                            "cron evaluation failed"
                                         );
                                     }
                                 }

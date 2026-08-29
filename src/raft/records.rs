@@ -124,3 +124,13 @@ pub struct AuditRecord {
     pub target: String,
     pub timestamp_unix: u64,
 }
+
+/// Replicated checkpoint marking the last scheduled time a cron workload was
+/// triggered. Lets any Raft leader continue a cron schedule after failover (G-11).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CronCheckpointRecord {
+    pub tenant_id: String,
+    pub cron_workload_id: String,
+    /// Unix timestamp of the last scheduled time that was triggered.
+    pub last_triggered_at_unix: i64,
+}

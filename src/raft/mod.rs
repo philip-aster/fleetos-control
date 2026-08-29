@@ -40,6 +40,13 @@ pub enum FleetosCommand {
     },
     SubmitCronWorkload {
         record: records::CronWorkloadRecord,
+        checkpoint: records::CronCheckpointRecord,
+    },
+    /// Atomically store a triggered cron run AND advance its checkpoint in one
+    /// Raft entry (G-11). Prevents double-trigger and lost runs across failover.
+    TriggerCronWorkload {
+        workload_record: records::WorkloadSpecRecord,
+        checkpoint: records::CronCheckpointRecord,
     },
     // --- Attestation / join ---
     MintJoinToken {

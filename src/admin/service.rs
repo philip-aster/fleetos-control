@@ -347,10 +347,16 @@ impl AdminService for AdminServiceImpl {
                 .unwrap_or_default(),
             spec_bytes,
         };
-
+        // G-11: initial checkpoint at submission time so the cron controller
+        // has a baseline and does not backfill from the epoch.
+        let checkpoint = crate::raft::records::CronCheckpointRecord {
+            tenant_id: cron.tenant_id.clone(),
+            cron_workload_id: cron.cron_workload_id.clone(),
+            last_triggered_at_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+        };
         self.raft
             .client_write(crate::raft::AuditedCommand {
-                cmd: crate::raft::FleetosCommand::SubmitCronWorkload { record },
+                cmd: crate::raft::FleetosCommand::SubmitCronWorkload { record, checkpoint },
                 audit: Some(audit),
             })
             .await

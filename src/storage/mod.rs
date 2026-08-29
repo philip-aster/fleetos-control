@@ -110,6 +110,9 @@ pub fn init_keyspaces(db: &Database) -> Result<Keyspaces, StorageError> {
         audit_log: db
             .keyspace(tables::AUDIT_LOG_KEYSPACE, opts)
             .map_err(StorageError::Open)?,
+        cron_checkpoints: db
+            .keyspace(tables::CRON_CHECKPOINT_KEYSPACE, opts)
+            .map_err(StorageError::Open)?,
     })
 }
 
@@ -142,6 +145,7 @@ pub struct Keyspaces {
     pub svid_grants: fjall::Keyspace,
     pub revoked_svids: fjall::Keyspace,
     pub audit_log: fjall::Keyspace,
+    pub cron_checkpoints: fjall::Keyspace,
 }
 
 impl Keyspaces {
