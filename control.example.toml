@@ -128,6 +128,17 @@ purge_batch_size = 1024
 # Seconds to let in-flight work drain before forcing shutdown.
 grace_period_secs = 10
 
+# ---------------------------------------------------------------------------
+# Operator JIT access (CR-8)
+# ---------------------------------------------------------------------------
+[operators]
+# Bootstrap admin operator SPIFFE URIs (implicit cluster_admin).
+bootstrap_admins = []
+# Default grant TTL (seconds). 0 in a grant request uses this.
+grant_ttl_secs = 3600
+# Pre-registered operator SPIFFE URIs allowed to attest.
+allowed_operators = []
+
 # -----------------------------------------------------------------------------
 # Provisioning
 # -----------------------------------------------------------------------------

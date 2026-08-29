@@ -30,6 +30,7 @@ pub struct FjallStateMachine {
     keyspaces: Keyspaces,
     versioned_state: VersionedState,
     broadcast_hub: Arc<BroadcastHub>,
+    data_trust_domain: String,
 }
 
 impl FjallStateMachine {
@@ -38,12 +39,14 @@ impl FjallStateMachine {
         keyspaces: Keyspaces,
         versioned_state: VersionedState,
         broadcast_hub: Arc<BroadcastHub>,
+        data_trust_domain: String,
     ) -> Self {
         Self {
             db,
             keyspaces,
             versioned_state,
             broadcast_hub,
+            data_trust_domain,
         }
     }
 
@@ -475,6 +478,21 @@ impl FjallStateMachine {
                 batch.remove(&self.keyspaces.node_pools, pool_id.as_bytes());
                 Ok(ChangeKind::SchedulingUpdate)
             }
+
+            FleetosCommand::GrantOperatorAccess { record } => {
+                let value = postcard::to_allocvec(record).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.operator_grants,
+                    record.grant_id.as_bytes(),
+                    value.as_slice(),
+                );
+                Ok(ChangeKind::SagUpdate)
+            }
+
+            FleetosCommand::RevokeOperatorAccess { grant_id } => {
+                batch.remove(&self.keyspaces.operator_grants, grant_id.as_bytes());
+                Ok(ChangeKind::SagUpdate)
+            }
         }
     }
 
@@ -485,6 +503,7 @@ impl FjallStateMachine {
             ChangeKind::Eviction => {
                 self.publish_sag_update(version);
                 self.publish_schedule_update(version);
+                self.publish_route_update(version);
             }
             ChangeKind::SagUpdate | ChangeKind::RevokedDelegations => {
                 self.publish_sag_update(version);
@@ -498,6 +517,7 @@ impl FjallStateMachine {
             }
             ChangeKind::SchedulingUpdate => {
                 self.publish_schedule_update(version);
+                self.publish_route_update(version);
             }
             // ClusterMembership, TrustBundleRotation, DummyIpUpdate don't have
             // dedicated watch streams in the current proto schema.
@@ -583,6 +603,53 @@ impl FjallStateMachine {
             .publish_schedule_update(crate::watch::broadcast::ScheduleUpdateEvent {
                 version,
                 assignments_bytes,
+            });
+    }
+
+    /// Read all placements + dummy IPs and publish a RouteUpdateEvent (S-8).
+    fn publish_route_update(&self, version: fleetos_core::MonotonicVersion) {
+        let mut records: Vec<crate::watch::router_assignment::RouteEntryRecord> = Vec::new();
+        for guard in self.keyspaces.placements.prefix(Vec::<u8>::new()) {
+            let value = match guard.value() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Ok(placement) =
+                postcard::from_bytes::<crate::scheduler::Placement>(value.as_ref())
+            {
+                // Look up the dummy IP for this (tenant, service, role).
+                let service_key = format!(
+                    "service:{}:{}:{}",
+                    placement.tenant_id, placement.service, placement.role
+                );
+                let dummy_ip = match self.keyspaces.dummy_ips.get(service_key.as_bytes()) {
+                    Ok(Some(bytes)) => postcard::from_bytes::<
+                        crate::dummy_ip::allocator::ServiceAddress,
+                    >(bytes.as_ref())
+                    .map(|sa| sa.address)
+                    .unwrap_or(0),
+                    _ => 0,
+                };
+                let destination_svid = format!(
+                    "spiffe://{}/ns/{}/sa/{}",
+                    self.data_trust_domain, placement.tenant_id, placement.service
+                );
+                records.push(crate::watch::router_assignment::RouteEntryRecord {
+                    destination_svid,
+                    destination_role: placement.role.clone(),
+                    target_agent_svid: placement.node_id.to_string(),
+                    dummy_ip,
+                });
+            }
+        }
+        let routes_bytes = match postcard::to_allocvec(&records) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        self.broadcast_hub
+            .publish_route_update(crate::watch::broadcast::RouteUpdateEvent {
+                version,
+                routes_bytes,
             });
     }
 
@@ -676,6 +743,8 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::StoreNodePool { .. } => "StoreNodePool",
         FleetosCommand::DeleteNodePool { .. } => "DeleteNodePool",
         FleetosCommand::TriggerCronWorkload { .. } => "TriggerCronWorkload",
+        FleetosCommand::GrantOperatorAccess { .. } => "GrantOperatorAccess",
+        FleetosCommand::RevokeOperatorAccess { .. } => "RevokeOperatorAccess",
     }
 }
 

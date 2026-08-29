@@ -33,6 +33,7 @@ fn setup(
         keyspaces.clone(),
         versioned_state,
         broadcast_hub,
+        "test.example.internal".to_owned(),
     );
     (db, keyspaces, sm)
 }

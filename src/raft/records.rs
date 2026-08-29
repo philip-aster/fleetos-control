@@ -134,3 +134,17 @@ pub struct CronCheckpointRecord {
     /// Unix timestamp of the last scheduled time that was triggered.
     pub last_triggered_at_unix: i64,
 }
+
+/// An operator access grant (CR-8). Replicated via Raft so any leader can
+/// enforce it. Keyed by `grant_id` (hex of `OperatorGrantId::of_grant`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OperatorAccessGrantRecord {
+    pub grant_id: String,
+    pub operator_id: String,
+    pub granted_by: String,
+    pub granted_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub cluster_admin: bool,
+    pub read_only: bool,
+    pub tenants: Vec<String>,
+}

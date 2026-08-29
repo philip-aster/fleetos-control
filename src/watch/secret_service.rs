@@ -42,6 +42,19 @@ impl SecretServiceImpl {
         *seq += 1;
         *seq
     }
+
+    /// S-10: look up the requester's current tracked SVID version.
+    fn lookup_svid_version(&self, spiffe_id: &SpiffeId) -> Result<u64, Status> {
+        let key = spiffe_id.to_string();
+        let bytes = self
+            .svids_keyspace
+            .get(key.as_bytes())
+            .map_err(|e| Status::internal(format!("storage error: {}", e)))?
+            .ok_or_else(|| Status::not_found(format!("no SVID record for {}", spiffe_id)))?;
+        let record: crate::ca::SvidRecord = postcard::from_bytes(&bytes)
+            .map_err(|e| Status::internal(format!("failed to parse SVID record: {}", e)))?;
+        Ok(record.svid_version)
+    }
 }
 
 #[tonic::async_trait]
@@ -71,6 +84,17 @@ impl SecretService for SecretServiceImpl {
             .target_spiffe_id
             .parse()
             .map_err(|e| Status::invalid_argument(format!("invalid target SpiffeId: {}", e)))?;
+
+        // S-10: enforce SVID version binding. The requester's current SVID version
+        // must match the version the secret is sealed for; otherwise the delivery
+        // is stale (the agent rotated past it) and must be rejected.
+        let requester_version = self.lookup_svid_version(&requesting_spiffe_id)?;
+        if requester_version != req.sealed_for_svid_version {
+            return Err(Status::permission_denied(format!(
+                "SVID version mismatch: secret sealed for version {}, requester has version {}",
+                req.sealed_for_svid_version, requester_version
+            )));
+        }
 
         // Fetch the secret (ACL check + at-rest decryption happens inside).
         let plaintext = self

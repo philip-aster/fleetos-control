@@ -36,3 +36,4 @@ pub const SVID_GRANT_KEYSPACE: &str = "app_svid_grants";
 pub const REVOKED_SVID_KEYSPACE: &str = "app_revoked_svids";
 pub const AUDIT_LOG_KEYSPACE: &str = "app_audit_log";
 pub const CRON_CHECKPOINT_KEYSPACE: &str = "app_cron_checkpoints";
+pub const OPERATOR_GRANT_KEYSPACE: &str = "app_operator_grants";

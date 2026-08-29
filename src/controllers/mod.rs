@@ -45,6 +45,9 @@ pub enum ControllerError {
 
     #[error("not leader")]
     NotLeader,
+
+    #[error("dummy IP error: {0}")]
+    DummyIp(#[from] crate::dummy_ip::DummyIpError),
 }
 
 /// Controller task handle.

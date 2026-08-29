@@ -17,6 +17,7 @@ pub struct WorkloadController {
     ordinal_tracker: Arc<OrdinalTracker>,
     scheduler: DefaultScheduler,
     raft: Arc<Raft<FleetosRaftConfig>>,
+    dummy_ip_allocator: Arc<crate::dummy_ip::allocator::DummyIpAllocator>,
 }
 
 impl WorkloadController {
@@ -24,12 +25,14 @@ impl WorkloadController {
         storage: Arc<StorageEngine>,
         ordinal_tracker: Arc<OrdinalTracker>,
         raft: Arc<Raft<FleetosRaftConfig>>,
+        dummy_ip_allocator: Arc<crate::dummy_ip::allocator::DummyIpAllocator>,
     ) -> Self {
         Self {
             storage,
             ordinal_tracker,
             scheduler: DefaultScheduler::new(),
             raft,
+            dummy_ip_allocator,
         }
     }
 
@@ -134,6 +137,29 @@ impl WorkloadController {
                         );
                     }
                 }
+            }
+            // S-9: ensure a dummy service address is allocated for this
+            // (tenant, service, role). Idempotent — skipped if already present.
+            if self
+                .dummy_ip_allocator
+                .get_service_address(&tenant_id, &workload_id, role_str)
+                .map_err(ControllerError::DummyIp)?
+                .is_none()
+            {
+                let (block, address) = self
+                    .dummy_ip_allocator
+                    .compute_service_address_allocation(&tenant_id, &workload_id, role_str)
+                    .map_err(ControllerError::DummyIp)?;
+                self.raft
+                    .client_write(crate::raft::AuditedCommand::system(
+                        FleetosCommand::AllocateServiceAddress { block, address },
+                    ))
+                    .await
+                    .map_err(|e| ControllerError::Raft(e.to_string()))?;
+                tracing::info!(
+                    tenant = %tenant_id, workload = %workload_id, role = %role_str,
+                    "allocated dummy service address"
+                );
             }
         }
         Ok(())

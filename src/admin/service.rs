@@ -3,7 +3,11 @@
 //! This is the *only* API surface for `fleetctl-proxy`.
 //! All methods require `ctrl`-kind SVID authorization.
 
+use crate::attestation::join_token::{JoinTokenStore, NodeKind};
+use crate::controllers::cron_controller::CronController;
+use crate::dummy_ip::allocator::DummyIpAllocator;
 use crate::raft::FleetosRaftConfig;
+use crate::storage::StorageEngine;
 use fleetos_core::proto::admin::AdminService;
 use fleetos_core::proto::admin::ClusterStatus;
 use fleetos_core::proto::admin::{
@@ -14,14 +18,10 @@ use fleetos_core::proto::admin::{
     SecretAck, SecretAclChange, StoreSecretRequest, UpsertSagRuleRequest, WorkloadSpecAck,
 };
 use fleetos_core::proto::workload::{CronWorkload, WorkloadSpec};
+use fleetos_core::spiffe::SpiffeId;
 use rand::Rng;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-
-use crate::attestation::join_token::{JoinTokenStore, NodeKind};
-use crate::controllers::cron_controller::CronController;
-use crate::dummy_ip::allocator::DummyIpAllocator;
-use crate::storage::StorageEngine;
 
 /// The AdminService gRPC implementation.
 pub struct AdminServiceImpl {
@@ -29,6 +29,7 @@ pub struct AdminServiceImpl {
     join_token_store: Arc<JoinTokenStore>,
     dummy_ip_allocator: Arc<DummyIpAllocator>,
     raft: Arc<openraft::Raft<FleetosRaftConfig>>,
+    operators_config: crate::config::OperatorsConfig,
 }
 
 /// Admission hardening (G-12): identifiers must be DNS-label-shaped so they
@@ -65,12 +66,14 @@ impl AdminServiceImpl {
         join_token_store: Arc<JoinTokenStore>,
         dummy_ip_allocator: Arc<DummyIpAllocator>,
         raft: Arc<openraft::Raft<FleetosRaftConfig>>,
+        operators_config: crate::config::OperatorsConfig,
     ) -> Self {
         Self {
             storage,
             join_token_store,
             dummy_ip_allocator,
             raft,
+            operators_config,
         }
     }
 
@@ -123,6 +126,77 @@ impl AdminServiceImpl {
             target: target.to_owned(),
             timestamp_unix: time::OffsetDateTime::now_utc().unix_timestamp() as u64,
         }
+    }
+
+    /// Extract the caller's SPIFFE ID string from request extensions.
+    fn caller_spiffe_id<T>(&self, request: &Request<T>) -> Result<String, Status> {
+        let connect_info = request
+            .extensions()
+            .get::<crate::tls::PeerConnectInfo>()
+            .ok_or_else(|| Status::unauthenticated("no peer certificate found"))?;
+        let spiffe_id = connect_info
+            .spiffe_id
+            .as_ref()
+            .ok_or_else(|| Status::unauthenticated("no peer certificate found"))?;
+        Ok(spiffe_id.to_string())
+    }
+
+    /// CR-8 middleware: require cluster_admin scope.
+    ///
+    /// Ctrl-kind callers (fleetctl-proxy) have full access. Operator-kind
+    /// callers must be a config-seeded bootstrap admin or hold an active,
+    /// unexpired grant with cluster_admin=true.
+    fn require_cluster_admin<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let caller = self.caller_spiffe_id(request)?;
+        let connect_info = request
+            .extensions()
+            .get::<crate::tls::PeerConnectInfo>()
+            .ok_or_else(|| Status::unauthenticated("no peer certificate found"))?;
+        let kind = connect_info
+            .spiffe_id
+            .as_ref()
+            .map(|s| s.kind)
+            .ok_or_else(|| Status::unauthenticated("no peer certificate found"))?;
+
+        if kind == fleetos_core::spiffe::IdKind::Ctrl {
+            return Ok(());
+        }
+        if kind == fleetos_core::spiffe::IdKind::Operator {
+            if self.operators_config.bootstrap_admins.contains(&caller) {
+                return Ok(());
+            }
+            let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+            if self.has_active_grant(&caller, now, |g| g.cluster_admin)? {
+                return Ok(());
+            }
+        }
+        Err(Status::permission_denied("cluster_admin scope required"))
+    }
+
+    /// Scan operator grants for an active grant matching a predicate.
+    fn has_active_grant(
+        &self,
+        operator_id: &str,
+        now: u64,
+        pred: impl Fn(&crate::raft::records::OperatorAccessGrantRecord) -> bool,
+    ) -> Result<bool, Status> {
+        for guard in self.storage.operator_grants.prefix(Vec::<u8>::new()) {
+            let value = guard
+                .value()
+                .map_err(|e| Status::internal(format!("storage error: {}", e)))?;
+            if let Ok(record) = postcard::from_bytes::<
+                crate::raft::records::OperatorAccessGrantRecord,
+            >(value.as_ref())
+            {
+                if record.operator_id == operator_id
+                    && record.expires_at_unix > now
+                    && pred(&record)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -451,13 +525,87 @@ impl AdminService for AdminServiceImpl {
     }
 
     // --- CR-8: Operator JIT Access (Stubs for Step 25) ---
-
     async fn grant_operator_access(
         &self,
         request: Request<fleetos_core::proto::admin::GrantOperatorAccessRequest>,
     ) -> Result<Response<fleetos_core::proto::admin::OperatorAccessAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 25"))
+        self.require_cluster_admin(&request)?;
+        let granted_by = self.caller_spiffe_id(&request)?;
+        let audit = self.build_audit_context(&request, &request.get_ref().operator_id);
+
+        let req = request.into_inner();
+
+        // Validate operator_id is an operator-kind SPIFFE ID.
+        let operator_spiffe: SpiffeId = req
+            .operator_id
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("invalid operator_id: {}", e)))?;
+        if operator_spiffe.kind != fleetos_core::spiffe::IdKind::Operator {
+            return Err(Status::invalid_argument(
+                "operator_id must be an operator-kind SPIFFE ID",
+            ));
+        }
+
+        // Leader-computed timestamps (determinism contract).
+        let granted_at_unix = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+        let ttl = if req.ttl_secs == 0 {
+            self.operators_config.grant_ttl_secs
+        } else {
+            req.ttl_secs
+        };
+        let expires_at_unix = granted_at_unix + ttl;
+
+        let scope = req.scope.unwrap_or_default();
+        let cluster_admin = scope.cluster_admin;
+        let read_only = scope.read_only;
+        let tenants = scope.tenants;
+
+        // Content-derived grant id via the frozen 7-arg of_grant (CR-8 amendment).
+        let tenant_refs: Vec<&str> = tenants.iter().map(|s| s.as_str()).collect();
+        let grant_id = fleetos_core::OperatorGrantId::of_grant(
+            &req.operator_id,
+            &granted_by,
+            granted_at_unix,
+            expires_at_unix,
+            cluster_admin,
+            read_only,
+            &tenant_refs,
+        )
+        .to_hex();
+
+        let record = crate::raft::records::OperatorAccessGrantRecord {
+            grant_id: grant_id.clone(),
+            operator_id: req.operator_id.clone(),
+            granted_by,
+            granted_at_unix,
+            expires_at_unix,
+            cluster_admin,
+            read_only,
+            tenants,
+        };
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::GrantOperatorAccess { record },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(
+            operator_id = %req.operator_id,
+            grant_id = %grant_id,
+            cluster_admin = cluster_admin,
+            read_only = read_only,
+            "operator access granted"
+        );
+        Ok(Response::new(
+            fleetos_core::proto::admin::OperatorAccessAck {
+                accepted: true,
+                grant_id,
+            },
+        ))
     }
 
     async fn revoke_operator_access(
@@ -465,7 +613,42 @@ impl AdminService for AdminServiceImpl {
         request: Request<fleetos_core::proto::admin::RevokeOperatorAccessRequest>,
     ) -> Result<Response<fleetos_core::proto::admin::OperatorAccessAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 25"))
+        self.require_cluster_admin(&request)?;
+        let audit = self.build_audit_context(&request, &request.get_ref().grant_id);
+
+        let req = request.into_inner();
+
+        // Verify the grant exists before proposing revocation.
+        let exists = self
+            .storage
+            .operator_grants
+            .get(req.grant_id.as_bytes())
+            .map_err(|e| Status::internal(format!("storage error: {}", e)))?
+            .is_some();
+        if !exists {
+            return Err(Status::not_found(format!(
+                "grant '{}' not found",
+                req.grant_id
+            )));
+        }
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::RevokeOperatorAccess {
+                    grant_id: req.grant_id.clone(),
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(grant_id = %req.grant_id, "operator access revoked");
+        Ok(Response::new(
+            fleetos_core::proto::admin::OperatorAccessAck {
+                accepted: true,
+                grant_id: req.grant_id,
+            },
+        ))
     }
 
     async fn list_operator_access(
@@ -473,7 +656,36 @@ impl AdminService for AdminServiceImpl {
         request: Request<fleetos_core::proto::admin::ListOperatorAccessRequest>,
     ) -> Result<Response<fleetos_core::proto::admin::ListOperatorAccessResponse>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 25"))
+        self.require_cluster_admin(&request)?;
+        let _ = request.into_inner();
+
+        let mut grants = Vec::new();
+        for guard in self.storage.operator_grants.prefix(Vec::<u8>::new()) {
+            let value = guard
+                .value()
+                .map_err(|e| Status::internal(format!("storage error: {}", e)))?;
+            if let Ok(record) = postcard::from_bytes::<
+                crate::raft::records::OperatorAccessGrantRecord,
+            >(value.as_ref())
+            {
+                grants.push(fleetos_core::proto::admin::OperatorAccessGrant {
+                    grant_id: record.grant_id,
+                    operator_id: record.operator_id,
+                    granted_by: record.granted_by,
+                    granted_at_unix: record.granted_at_unix,
+                    expires_at_unix: record.expires_at_unix,
+                    scope: Some(fleetos_core::proto::admin::OperatorScope {
+                        cluster_admin: record.cluster_admin,
+                        tenants: record.tenants,
+                        read_only: record.read_only,
+                    }),
+                });
+            }
+        }
+
+        Ok(Response::new(
+            fleetos_core::proto::admin::ListOperatorAccessResponse { grants },
+        ))
     }
 
     // --- CR-9: Replicated Audit Log (Read Path) ---

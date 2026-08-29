@@ -64,6 +64,10 @@ pub struct ControlConfig {
     /// Graceful shutdown behavior.
     #[serde(default)]
     pub graceful_shutdown: GracefulShutdownConfig,
+
+    /// Operator JIT access configuration (CR-8).
+    #[serde(default)]
+    pub operators: OperatorsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -451,6 +455,37 @@ impl Default for GracefulShutdownConfig {
 
 fn default_shutdown_grace_secs() -> u64 {
     10
+}
+
+// ---------------------------------------------------------------------------
+// Operator JIT access (CR-8)
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Deserialize)]
+pub struct OperatorsConfig {
+    /// Bootstrap admin operator identities (SPIFFE URIs). These get implicit
+    /// cluster_admin without an explicit grant record.
+    #[serde(default)]
+    pub bootstrap_admins: Vec<String>,
+    /// Default TTL for operator access grants (seconds). Default 3600 (1 hour).
+    #[serde(default = "default_operator_grant_ttl_secs")]
+    pub grant_ttl_secs: u64,
+    /// Pre-registered operator identities allowed to attest (allow-list).
+    #[serde(default)]
+    pub allowed_operators: Vec<String>,
+}
+
+impl Default for OperatorsConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_admins: Vec::new(),
+            grant_ttl_secs: default_operator_grant_ttl_secs(),
+            allowed_operators: Vec::new(),
+        }
+    }
+}
+
+fn default_operator_grant_ttl_secs() -> u64 {
+    3600
 }
 
 // ---------------------------------------------------------------------------

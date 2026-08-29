@@ -136,6 +136,14 @@ pub enum FleetosCommand {
     DeleteNodePool {
         pool_id: String,
     },
+
+    // --- Operator JIT access (CR-8) ---
+    GrantOperatorAccess {
+        record: records::OperatorAccessGrantRecord,
+    },
+    RevokeOperatorAccess {
+        grant_id: String,
+    },
 }
 
 /// Wraps a `FleetosCommand` with optional audit context so the audit record

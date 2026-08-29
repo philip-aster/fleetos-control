@@ -194,6 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyspaces.sag_rules.clone(),
         keyspaces.node_pools.clone(),
         keyspaces.audit_log.clone(),
+        keyspaces.operator_grants.clone(),
     ));
 
     // JoinHandles for the gRPC listeners, awaited during graceful shutdown.
@@ -227,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage_engine.clone(),
         ordinal_tracker.clone(),
         raft_handle.raft.clone(),
+        dummy_ip_allocator.clone(),
     ));
     let pod_controller = Arc::new(PodController::new(
         ordinal_tracker.clone(),
@@ -494,6 +496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         join_token_store.clone(),
         dummy_ip_allocator.clone(),
         raft_handle.raft.clone(),
+        config.operators.clone(),
     );
 
     let dc_addr: std::net::SocketAddr = config.listeners.data_control.parse()?;
@@ -953,6 +956,7 @@ async fn init_raft_cluster(
         keyspaces.clone(),
         versioned_state,
         broadcast_hub,
+        config.trust_domains.data_control.clone(),
     );
 
     let peer_addresses = match config.cluster.mode {

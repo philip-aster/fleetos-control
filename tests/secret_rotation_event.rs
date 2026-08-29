@@ -31,6 +31,7 @@ async fn store_secret_broadcasts_rotation_with_target_spiffe_id() {
         keyspaces.clone(),
         versioned_state,
         broadcast_hub.clone(),
+        "test.example.internal".to_owned(),
     );
 
     let target_spiffe_id = "spiffe://fleet.example.internal/ns/tenant-1/sa/db".to_owned();
