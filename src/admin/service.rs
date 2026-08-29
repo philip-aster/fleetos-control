@@ -173,6 +173,109 @@ impl AdminServiceImpl {
         Err(Status::permission_denied("cluster_admin scope required"))
     }
 
+    /// Scan all active (unexpired) grants for an operator.
+    fn active_grants_for_operator(
+        &self,
+        operator_id: &str,
+        now: u64,
+    ) -> Result<Vec<crate::raft::records::OperatorAccessGrantRecord>, Status> {
+        let mut grants = Vec::new();
+        for guard in self.storage.operator_grants.prefix(Vec::<u8>::new()) {
+            let value = guard
+                .value()
+                .map_err(|e| Status::internal(format!("storage error: {}", e)))?;
+            if let Ok(record) = postcard::from_bytes::<
+                crate::raft::records::OperatorAccessGrantRecord,
+            >(value.as_ref())
+            {
+                if record.operator_id == operator_id && record.expires_at_unix > now {
+                    grants.push(record);
+                }
+            }
+        }
+        Ok(grants)
+    }
+
+    /// Returns true if the caller is ctrl-kind (fleetctl-proxy), which has full access.
+    fn caller_is_ctrl<T>(&self, request: &Request<T>) -> Result<bool, Status> {
+        let connect_info = request
+            .extensions()
+            .get::<crate::tls::PeerConnectInfo>()
+            .ok_or_else(|| Status::unauthenticated("no peer certificate found"))?;
+        let kind = connect_info
+            .spiffe_id
+            .as_ref()
+            .map(|s| s.kind)
+            .ok_or_else(|| Status::unauthenticated("no peer certificate found"))?;
+        Ok(kind == fleetos_core::spiffe::IdKind::Ctrl)
+    }
+
+    /// CR-8 middleware: require read access.
+    ///
+    /// Ctrl-kind callers have full access. Operator-kind callers need at least
+    /// one active grant; read-only grants are sufficient for reads.
+    fn require_read_access<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if self.caller_is_ctrl(request)? {
+            return Ok(());
+        }
+        let caller = self.caller_spiffe_id(request)?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+        let grants = self.active_grants_for_operator(&caller, now)?;
+        if grants.is_empty() {
+            return Err(Status::permission_denied(
+                "no active operator grant for read access",
+            ));
+        }
+        Ok(())
+    }
+
+    /// CR-8 middleware: require write access to a specific tenant.
+    ///
+    /// Ctrl-kind callers have full access. Operator-kind callers need an
+    /// active, non-read-only grant that is either cluster_admin or lists
+    /// the target tenant.
+    fn require_tenant_write<T>(&self, request: &Request<T>, tenant_id: &str) -> Result<(), Status> {
+        if self.caller_is_ctrl(request)? {
+            return Ok(());
+        }
+        let caller = self.caller_spiffe_id(request)?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+        let grants = self.active_grants_for_operator(&caller, now)?;
+        let has_write = grants
+            .iter()
+            .any(|g| !g.read_only && (g.cluster_admin || g.tenants.iter().any(|t| t == tenant_id)));
+        if !has_write {
+            return Err(Status::permission_denied(format!(
+                "no active write grant for tenant '{}'",
+                tenant_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// CR-8 middleware: require cluster_admin scope for MUTATING operations.
+    ///
+    /// Like `require_cluster_admin`, but also rejects read-only grants —
+    /// a read-only cluster admin may list/inspect but not mutate.
+    fn require_cluster_admin_write<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if self.caller_is_ctrl(request)? {
+            return Ok(());
+        }
+        let caller = self.caller_spiffe_id(request)?;
+        if self.operators_config.bootstrap_admins.contains(&caller) {
+            return Ok(());
+        }
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+        let grants = self.active_grants_for_operator(&caller, now)?;
+        let has_access = grants.iter().any(|g| g.cluster_admin && !g.read_only);
+        if !has_access {
+            return Err(Status::permission_denied(
+                "cluster_admin write scope required",
+            ));
+        }
+        Ok(())
+    }
+
     /// Scan operator grants for an active grant matching a predicate.
     fn has_active_grant(
         &self,
@@ -207,6 +310,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<CreateTenantRequest>,
     ) -> Result<Response<CreateTenantResponse>, Status> {
         self.verify_caller(&request)?;
+        self.require_cluster_admin_write(&request)?;
 
         // 1. Extract target BEFORE consuming the request
         let tenant_id = request.get_ref().tenant_id.clone();
@@ -265,6 +369,8 @@ impl AdminService for AdminServiceImpl {
         self.verify_caller(&request)?;
 
         let workload_id = request.get_ref().workload_id.clone();
+        let tenant_id = request.get_ref().tenant_id.clone();
+        self.require_tenant_write(&request, &tenant_id)?;
         let audit = self.build_audit_context(&request, &workload_id);
         let spec = request.into_inner();
         validate_identifier(&spec.tenant_id, "tenant_id")?;
@@ -317,6 +423,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
         self.verify_caller(&request)?;
+        self.require_read_access(&request)?;
         let records = self
             .storage
             .list_node_records()
@@ -334,6 +441,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<GetClusterStatusRequest>,
     ) -> Result<Response<ClusterStatus>, Status> {
         self.verify_caller(&request)?;
+        self.require_read_access(&request)?;
         let raft_term = self.raft.metrics().borrow().current_term;
         let records = self
             .storage
@@ -354,6 +462,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<GenerateJoinTokenRequest>,
     ) -> Result<Response<GenerateJoinTokenResponse>, Status> {
         self.verify_caller(&request)?;
+        self.require_cluster_admin_write(&request)?;
 
         let node_kind_str = request.get_ref().node_kind.clone();
         let audit = self.build_audit_context(&request, &node_kind_str);
@@ -397,8 +506,9 @@ impl AdminService for AdminServiceImpl {
         request: Request<CronWorkload>,
     ) -> Result<Response<fleetos_core::proto::admin::CronWorkloadAck>, Status> {
         self.verify_caller(&request)?;
-
         let cron_id = request.get_ref().cron_workload_id.clone();
+        let tenant_id = request.get_ref().tenant_id.clone();
+        self.require_tenant_write(&request, &tenant_id)?;
         let audit = self.build_audit_context(&request, &cron_id);
         let cron = request.into_inner();
         validate_identifier(&cron.tenant_id, "tenant_id")?;
@@ -530,7 +640,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<fleetos_core::proto::admin::GrantOperatorAccessRequest>,
     ) -> Result<Response<fleetos_core::proto::admin::OperatorAccessAck>, Status> {
         self.verify_caller(&request)?;
-        self.require_cluster_admin(&request)?;
+        self.require_cluster_admin_write(&request)?;
         let granted_by = self.caller_spiffe_id(&request)?;
         let audit = self.build_audit_context(&request, &request.get_ref().operator_id);
 
@@ -545,6 +655,19 @@ impl AdminService for AdminServiceImpl {
             return Err(Status::invalid_argument(
                 "operator_id must be an operator-kind SPIFFE ID",
             ));
+        }
+
+        // Enforce the pre-registered allow-list (empty = unrestricted).
+        if !self.operators_config.allowed_operators.is_empty()
+            && !self
+                .operators_config
+                .allowed_operators
+                .contains(&req.operator_id)
+        {
+            return Err(Status::permission_denied(format!(
+                "operator '{}' is not in the pre-registered allow-list",
+                req.operator_id
+            )));
         }
 
         // Leader-computed timestamps (determinism contract).
@@ -613,7 +736,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<fleetos_core::proto::admin::RevokeOperatorAccessRequest>,
     ) -> Result<Response<fleetos_core::proto::admin::OperatorAccessAck>, Status> {
         self.verify_caller(&request)?;
-        self.require_cluster_admin(&request)?;
+        self.require_cluster_admin_write(&request)?;
         let audit = self.build_audit_context(&request, &request.get_ref().grant_id);
 
         let req = request.into_inner();
@@ -694,7 +817,7 @@ impl AdminService for AdminServiceImpl {
         request: Request<fleetos_core::proto::admin::ListAuditLogRequest>,
     ) -> Result<Response<fleetos_core::proto::admin::ListAuditLogResponse>, Status> {
         self.verify_caller(&request)?;
-
+        self.require_cluster_admin(&request)?;
         let req = request.into_inner();
         let from_version = req.from_version;
         let max_entries = if req.max_entries == 0 {
