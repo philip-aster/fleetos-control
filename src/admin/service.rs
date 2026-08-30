@@ -30,6 +30,7 @@ pub struct AdminServiceImpl {
     dummy_ip_allocator: Arc<DummyIpAllocator>,
     raft: Arc<openraft::Raft<FleetosRaftConfig>>,
     operators_config: crate::config::OperatorsConfig,
+    node_ttl_secs: u64,
 }
 
 /// Admission hardening (G-12): identifiers must be DNS-label-shaped so they
@@ -67,6 +68,7 @@ impl AdminServiceImpl {
         dummy_ip_allocator: Arc<DummyIpAllocator>,
         raft: Arc<openraft::Raft<FleetosRaftConfig>>,
         operators_config: crate::config::OperatorsConfig,
+        node_ttl_secs: u64,
     ) -> Self {
         Self {
             storage,
@@ -74,6 +76,7 @@ impl AdminServiceImpl {
             dummy_ip_allocator,
             raft,
             operators_config,
+            node_ttl_secs,
         }
     }
 
@@ -613,11 +616,49 @@ impl AdminService for AdminServiceImpl {
     }
     async fn cordon_node(&self, request: Request<NodeId>) -> Result<Response<NodeAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16"))
+        self.require_cluster_admin_write(&request)?;
+        let node_svid = request.get_ref().node_svid.clone();
+        let audit = self.build_audit_context(&request, &node_svid);
+        let _req = request.into_inner();
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::SetNodeSchedulable {
+                    node_id: node_svid.clone(),
+                    schedulable: false,
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(node_id = %node_svid, "node cordoned via admin");
+        Ok(Response::new(NodeAck { accepted: true }))
     }
+
     async fn evict_node(&self, request: Request<NodeId>) -> Result<Response<NodeAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16"))
+        self.require_cluster_admin_write(&request)?;
+        let node_svid = request.get_ref().node_svid.clone();
+        let audit = self.build_audit_context(&request, &node_svid);
+        let _req = request.into_inner();
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let svid_expires_at_unix = now + self.node_ttl_secs as i64;
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::EvictNode {
+                    node_id: node_svid.clone(),
+                    svid_expires_at_unix,
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(node_id = %node_svid, "node evicted via admin");
+        Ok(Response::new(NodeAck { accepted: true }))
     }
     async fn set_quota(
         &self,
