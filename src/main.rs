@@ -496,6 +496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     });
 
+    let ca_data_control = ca_service.as_ref().map(|ca| ca.data_control.clone());
     let admin_service = fleetos_control::admin::service::AdminServiceImpl::new(
         storage_engine.clone(),
         join_token_store.clone(),
@@ -504,6 +505,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.operators.clone(),
         config.svid.node_ttl_secs,
         secret_store.clone(),
+        ca_data_control,
+        config.svid.delegated_key_ttl_secs,
     );
 
     let dc_addr: std::net::SocketAddr = config.listeners.data_control.parse()?;

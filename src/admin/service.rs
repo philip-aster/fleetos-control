@@ -32,6 +32,8 @@ pub struct AdminServiceImpl {
     operators_config: crate::config::OperatorsConfig,
     node_ttl_secs: u64,
     secret_store: Arc<crate::secrets::SecretStore>,
+    ca_data_control: Option<Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>>,
+    delegated_key_ttl_secs: u64,
 }
 
 /// Admission hardening (G-12): identifiers must be DNS-label-shaped so they
@@ -71,6 +73,8 @@ impl AdminServiceImpl {
         operators_config: crate::config::OperatorsConfig,
         node_ttl_secs: u64,
         secret_store: Arc<crate::secrets::SecretStore>,
+        ca_data_control: Option<Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>>,
+        delegated_key_ttl_secs: u64,
     ) -> Self {
         Self {
             storage,
@@ -80,6 +84,8 @@ impl AdminServiceImpl {
             operators_config,
             node_ttl_secs,
             secret_store,
+            ca_data_control,
+            delegated_key_ttl_secs,
         }
     }
 
@@ -928,7 +934,95 @@ impl AdminService for AdminServiceImpl {
         request: Request<DelegatedKeyRequest>,
     ) -> Result<Response<DelegatedKeyResponse>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 20"))
+
+        let req = request.get_ref();
+        let node_svid_str = req.node_svid.clone();
+        let target_spiffe_str = req.target_spiffe_id.clone();
+
+        // Authorization: caller must be the node itself, or a cluster admin.
+        let caller = self.caller_spiffe_id(&request)?;
+        let is_self = caller == node_svid_str;
+        if !is_self {
+            self.require_cluster_admin(&request)?;
+        }
+
+        let node_spiffe: SpiffeId = node_svid_str
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("invalid node_svid: {}", e)))?;
+        let target_spiffe: SpiffeId = target_spiffe_str
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("invalid target_spiffe_id: {}", e)))?;
+
+        // Bound the TTL to the configured maximum.
+        let ttl = if req.requested_ttl_secs == 0
+            || req.requested_ttl_secs > self.delegated_key_ttl_secs
+        {
+            self.delegated_key_ttl_secs
+        } else {
+            req.requested_ttl_secs
+        };
+
+        let ca_bundle = self
+            .ca_data_control
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("CA not available (join mode first boot)"))?;
+
+        let placement_verifier =
+            crate::ca::key_issuance::StoragePlacementVerifier::new(self.storage.placements.clone());
+
+        let delegation_req = crate::ca::key_issuance::DelegationRequest {
+            node_id: node_spiffe.clone(),
+            target_svid_id: target_spiffe.clone(),
+            target_ordinal: req.target_ordinal,
+            ttl_secs: ttl,
+        };
+
+        // Issue the key (enforces placement verification + pathLen=0 constraint).
+        let bundle = crate::ca::key_issuance::issue_delegated_key(
+            &delegation_req,
+            ca_bundle,
+            &placement_verifier,
+        )
+        .map_err(|e| Status::internal(format!("failed to issue delegated key: {}", e)))?;
+
+        // Record the delegation in Raft so it can be revoked on node eviction.
+        let now = time::OffsetDateTime::now_utc();
+        let issued_at = now.unix_timestamp();
+        let expires_at = issued_at + ttl as i64;
+        let refresh_at = issued_at + (ttl as f64 * 0.75) as i64;
+
+        let record = crate::delegation::DelegationRecord {
+            delegation_id: bundle.delegation_id.clone(),
+            node_id: node_spiffe,
+            target_svid_id: target_spiffe,
+            target_ordinal: req.target_ordinal,
+            issued_at,
+            expires_at,
+            refresh_at,
+        };
+
+        let audit = self.build_audit_context(&request, &bundle.delegation_id);
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::IssueDelegation { record },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(
+            node_id = %node_svid_str,
+            target = %target_spiffe_str,
+            delegation_id = %bundle.delegation_id,
+            "delegated key issued via raft"
+        );
+
+        Ok(Response::new(DelegatedKeyResponse {
+            delegation_id: bundle.delegation_id.into_bytes(),
+            key_material: bundle.key_bytes,
+            expires_at_unix: expires_at as u64,
+        }))
     }
     async fn delete_workload(
         &self,
