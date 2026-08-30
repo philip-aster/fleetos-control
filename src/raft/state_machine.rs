@@ -80,6 +80,107 @@ impl FjallStateMachine {
                 batch.insert(&self.keyspaces.workloads, key.as_bytes(), value.as_slice());
                 Ok(ChangeKind::SchedulingUpdate)
             }
+
+            FleetosCommand::DeleteWorkload {
+                tenant_id,
+                workload_id,
+            } => {
+                // Remove the workload spec.
+                let key = format!("{}:{}", tenant_id, workload_id);
+                batch.remove(&self.keyspaces.workloads, key.as_bytes());
+                // Remove all placements for this workload and free their ordinals.
+                let mut to_remove: Vec<(String, String, u32)> = Vec::new();
+                for guard in self.keyspaces.placements.prefix(Vec::<u8>::new()) {
+                    let value = guard.value().map_err(read_err)?;
+                    if let Ok(placement) =
+                        postcard::from_bytes::<crate::scheduler::Placement>(value.as_ref())
+                    {
+                        if placement.tenant_id == *tenant_id && placement.service == *workload_id {
+                            to_remove.push((placement.pod_id, placement.role, placement.ordinal));
+                        }
+                    }
+                }
+                for (pod_id, role, ordinal) in to_remove {
+                    batch.remove(&self.keyspaces.placements, pod_id.as_bytes());
+                    let freed = crate::scheduler::ordinal::OrdinalAssignment {
+                        tenant_id: tenant_id.clone(),
+                        service: workload_id.clone(),
+                        role: role.clone(),
+                        ordinal,
+                        current_pod_id: None,
+                        current_node_id: None,
+                    };
+                    let ordinal_key = format!("{}:{}:{}:{}", tenant_id, workload_id, role, ordinal);
+                    let freed_value = postcard::to_allocvec(&freed).map_err(ser_err)?;
+                    batch.insert(
+                        &self.keyspaces.ordinals,
+                        ordinal_key.as_bytes(),
+                        freed_value.as_slice(),
+                    );
+                }
+                Ok(ChangeKind::SchedulingUpdate)
+            }
+            FleetosCommand::ScaleWorkload { record } => {
+                // 1. Replace the stored spec with the updated one.
+                let key = format!("{}:{}", record.tenant_id, record.workload_id);
+                let value = postcard::to_allocvec(record).map_err(ser_err)?;
+                batch.insert(&self.keyspaces.workloads, key.as_bytes(), value.as_slice());
+                // 2. Decode the new replica counts from the updated spec.
+                let new_replicas: std::collections::HashMap<String, u32> =
+                    match fleetos_core::proto::workload::WorkloadSpec::decode(
+                        record.spec_bytes.as_slice(),
+                    ) {
+                        Ok(spec) => spec.replicas,
+                        Err(_) => std::collections::HashMap::new(),
+                    };
+                // 3. Remove placements whose ordinal exceeds the new count (or whose
+                //    role was removed), and free their ordinal slots.
+                let mut to_remove: Vec<(String, String, u32)> = Vec::new();
+                for guard in self.keyspaces.placements.prefix(Vec::<u8>::new()) {
+                    let value = guard.value().map_err(read_err)?;
+                    if let Ok(placement) =
+                        postcard::from_bytes::<crate::scheduler::Placement>(value.as_ref())
+                    {
+                        if placement.tenant_id == record.tenant_id
+                            && placement.service == record.workload_id
+                        {
+                            let should_remove = match new_replicas.get(&placement.role) {
+                                Some(&new_count) => placement.ordinal >= new_count,
+                                None => true, // role no longer present
+                            };
+                            if should_remove {
+                                to_remove.push((
+                                    placement.pod_id,
+                                    placement.role,
+                                    placement.ordinal,
+                                ));
+                            }
+                        }
+                    }
+                }
+                for (pod_id, role, ordinal) in to_remove {
+                    batch.remove(&self.keyspaces.placements, pod_id.as_bytes());
+                    let freed = crate::scheduler::ordinal::OrdinalAssignment {
+                        tenant_id: record.tenant_id.clone(),
+                        service: record.workload_id.clone(),
+                        role: role.clone(),
+                        ordinal,
+                        current_pod_id: None,
+                        current_node_id: None,
+                    };
+                    let ordinal_key = format!(
+                        "{}:{}:{}:{}",
+                        record.tenant_id, record.workload_id, role, ordinal
+                    );
+                    let freed_value = postcard::to_allocvec(&freed).map_err(ser_err)?;
+                    batch.insert(
+                        &self.keyspaces.ordinals,
+                        ordinal_key.as_bytes(),
+                        freed_value.as_slice(),
+                    );
+                }
+                Ok(ChangeKind::SchedulingUpdate)
+            }
             FleetosCommand::SubmitCronWorkload { record, checkpoint } => {
                 let key = format!("cron:{}:{}", record.tenant_id, record.cron_workload_id);
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
@@ -756,6 +857,8 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::UpsertWorkloadStatus { .. } => "UpsertWorkloadStatus",
         FleetosCommand::GrantOperatorAccess { .. } => "GrantOperatorAccess",
         FleetosCommand::RevokeOperatorAccess { .. } => "RevokeOperatorAccess",
+        FleetosCommand::DeleteWorkload { .. } => "DeleteWorkload",
+        FleetosCommand::ScaleWorkload { .. } => "ScaleWorkload",
     }
 }
 

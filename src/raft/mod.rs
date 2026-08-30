@@ -38,6 +38,16 @@ pub enum FleetosCommand {
     SubmitWorkloadSpec {
         record: records::WorkloadSpecRecord,
     },
+    /// Delete a workload spec and all its placements/ordinal assignments.
+    DeleteWorkload {
+        tenant_id: String,
+        workload_id: String,
+    },
+    /// Update a workload's replica counts. The state machine applies the new
+    /// spec, removes excess placements, and frees their ordinal slots.
+    ScaleWorkload {
+        record: records::WorkloadSpecRecord,
+    },
     SubmitCronWorkload {
         record: records::CronWorkloadRecord,
         checkpoint: records::CronCheckpointRecord,

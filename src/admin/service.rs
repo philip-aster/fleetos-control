@@ -605,14 +605,70 @@ impl AdminService for AdminServiceImpl {
         request: Request<DeleteWorkloadRequest>,
     ) -> Result<Response<WorkloadSpecAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16"))
+        let tenant_id = request.get_ref().tenant_id.clone();
+        let workload_id = request.get_ref().workload_id.clone();
+        self.require_tenant_write(&request, &tenant_id)?;
+        let audit = self.build_audit_context(&request, &workload_id);
+        let _req = request.into_inner();
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::DeleteWorkload {
+                    tenant_id: tenant_id.clone(),
+                    workload_id: workload_id.clone(),
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(tenant_id = %tenant_id, workload_id = %workload_id, "workload deleted via raft");
+        Ok(Response::new(WorkloadSpecAck { accepted: true }))
     }
     async fn scale_workload(
         &self,
         request: Request<ScaleWorkloadRequest>,
     ) -> Result<Response<WorkloadSpecAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16"))
+        let tenant_id = request.get_ref().tenant_id.clone();
+        let workload_id = request.get_ref().workload_id.clone();
+        self.require_tenant_write(&request, &tenant_id)?;
+        let audit = self.build_audit_context(&request, &workload_id);
+        let req = request.into_inner();
+
+        // Load the current stored spec record.
+        let record_bytes = self
+            .storage
+            .get_workload_spec(&tenant_id, &workload_id)
+            .map_err(|e| Status::internal(format!("storage read failed: {}", e)))?
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "workload '{}/{}' not found",
+                    tenant_id, workload_id
+                ))
+            })?;
+        let mut record: crate::raft::records::WorkloadSpecRecord =
+            postcard::from_bytes(&record_bytes).map_err(|e| {
+                Status::internal(format!("failed to decode workload record: {}", e))
+            })?;
+
+        // Apply the new replica counts to the embedded WorkloadSpec.
+        let mut spec: fleetos_core::proto::workload::WorkloadSpec =
+            prost::Message::decode(record.spec_bytes.as_slice())
+                .map_err(|e| Status::internal(format!("failed to decode workload spec: {}", e)))?;
+        spec.replicas = req.replicas.clone();
+        record.spec_bytes = prost::Message::encode_to_vec(&spec);
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::ScaleWorkload { record },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(tenant_id = %tenant_id, workload_id = %workload_id, "workload scaled via raft");
+        Ok(Response::new(WorkloadSpecAck { accepted: true }))
     }
     async fn cordon_node(&self, request: Request<NodeId>) -> Result<Response<NodeAck>, Status> {
         self.verify_caller(&request)?;
