@@ -563,14 +563,140 @@ impl AdminService for AdminServiceImpl {
         request: Request<UpsertSagRuleRequest>,
     ) -> Result<Response<SagRuleAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16/20"))
+        self.require_cluster_admin_write(&request)?;
+
+        // Extract the rule before consuming the request.
+        let rule = request
+            .get_ref()
+            .rule
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("rule is required"))?;
+
+        let from = rule
+            .from
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("rule.from is required"))?;
+        let to = rule
+            .to
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("rule.to is required"))?;
+
+        // Cross-tenant rules are prohibited by the TenantCtx contract.
+        if from.tenant != to.tenant {
+            return Err(Status::invalid_argument(
+                "from.tenant and to.tenant must match (cross-tenant rules are prohibited)",
+            ));
+        }
+
+        // Validate identifiers.
+        validate_identifier(&from.tenant, "from.tenant")?;
+        validate_identifier(&from.service_name, "from.service_name")?;
+        validate_identifier(&to.service_name, "to.service_name")?;
+
+        // Validate ports (reject > 65535, don't truncate).
+        let from_port = crate::policy::port_validation::validate_optional_port(from.port)
+            .map_err(|e| Status::invalid_argument(format!("invalid from.port: {}", e)))?;
+        let to_port = crate::policy::port_validation::validate_optional_port(to.port)
+            .map_err(|e| Status::invalid_argument(format!("invalid to.port: {}", e)))?;
+
+        // Parse roles (empty string = wildcard).
+        let from_role = if from.role.is_empty() {
+            None
+        } else {
+            Some(
+                fleetos_core::spiffe::WorkloadRole::try_from(from.role.as_str())
+                    .map_err(|e| Status::invalid_argument(format!("invalid from.role: {}", e)))?,
+            )
+        };
+        let to_role = if to.role.is_empty() {
+            None
+        } else {
+            Some(
+                fleetos_core::spiffe::WorkloadRole::try_from(to.role.as_str())
+                    .map_err(|e| Status::invalid_argument(format!("invalid to.role: {}", e)))?,
+            )
+        };
+
+        // Compute the canonical rule_id from rule content.
+        let action_str = match rule.action {
+            0 => "ALLOW",
+            1 => "DENY",
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "invalid action value: {}",
+                    other
+                )));
+            }
+        };
+
+        let rule_id = fleetos_core::policy::SagRuleId::of_rule(
+            &from.tenant,
+            &from.service_name,
+            from_role.as_ref(),
+            from_port,
+            &to.service_name,
+            to_role.as_ref(),
+            to_port,
+            action_str,
+        )
+        .to_hex();
+
+        let audit = self.build_audit_context(&request, &rule_id);
+        let _req = request.into_inner();
+
+        // Encode the proto rule for storage (decoded as proto by policy_stream).
+        let rule_bytes = prost::Message::encode_to_vec(&rule);
+
+        let record = crate::raft::records::SagRuleRecord {
+            rule_id: rule_id.clone(),
+            rule_bytes,
+        };
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::UpsertSagRule { record },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(rule_id = %rule_id, "SAG rule upserted via raft");
+        Ok(Response::new(SagRuleAck {
+            accepted: true,
+            rule_id,
+        }))
     }
+
     async fn delete_sag_rule(
         &self,
         request: Request<DeleteSagRuleRequest>,
     ) -> Result<Response<SagRuleAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16/20"))
+        self.require_cluster_admin_write(&request)?;
+
+        let rule_id = request.get_ref().rule_id.clone();
+        if rule_id.is_empty() {
+            return Err(Status::invalid_argument("rule_id cannot be empty"));
+        }
+
+        let audit = self.build_audit_context(&request, &rule_id);
+        let _req = request.into_inner();
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::DeleteSagRule {
+                    rule_id: rule_id.clone(),
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(rule_id = %rule_id, "SAG rule deleted via raft");
+        Ok(Response::new(SagRuleAck {
+            accepted: true,
+            rule_id,
+        }))
     }
     async fn store_secret(
         &self,
