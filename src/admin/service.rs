@@ -259,6 +259,72 @@ impl AdminServiceImpl {
         Ok(())
     }
 
+    /// Check whether adding a workload would exceed the tenant's quota.
+    ///
+    /// If no quota is set, resources are unlimited (default-open).
+    /// Returns `Ok(())` if the workload fits, or a `Status::resource_exhausted`
+    /// error if it would exceed the quota.
+    fn check_tenant_quota(
+        &self,
+        tenant_id: &str,
+        spec: &fleetos_core::proto::workload::WorkloadSpec,
+    ) -> Result<(), Status> {
+        let quota = self
+            .storage
+            .get_tenant_quota(tenant_id)
+            .map_err(|e| Status::internal(format!("quota lookup failed: {}", e)))?;
+
+        let Some(quota) = quota else {
+            // No quota set — unlimited.
+            return Ok(());
+        };
+
+        let (current_cpu, current_memory, current_workloads) = self
+            .storage
+            .compute_tenant_usage(tenant_id)
+            .map_err(|e| Status::internal(format!("usage computation failed: {}", e)))?;
+
+        // Compute the new workload's resource footprint.
+        let cpu_per_pod = spec
+            .pod_spec
+            .as_ref()
+            .and_then(|ps| ps.resources.as_ref())
+            .map(|r| r.vcpus as u64 * 1000)
+            .unwrap_or(0);
+        let mem_per_pod = spec
+            .pod_spec
+            .as_ref()
+            .and_then(|ps| ps.resources.as_ref())
+            .map(|r| r.memory_mb as u64 * 1024 * 1024)
+            .unwrap_or(0);
+        let total_replicas: u64 = spec.replicas.values().map(|&c| c as u64).sum();
+
+        let new_cpu = current_cpu + cpu_per_pod * total_replicas;
+        let new_memory = current_memory + mem_per_pod * total_replicas;
+        let new_workloads = current_workloads + 1;
+
+        if new_workloads > quota.max_workloads as u32 {
+            return Err(Status::resource_exhausted(format!(
+                "tenant '{}' workload quota exceeded: {} of {} allowed",
+                tenant_id, new_workloads, quota.max_workloads
+            )));
+        }
+        if new_cpu > quota.max_cpu_millicores {
+            return Err(Status::resource_exhausted(format!(
+                "tenant '{}' CPU quota exceeded: {} of {} millicores allowed",
+                tenant_id, new_cpu, quota.max_cpu_millicores
+            )));
+        }
+        if new_memory > quota.max_memory_bytes {
+            return Err(Status::resource_exhausted(format!(
+                "tenant '{}' memory quota exceeded: {} of {} bytes allowed",
+                tenant_id, new_memory, quota.max_memory_bytes
+            )));
+        }
+
+        Ok(())
+    }
+
     /// CR-8 middleware: require cluster_admin scope for MUTATING operations.
     ///
     /// Like `require_cluster_admin`, but also rejects read-only grants —
@@ -405,6 +471,9 @@ impl AdminService for AdminServiceImpl {
         if prost::Message::encoded_len(&spec) > MAX_SPEC_BYTES {
             return Err(Status::invalid_argument("workload spec exceeds 1 MiB"));
         }
+
+        // CR-7: enforce tenant quota before storing the workload.
+        self.check_tenant_quota(&spec.tenant_id, &spec)?;
 
         let record = crate::raft::records::WorkloadSpecRecord {
             tenant_id: spec.tenant_id.clone(),
@@ -918,6 +987,8 @@ impl AdminService for AdminServiceImpl {
             prost::Message::decode(record.spec_bytes.as_slice())
                 .map_err(|e| Status::internal(format!("failed to decode workload spec: {}", e)))?;
         spec.replicas = req.replicas.clone();
+        // CR-7: re-check tenant quota after scaling.
+        self.check_tenant_quota(&tenant_id, &spec)?;
         record.spec_bytes = prost::Message::encode_to_vec(&spec);
 
         self.raft
@@ -982,14 +1053,92 @@ impl AdminService for AdminServiceImpl {
         request: Request<QuotaRequest>,
     ) -> Result<Response<QuotaAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16"))
+        self.require_cluster_admin_write(&request)?;
+
+        let req = request.get_ref();
+        let quota = req
+            .quota
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("quota is required"))?;
+
+        validate_identifier(&quota.tenant_id, "tenant_id")?;
+
+        // Build audit context BEFORE consuming the request.
+        let audit = self.build_audit_context(&request, &quota.tenant_id);
+
+        // Verify the tenant exists.
+        let tenant_exists = self
+            .storage
+            .get_tenant(&quota.tenant_id)
+            .map_err(|e| Status::internal(format!("tenant lookup failed: {}", e)))?
+            .is_some();
+        if !tenant_exists {
+            return Err(Status::not_found(format!(
+                "tenant '{}' not found",
+                quota.tenant_id
+            )));
+        }
+
+        // NOW consume the request.
+        let req = request.into_inner();
+        let quota = req.quota.unwrap();
+
+        let record = crate::raft::records::TenantQuotaRecord {
+            tenant_id: quota.tenant_id.clone(),
+            max_cpu_millicores: quota.max_cpu_millicores,
+            max_memory_bytes: quota.max_memory_bytes,
+            max_workloads: quota.max_workloads,
+        };
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::SetTenantQuota { record },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(
+            tenant_id = %quota.tenant_id,
+            max_cpu = quota.max_cpu_millicores,
+            max_memory = quota.max_memory_bytes,
+            max_workloads = quota.max_workloads,
+            "tenant quota set via raft"
+        );
+
+        Ok(Response::new(QuotaAck { accepted: true }))
     }
+
     async fn get_quota(
         &self,
         request: Request<QuotaRequest>,
     ) -> Result<Response<QuotaResponse>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16"))
+        self.require_read_access(&request)?;
+
+        let req = request.into_inner();
+        let quota = req
+            .quota
+            .ok_or_else(|| Status::invalid_argument("quota is required"))?;
+
+        validate_identifier(&quota.tenant_id, "tenant_id")?;
+
+        let record = self
+            .storage
+            .get_tenant_quota(&quota.tenant_id)
+            .map_err(|e| Status::internal(format!("quota lookup failed: {}", e)))?
+            .ok_or_else(|| {
+                Status::not_found(format!("no quota set for tenant '{}'", quota.tenant_id))
+            })?;
+
+        Ok(Response::new(QuotaResponse {
+            quota: Some(fleetos_core::proto::admin::TenantQuota {
+                tenant_id: record.tenant_id,
+                max_cpu_millicores: record.max_cpu_millicores,
+                max_memory_bytes: record.max_memory_bytes,
+                max_workloads: record.max_workloads,
+            }),
+        }))
     }
 
     // --- CR-8: Operator JIT Access (Stubs for Step 25) ---

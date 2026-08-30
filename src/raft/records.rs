@@ -160,3 +160,13 @@ pub struct WorkloadStatusRecord {
     pub live: bool,
     pub observed_at_unix: i64,
 }
+
+/// A tenant resource quota (CR-7). Replicated via Raft so any leader can
+/// enforce it. Keyed by `tenant_id`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TenantQuotaRecord {
+    pub tenant_id: String,
+    pub max_cpu_millicores: u64,
+    pub max_memory_bytes: u64,
+    pub max_workloads: u32,
+}

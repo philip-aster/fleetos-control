@@ -3,6 +3,7 @@ use crate::raft::records::{NodeRecord, TenantRecord};
 use crate::scheduler::Placement;
 use fjall::Keyspace;
 use fleetos_core::spiffe::SpiffeId;
+use prost::Message;
 
 /// Unified storage engine providing access to all keyspaces.
 ///
@@ -33,6 +34,7 @@ pub struct StorageEngine {
     pub audit_log: Keyspace,
     pub operator_grants: Keyspace,
     pub workload_status: Keyspace,
+    pub tenant_quotas: Keyspace,
 }
 
 impl StorageEngine {
@@ -61,6 +63,7 @@ impl StorageEngine {
         audit_log: Keyspace,
         operator_grants: Keyspace,
         workload_status: Keyspace,
+        tenant_quotas: Keyspace,
     ) -> Self {
         Self {
             version,
@@ -86,6 +89,7 @@ impl StorageEngine {
             audit_log,
             operator_grants,
             workload_status,
+            tenant_quotas,
         }
     }
 
@@ -408,5 +412,76 @@ impl StorageEngine {
             }
             None => Ok(None),
         }
+    }
+
+    // --- Tenant quota persistence ---
+
+    /// Get the quota for a tenant, if one is set.
+    pub fn get_tenant_quota(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<crate::raft::records::TenantQuotaRecord>, crate::storage::StorageError> {
+        match self
+            .tenant_quotas
+            .get(tenant_id.as_bytes())
+            .map_err(crate::storage::StorageError::Storage)?
+        {
+            Some(bytes) => {
+                let record: crate::raft::records::TenantQuotaRecord = postcard::from_bytes(&bytes)
+                    .map_err(crate::storage::StorageError::Serialization)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Compute current resource usage for a tenant.
+    ///
+    /// Returns `(total_cpu_millicores, total_memory_bytes, workload_count)`.
+    /// Iterates all workload specs for the tenant, decoding each to extract
+    /// resource requirements and replica counts.
+    pub fn compute_tenant_usage(
+        &self,
+        tenant_id: &str,
+    ) -> Result<(u64, u64, u32), crate::storage::StorageError> {
+        let mut total_cpu: u64 = 0;
+        let mut total_memory: u64 = 0;
+        let mut workload_count: u32 = 0;
+
+        for guard in self.workloads.prefix(Vec::<u8>::new()) {
+            let value = guard
+                .value()
+                .map_err(crate::storage::StorageError::Storage)?;
+            if let Ok(record) =
+                postcard::from_bytes::<crate::raft::records::WorkloadSpecRecord>(value.as_ref())
+            {
+                if record.tenant_id != tenant_id {
+                    continue;
+                }
+                workload_count += 1;
+                // Decode the workload spec to extract resource requirements.
+                if let Ok(spec) = fleetos_core::proto::workload::WorkloadSpec::decode(
+                    record.spec_bytes.as_slice(),
+                ) {
+                    let cpu_per_pod = spec
+                        .pod_spec
+                        .as_ref()
+                        .and_then(|ps| ps.resources.as_ref())
+                        .map(|r| r.vcpus as u64 * 1000) // vcpus → millicores
+                        .unwrap_or(0);
+                    let mem_per_pod = spec
+                        .pod_spec
+                        .as_ref()
+                        .and_then(|ps| ps.resources.as_ref())
+                        .map(|r| r.memory_mb as u64 * 1024 * 1024) // MB → bytes
+                        .unwrap_or(0);
+                    let total_replicas: u64 = spec.replicas.values().map(|&c| c as u64).sum();
+                    total_cpu += cpu_per_pod * total_replicas;
+                    total_memory += mem_per_pod * total_replicas;
+                }
+            }
+        }
+
+        Ok((total_cpu, total_memory, workload_count))
     }
 }

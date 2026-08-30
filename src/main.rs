@@ -196,6 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyspaces.audit_log.clone(),
         keyspaces.operator_grants.clone(),
         keyspaces.workload_status.clone(),
+        keyspaces.tenant_quotas.clone(),
     ));
 
     // JoinHandles for the gRPC listeners, awaited during graceful shutdown.

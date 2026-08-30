@@ -48,6 +48,10 @@ pub enum FleetosCommand {
     ScaleWorkload {
         record: records::WorkloadSpecRecord,
     },
+    /// Set or replace the resource quota for a tenant (CR-7).
+    SetTenantQuota {
+        record: records::TenantQuotaRecord,
+    },
     SubmitCronWorkload {
         record: records::CronWorkloadRecord,
         checkpoint: records::CronCheckpointRecord,

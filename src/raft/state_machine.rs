@@ -181,6 +181,15 @@ impl FjallStateMachine {
                 }
                 Ok(ChangeKind::SchedulingUpdate)
             }
+            FleetosCommand::SetTenantQuota { record } => {
+                let value = postcard::to_allocvec(record).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.tenant_quotas,
+                    record.tenant_id.as_bytes(),
+                    value.as_slice(),
+                );
+                Ok(ChangeKind::SchedulingUpdate)
+            }
             FleetosCommand::SubmitCronWorkload { record, checkpoint } => {
                 let key = format!("cron:{}:{}", record.tenant_id, record.cron_workload_id);
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
@@ -918,6 +927,7 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::RevokeOperatorAccess { .. } => "RevokeOperatorAccess",
         FleetosCommand::DeleteWorkload { .. } => "DeleteWorkload",
         FleetosCommand::ScaleWorkload { .. } => "ScaleWorkload",
+        FleetosCommand::SetTenantQuota { .. } => "SetTenantQuota",
     }
 }
 
