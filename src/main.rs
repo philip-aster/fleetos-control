@@ -502,6 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft_handle.raft.clone(),
         config.operators.clone(),
         config.svid.node_ttl_secs,
+        secret_store.clone(),
     );
 
     let dc_addr: std::net::SocketAddr = config.listeners.data_control.parse()?;

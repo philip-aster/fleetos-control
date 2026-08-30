@@ -124,6 +124,19 @@ pub enum FleetosCommand {
         record: records::SecretRecord,
         target_spiffe_id: String,
     },
+    /// Grant a SPIFFE ID access to an existing secret's ACL (atomic
+    /// read-modify-write in the state machine).
+    GrantSecretAccess {
+        tenant_id: String,
+        key: String,
+        spiffe_id: String,
+    },
+    /// Revoke a SPIFFE ID's access to an existing secret's ACL.
+    RevokeSecretAccess {
+        tenant_id: String,
+        key: String,
+        spiffe_id: String,
+    },
     // --- Scheduler / placement ---
     RecordOrdinalAssignment {
         record: crate::scheduler::ordinal::OrdinalAssignment,

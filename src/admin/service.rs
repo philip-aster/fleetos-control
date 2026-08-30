@@ -31,6 +31,7 @@ pub struct AdminServiceImpl {
     raft: Arc<openraft::Raft<FleetosRaftConfig>>,
     operators_config: crate::config::OperatorsConfig,
     node_ttl_secs: u64,
+    secret_store: Arc<crate::secrets::SecretStore>,
 }
 
 /// Admission hardening (G-12): identifiers must be DNS-label-shaped so they
@@ -69,6 +70,7 @@ impl AdminServiceImpl {
         raft: Arc<openraft::Raft<FleetosRaftConfig>>,
         operators_config: crate::config::OperatorsConfig,
         node_ttl_secs: u64,
+        secret_store: Arc<crate::secrets::SecretStore>,
     ) -> Self {
         Self {
             storage,
@@ -77,6 +79,7 @@ impl AdminServiceImpl {
             raft,
             operators_config,
             node_ttl_secs,
+            secret_store,
         }
     }
 
@@ -703,21 +706,153 @@ impl AdminService for AdminServiceImpl {
         request: Request<StoreSecretRequest>,
     ) -> Result<Response<SecretAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16/20"))
+        let tenant_id = request.get_ref().tenant_id.clone();
+        let key = request.get_ref().key.clone();
+        self.require_tenant_write(&request, &tenant_id)?;
+        let audit = self.build_audit_context(&request, &key);
+        let req = request.into_inner();
+
+        validate_identifier(&req.tenant_id, "tenant_id")?;
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("key cannot be empty"));
+        }
+        if req.value.is_empty() {
+            return Err(Status::invalid_argument("value cannot be empty"));
+        }
+        if req.authorized_spiffe_ids.is_empty() {
+            return Err(Status::invalid_argument(
+                "at least one authorized_spiffe_id is required",
+            ));
+        }
+
+        let mut authorized = Vec::new();
+        for s in &req.authorized_spiffe_ids {
+            let spiffe: SpiffeId = s.parse().map_err(|e| {
+                Status::invalid_argument(format!("invalid authorized_spiffe_id '{}': {}", s, e))
+            })?;
+            authorized.push(spiffe);
+        }
+
+        // Leader-side: envelope encryption + ACL construction (non-deterministic).
+        let (envelope_bytes, acl_bytes) = self
+            .secret_store
+            .prepare_secret(&req.key, &req.value, &authorized)
+            .map_err(|e| Status::internal(format!("failed to prepare secret: {}", e)))?;
+
+        let record = crate::raft::records::SecretRecord {
+            key: req.key.clone(),
+            envelope_bytes,
+            acl_bytes,
+        };
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::StoreSecret {
+                    record,
+                    target_spiffe_id: authorized[0].to_string(),
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(tenant_id = %req.tenant_id, key = %req.key, "secret stored via raft");
+        Ok(Response::new(SecretAck { accepted: true }))
     }
+
     async fn grant_secret_access(
         &self,
         request: Request<SecretAclChange>,
     ) -> Result<Response<SecretAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16/20"))
+        let tenant_id = request.get_ref().tenant_id.clone();
+        let key = request.get_ref().key.clone();
+        self.require_tenant_write(&request, &tenant_id)?;
+        let audit = self.build_audit_context(&request, &key);
+        let req = request.into_inner();
+
+        validate_identifier(&req.tenant_id, "tenant_id")?;
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("key cannot be empty"));
+        }
+        let _: SpiffeId = req
+            .spiffe_id
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("invalid spiffe_id: {}", e)))?;
+
+        // Verify the secret exists before proposing the ACL change.
+        let secret_key = format!("secret:{}", req.key);
+        let exists = self
+            .storage
+            .secrets
+            .get(secret_key.as_bytes())
+            .map_err(|e| Status::internal(format!("storage read failed: {}", e)))?
+            .is_some();
+        if !exists {
+            return Err(Status::not_found(format!("secret '{}' not found", req.key)));
+        }
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::GrantSecretAccess {
+                    tenant_id: req.tenant_id.clone(),
+                    key: req.key.clone(),
+                    spiffe_id: req.spiffe_id.clone(),
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(key = %req.key, spiffe_id = %req.spiffe_id, "secret access granted via raft");
+        Ok(Response::new(SecretAck { accepted: true }))
     }
+
     async fn revoke_secret_access(
         &self,
         request: Request<SecretAclChange>,
     ) -> Result<Response<SecretAck>, Status> {
         self.verify_caller(&request)?;
-        Err(Status::unimplemented("scheduled for Step 16/20"))
+        let tenant_id = request.get_ref().tenant_id.clone();
+        let key = request.get_ref().key.clone();
+        self.require_tenant_write(&request, &tenant_id)?;
+        let audit = self.build_audit_context(&request, &key);
+        let req = request.into_inner();
+
+        validate_identifier(&req.tenant_id, "tenant_id")?;
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("key cannot be empty"));
+        }
+        let _: SpiffeId = req
+            .spiffe_id
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("invalid spiffe_id: {}", e)))?;
+
+        let secret_key = format!("secret:{}", req.key);
+        let exists = self
+            .storage
+            .secrets
+            .get(secret_key.as_bytes())
+            .map_err(|e| Status::internal(format!("storage read failed: {}", e)))?
+            .is_some();
+        if !exists {
+            return Err(Status::not_found(format!("secret '{}' not found", req.key)));
+        }
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::RevokeSecretAccess {
+                    tenant_id: req.tenant_id.clone(),
+                    key: req.key.clone(),
+                    spiffe_id: req.spiffe_id.clone(),
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(key = %req.key, spiffe_id = %req.spiffe_id, "secret access revoked via raft");
+        Ok(Response::new(SecretAck { accepted: true }))
     }
     async fn request_delegated_key(
         &self,

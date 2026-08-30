@@ -512,6 +512,63 @@ impl FjallStateMachine {
                 })
             }
 
+            FleetosCommand::GrantSecretAccess {
+                tenant_id: _,
+                key,
+                spiffe_id,
+            } => {
+                let acl_key = format!("acl:{}", key);
+                let mut acl = match self
+                    .keyspaces
+                    .secrets
+                    .get(acl_key.as_bytes())
+                    .map_err(read_err)?
+                {
+                    Some(bytes) => postcard::from_bytes::<crate::secrets::acl::SecretAcl>(&bytes)
+                        .map_err(ser_err)?,
+                    None => crate::secrets::acl::SecretAcl::new(),
+                };
+                let spiffe = parse_spiffe(spiffe_id)?;
+                acl.grant(key, &spiffe);
+                let acl_bytes = postcard::to_allocvec(&acl).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.secrets,
+                    acl_key.as_bytes(),
+                    acl_bytes.as_slice(),
+                );
+                Ok(ChangeKind::SecretRotation {
+                    target_spiffe_id: spiffe_id.clone(),
+                })
+            }
+            FleetosCommand::RevokeSecretAccess {
+                tenant_id: _,
+                key,
+                spiffe_id,
+            } => {
+                let acl_key = format!("acl:{}", key);
+                let mut acl = match self
+                    .keyspaces
+                    .secrets
+                    .get(acl_key.as_bytes())
+                    .map_err(read_err)?
+                {
+                    Some(bytes) => postcard::from_bytes::<crate::secrets::acl::SecretAcl>(&bytes)
+                        .map_err(ser_err)?,
+                    None => crate::secrets::acl::SecretAcl::new(),
+                };
+                let spiffe = parse_spiffe(spiffe_id)?;
+                acl.revoke(key, &spiffe);
+                let acl_bytes = postcard::to_allocvec(&acl).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.secrets,
+                    acl_key.as_bytes(),
+                    acl_bytes.as_slice(),
+                );
+                Ok(ChangeKind::SecretRotation {
+                    target_spiffe_id: spiffe_id.clone(),
+                })
+            }
+
             // --- Scheduler / placement ---
             FleetosCommand::RecordOrdinalAssignment { record } => {
                 let key = format!(
@@ -847,6 +904,8 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::AllocateTenantBlock { .. } => "AllocateTenantBlock",
         FleetosCommand::AllocateServiceAddress { .. } => "AllocateServiceAddress",
         FleetosCommand::StoreSecret { .. } => "StoreSecret",
+        FleetosCommand::GrantSecretAccess { .. } => "GrantSecretAccess",
+        FleetosCommand::RevokeSecretAccess { .. } => "RevokeSecretAccess",
         FleetosCommand::RecordOrdinalAssignment { .. } => "RecordOrdinalAssignment",
         FleetosCommand::CommitPlacement { .. } => "CommitPlacement",
         FleetosCommand::RemovePlacement { .. } => "RemovePlacement",

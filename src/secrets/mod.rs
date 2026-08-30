@@ -136,6 +136,29 @@ impl SecretStore {
         crypto::decrypt_at_rest(&envelope, self.master_key.as_ref())
     }
 
+    /// Prepare a secret for storage: encrypt at rest and build the ACL.
+    ///
+    /// Returns `(envelope_bytes, acl_bytes)` ready to be proposed via Raft.
+    /// Does NOT write to disk — the caller proposes via Raft and the state
+    /// machine persists. This keeps envelope encryption (non-deterministic)
+    /// on the leader, preserving the atomic-apply invariant.
+    pub fn prepare_secret(
+        &self,
+        secret_key: &str,
+        plaintext: &[u8],
+        authorized: &[SpiffeId],
+    ) -> Result<(Vec<u8>, Vec<u8>), SecretError> {
+        let envelope = crypto::encrypt_at_rest(plaintext, self.master_key.as_ref())?;
+        let envelope_bytes =
+            postcard::to_allocvec(&envelope).map_err(SecretError::Serialization)?;
+        let mut acl = acl::SecretAcl::new();
+        for spiffe_id in authorized {
+            acl.grant(secret_key, spiffe_id);
+        }
+        let acl_bytes = postcard::to_allocvec(&acl).map_err(SecretError::Serialization)?;
+        Ok((envelope_bytes, acl_bytes))
+    }
+
     fn load_acl(&self, secret_key: &str) -> Result<acl::SecretAcl, SecretError> {
         let key = format!("{}{}", ACL_KEY_PREFIX, secret_key);
         match self
