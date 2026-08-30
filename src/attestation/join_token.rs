@@ -17,7 +17,7 @@ use rand::Rng;
 /// Length of join tokens in bytes (256 bits).
 const TOKEN_LENGTH: usize = 32;
 
-/// Default join-token TTL: 24 hours (Master findings M-2/S-11).
+/// Default join-token TTL: 1 hour (Master findings M-2/S-11).
 ///
 /// Until hardware-quote signature verification lands, possession of a join
 /// token is the SOLE gate to cluster membership. Tokens must therefore be
@@ -88,6 +88,29 @@ impl JoinTokenStore {
             expires_at: Some(now + self.ttl_secs as i64),
             consumed: false,
         })
+    }
+
+    /// Validate a join token WITHOUT consuming it. Consumption is performed
+    /// by the Raft state machine (`FleetosCommand::ConsumeJoinToken`) so
+    /// single-use is enforced cluster-wide, not node-locally (V-2).
+    pub fn validate_only(&self, token: &[u8]) -> Result<JoinTokenRecord, AttestationError> {
+        let bytes = self
+            .keyspace
+            .get(token)
+            .map_err(|e| AttestationError::Storage(crate::storage::StorageError::Storage(e)))?
+            .ok_or(AttestationError::JoinTokenNotFound)?;
+        let record: JoinTokenRecord =
+            postcard::from_bytes(&bytes).map_err(AttestationError::Serialization)?;
+        if record.consumed {
+            return Err(AttestationError::JoinTokenAlreadyUsed);
+        }
+        if let Some(expires_at) = record.expires_at {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            if now > expires_at {
+                return Err(AttestationError::JoinToken("token expired".to_owned()));
+            }
+        }
+        Ok(record)
     }
 
     /// Validate and consume a join token (strict single-use).

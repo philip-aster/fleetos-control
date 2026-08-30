@@ -21,8 +21,10 @@ use fleetos_control::controllers::{
 use fleetos_control::dummy_ip::allocator::DummyIpAllocator;
 use fleetos_control::provisioning::control_pool::ControlPoolManager;
 use fleetos_control::raft::raft_proto::raft_transport_server::RaftTransportServer;
+use fleetos_control::raft::records::ControlNodeAddressRecord;
 use fleetos_control::raft::state_machine::FjallStateMachine;
 use fleetos_control::raft::store::FjallLogStorage;
+use fleetos_control::raft::{AuditedCommand, FleetosCommand};
 use fleetos_control::raft::{RaftHandle, network::TonicRaftNetworkFactory};
 use fleetos_control::scheduler::OrdinalTracker;
 use fleetos_control::secrets::SecretStore;
@@ -361,12 +363,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .clone()
             .expect("join_raft_target validated in init_raft_cluster");
         let our_raft_addr = config.listeners.raft.clone();
+        let our_dc_addr = config.listeners.data_control.clone();
         let node_id = info.node_id;
         tokio::spawn(async move {
             match fleetos_control::join::request_membership(
                 &join_raft_target,
                 node_id,
                 &our_raft_addr,
+                &our_dc_addr,
             )
             .await
             {
@@ -483,6 +487,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pcr_store,
             keyspaces.nonce_claims.clone(),
             keyspaces.svid_grants.clone(),
+            raft_handle.raft.clone(),
+            keyspaces.control_addresses.clone(),
         );
 
     // CaService is only available when the local CA is loaded.
@@ -1165,6 +1171,21 @@ async fn init_raft_cluster(
                 Box::<dyn std::error::Error>::from(format!("raft bootstrap failed: {}", e))
             })?;
             tracing::info!("raft cluster bootstrapped");
+            // V-2: register each initial member's DC address so followers
+            // can redirect joiners to the leader's Data/Control listener.
+            for m in &config.cluster.initial_members {
+                let _ = raft
+                    .client_write(AuditedCommand::system(
+                        FleetosCommand::RegisterControlAddress {
+                            record: ControlNodeAddressRecord {
+                                node_id: m.id,
+                                dc_addr: m.dc_address.clone(),
+                                raft_addr: m.address.clone(),
+                            },
+                        },
+                    ))
+                    .await;
+            }
         }
         ClusterMode::Join => {
             // NOTE: we do NOT call raft.initialize() here for first-boot joins.

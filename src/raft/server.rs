@@ -147,6 +147,19 @@ impl RaftTransportService for RaftTransportServerImpl {
                 match self.raft.change_membership(change, false).await {
                     Ok(_) => {
                         tracing::info!(node_id = req.node_id, "joiner promoted to voter");
+                        // V-2: register the joiner's addresses (best-effort).
+                        let _ = self
+                            .raft
+                            .client_write(crate::raft::AuditedCommand::system(
+                                crate::raft::FleetosCommand::RegisterControlAddress {
+                                    record: crate::raft::records::ControlNodeAddressRecord {
+                                        node_id: req.node_id,
+                                        dc_addr: req.dc_address.clone(),
+                                        raft_addr: req.address.clone(),
+                                    },
+                                },
+                            ))
+                            .await;
                         JoinResponsePayload {
                             success: true,
                             leader_address: None,

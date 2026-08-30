@@ -32,6 +32,8 @@ pub enum JoinError {
     Membership(String),
     #[error("serialization error: {0}")]
     Serialization(#[from] postcard::Error),
+    #[error("redirect to leader: {0}")]
+    Redirect(String),
 }
 
 /// Result of a successful join attestation.
@@ -54,7 +56,24 @@ fn channel_addr(addr: &str) -> String {
     }
 }
 
+/// Extract a leader redirect address from a gRPC status, if present.
+fn leader_redirect(status: &tonic::Status) -> Option<String> {
+    if status.code() != tonic::Code::Unavailable {
+        return None;
+    }
+    status
+        .metadata()
+        .get("leader-dc-address")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+}
+
 /// Execute the full join flow against an existing control node.
+///
+/// Follows leader redirects: if `submit_quote` lands on a follower, the
+/// follower returns the leader's Data/Control address and we restart the
+/// attestation against the leader (V-2 leader-directed attestation).
 pub async fn join_cluster(
     join_target: &str,
     join_token: &str,
@@ -67,115 +86,127 @@ pub async fn join_cluster(
         "beginning join flow"
     );
 
-    // 1. Connect to join_target via plaintext gRPC (no mTLS yet — we have no SVID).
-    let channel = tonic::transport::Channel::from_shared(channel_addr(join_target))
-        .map_err(|e| JoinError::Connection(e.to_string()))?
-        .connect()
-        .await
-        .map_err(|e| JoinError::Connection(e.to_string()))?;
+    let mut target = channel_addr(join_target);
+    loop {
+        // 1. Connect (plaintext for the attestation leg — no SVID yet).
+        let channel = tonic::transport::Channel::from_shared(target.clone())
+            .map_err(|e| JoinError::Connection(e.to_string()))?
+            .connect()
+            .await
+            .map_err(|e| JoinError::Connection(e.to_string()))?;
 
-    // 2. RequestNonce — fresh attestation challenge.
-    let mut attestation_client = AttestationServiceClient::new(channel.clone());
-    let claimed_spiffe_id = format!("spiffe://{}/ns/system/control/{}", trust_domain, node_name);
-    let nonce = attestation_client
-        .request_nonce(NonceRequest {
-            claimed_spiffe_id: claimed_spiffe_id.clone(),
-        })
-        .await
-        .map_err(|e| JoinError::Attestation(e.to_string()))?
-        .into_inner()
-        .nonce;
+        let mut attestation_client = AttestationServiceClient::new(channel.clone());
+        let claimed_spiffe_id =
+            format!("spiffe://{}/ns/system/control/{}", trust_domain, node_name);
 
-    tracing::debug!(nonce_len = nonce.len(), "attestation nonce received");
+        // 2. RequestNonce — fresh attestation challenge.
+        let nonce = match attestation_client
+            .request_nonce(NonceRequest {
+                claimed_spiffe_id: claimed_spiffe_id.clone(),
+            })
+            .await
+        {
+            Ok(r) => r.into_inner().nonce,
+            Err(status) => {
+                if let Some(leader) = leader_redirect(&status) {
+                    tracing::info!(leader = %leader, "redirecting attestation to leader");
+                    target = channel_addr(&leader);
+                    continue;
+                }
+                return Err(JoinError::Attestation(status.to_string()));
+            }
+        };
+        tracing::debug!(nonce_len = nonce.len(), "attestation nonce received");
 
-    // 3. SubmitQuote — construct a TPM quote bound to the nonce. The server
-    //    deserializes it, extracts the nonce, and verifies it against the
-    //    NonceManager.
-    //
-    // SECURITY (Master findings M-2/S-11): the quote below is a STRUCTURAL
-    // PLACEHOLDER — zeroed quote/signature bytes. The server-side verifiers
-    // (attestation/tpm.rs, attestation/apple_se.rs) currently check structure
-    // and nonce binding only, not cryptographic signatures. Until real quote
-    // generation (client) and signature verification (server) land,
-    // control-plane join is gated by JOIN-TOKEN POSSESSION ALONE. Treat join
-    // tokens as high-value secrets: they are single-use and TTL-bounded
-    // (default 24h), but a leaked token yields a voter.
-    let tpm_quote = crate::attestation::tpm::TpmQuote {
-        quote_bytes: vec![0u8; 32],         // Placeholder TPM quote structure
-        signature: vec![0u8; 64],           // Placeholder signature
-        nonce: nonce.clone(),               // Bound to the issued nonce
-        pcr_selection: Vec::new(),          // No PCR values for control-plane join
-        attestation_key_pub: vec![0u8; 32], // Placeholder attestation key
-    };
-    let raw_quote = postcard::to_allocvec(&tpm_quote)
-        .map_err(|e| JoinError::Attestation(format!("quote serialization failed: {}", e)))?;
+        // 3. SubmitQuote — construct a TPM quote bound to the nonce.
+        //
+        // SECURITY (Master findings M-2/S-11): the quote below is a STRUCTURAL
+        // PLACEHOLDER — zeroed quote/signature bytes. The server-side verifiers
+        // (attestation/tpm.rs, attestation/apple_se.rs) currently check structure
+        // and nonce binding only, not cryptographic signatures. Until real quote
+        // generation (client) and signature verification (server) land,
+        // control-plane join is gated by JOIN-TOKEN POSSESSION ALONE. Treat join
+        // tokens as high-value secrets: they are single-use and TTL-bounded
+        // (default 1h), but a leaked token yields a voter.
+        let tpm_quote = crate::attestation::tpm::TpmQuote {
+            quote_bytes: vec![0u8; 32],         // Placeholder TPM quote structure
+            signature: vec![0u8; 64],           // Placeholder signature
+            nonce: nonce.clone(),               // Bound to the issued nonce
+            pcr_selection: Vec::new(),          // No PCR values for control-plane join
+            attestation_key_pub: vec![0u8; 32], // Placeholder attestation key
+        };
+        let raw_quote = postcard::to_allocvec(&tpm_quote)
+            .map_err(|e| JoinError::Attestation(format!("quote serialization failed: {}", e)))?;
+        let quote = AttestationQuote {
+            join_token: join_token.to_owned(),
+            quote_type: 0, // TPM
+            raw_quote,
+            ..Default::default()
+        };
 
-    let quote = AttestationQuote {
-        join_token: join_token.to_owned(),
-        quote_type: 0, // TPM
-        raw_quote,
-        ..Default::default()
-    };
-    let attested_identity = attestation_client
-        .submit_quote(quote)
-        .await
-        .map_err(|e| JoinError::Attestation(e.to_string()))?
-        .into_inner();
+        let attested_identity = match attestation_client.submit_quote(quote).await {
+            Ok(r) => r.into_inner(),
+            Err(status) => {
+                if let Some(leader) = leader_redirect(&status) {
+                    tracing::info!(leader = %leader, "redirecting attestation to leader");
+                    target = channel_addr(&leader);
+                    continue; // restart attestation against the leader
+                }
+                return Err(JoinError::Attestation(status.to_string()));
+            }
+        };
+        tracing::info!(
+            claimed_spiffe_id = %attested_identity.claimed_spiffe_id,
+            "attestation successful"
+        );
 
-    tracing::info!(
-        claimed_spiffe_id = %attested_identity.claimed_spiffe_id,
-        "attestation successful"
-    );
+        // 4. Generate keypair + CSR with the attested SPIFFE ID.
+        let csr_params = crate::ca::rcgen_impl::SvidParams {
+            spiffe_id: attested_identity.claimed_spiffe_id.clone(),
+            kind: crate::ca::rcgen_impl::SvidKind::Control,
+            role: None,
+            ordinal: None,
+            degraded: false,
+            ttl_secs: 3600,
+        };
+        let csr_bundle = crate::ca::rcgen_impl::build_csr(&csr_params)
+            .map_err(|e| JoinError::Csr(e.to_string()))?;
 
-    // 4. Generate keypair + CSR with the attested SPIFFE ID.
-    let csr_params = crate::ca::rcgen_impl::SvidParams {
-        spiffe_id: attested_identity.claimed_spiffe_id.clone(),
-        kind: crate::ca::rcgen_impl::SvidKind::Control,
-        role: None,
-        ordinal: None,
-        degraded: false,
-        ttl_secs: 3600,
-    };
-    let csr_bundle =
-        crate::ca::rcgen_impl::build_csr(&csr_params).map_err(|e| JoinError::Csr(e.to_string()))?;
+        // 5. SubmitCsr — get the signed SVID (same channel = leader).
+        let mut ca_client = CaServiceClient::new(channel.clone());
+        let svid_response = ca_client
+            .submit_csr(CsrRequest {
+                csr_der: csr_bundle.csr_der.clone(),
+            })
+            .await
+            .map_err(|e| JoinError::Svid(e.to_string()))?
+            .into_inner();
+        tracing::info!(cert_len = svid_response.cert_chain_der.len(), "SVID issued");
 
-    // 5. SubmitCsr — get the signed SVID.
-    let mut ca_client = CaServiceClient::new(channel.clone());
-    let svid_response = ca_client
-        .submit_csr(CsrRequest {
-            csr_der: csr_bundle.csr_der.clone(),
-        })
-        .await
-        .map_err(|e| JoinError::Svid(e.to_string()))?
-        .into_inner();
+        // 6. GetTrustBundle — root certs for mTLS validation.
+        let trust_bundle_response = ca_client
+            .get_trust_bundle(TrustBundleRequest {})
+            .await
+            .map_err(|e| JoinError::TrustBundle(e.to_string()))?
+            .into_inner();
+        let mut trust_bundle_pem = String::new();
+        for root_der in &trust_bundle_response.roots_der {
+            let pem = der_to_pem(root_der, "CERTIFICATE").map_err(JoinError::TrustBundle)?;
+            trust_bundle_pem.push_str(&pem);
+        }
+        tracing::info!(
+            trust_domain = %trust_bundle_response.trust_domain,
+            roots_count = trust_bundle_response.roots_der.len(),
+            "trust bundle retrieved"
+        );
 
-    tracing::info!(cert_len = svid_response.cert_chain_der.len(), "SVID issued");
-
-    // 6. GetTrustBundle — root certs for mTLS validation.
-    let trust_bundle_response = ca_client
-        .get_trust_bundle(TrustBundleRequest {})
-        .await
-        .map_err(|e| JoinError::TrustBundle(e.to_string()))?
-        .into_inner();
-
-    let mut trust_bundle_pem = String::new();
-    for root_der in &trust_bundle_response.roots_der {
-        let pem = der_to_pem(root_der, "CERTIFICATE").map_err(JoinError::TrustBundle)?;
-        trust_bundle_pem.push_str(&pem);
+        return Ok(JoinResult {
+            svid_cert_der: svid_response.cert_chain_der,
+            svid_key_der: csr_bundle.private_key.to_vec(),
+            trust_bundle_pem,
+            claimed_spiffe_id: attested_identity.claimed_spiffe_id,
+        });
     }
-
-    tracing::info!(
-        trust_domain = %trust_bundle_response.trust_domain,
-        roots_count = trust_bundle_response.roots_der.len(),
-        "trust bundle retrieved"
-    );
-
-    Ok(JoinResult {
-        svid_cert_der: svid_response.cert_chain_der,
-        svid_key_der: csr_bundle.private_key.to_vec(),
-        trust_bundle_pem,
-        claimed_spiffe_id: attested_identity.claimed_spiffe_id,
-    })
 }
 
 /// Request cluster membership: add as learner (blocking until caught up),
@@ -186,11 +217,13 @@ pub async fn request_membership(
     join_raft_target: &str,
     node_id: u64,
     our_raft_addr: &str,
+    our_dc_addr: &str,
 ) -> Result<(), JoinError> {
     let mut target = join_raft_target.to_owned();
     let payload = postcard::to_allocvec(&JoinRequestPayload {
         node_id,
         address: our_raft_addr.to_owned(),
+        dc_address: our_dc_addr.to_owned(),
     })?;
 
     loop {

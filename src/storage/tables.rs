@@ -39,3 +39,4 @@ pub const CRON_CHECKPOINT_KEYSPACE: &str = "app_cron_checkpoints";
 pub const OPERATOR_GRANT_KEYSPACE: &str = "app_operator_grants";
 pub const WORKLOAD_STATUS_KEYSPACE: &str = "app_workload_status";
 pub const TENANT_QUOTA_KEYSPACE: &str = "app_tenant_quotas";
+pub const CONTROL_ADDRESS_KEYSPACE: &str = "app_control_addresses";

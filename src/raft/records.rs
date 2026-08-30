@@ -170,3 +170,12 @@ pub struct TenantQuotaRecord {
     pub max_memory_bytes: u64,
     pub max_workloads: u32,
 }
+
+/// A control node's listener addresses, so any node can redirect a joiner
+/// to the current leader's Data/Control endpoint (V-2 leader-directed attestation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlNodeAddressRecord {
+    pub node_id: u64,
+    pub dc_addr: String,
+    pub raft_addr: String,
+}

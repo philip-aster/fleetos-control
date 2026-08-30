@@ -122,6 +122,9 @@ pub fn init_keyspaces(db: &Database) -> Result<Keyspaces, StorageError> {
         tenant_quotas: db
             .keyspace(tables::TENANT_QUOTA_KEYSPACE, opts)
             .map_err(StorageError::Open)?,
+        control_addresses: db
+            .keyspace(tables::CONTROL_ADDRESS_KEYSPACE, opts)
+            .map_err(StorageError::Open)?,
     })
 }
 
@@ -158,6 +161,7 @@ pub struct Keyspaces {
     pub operator_grants: fjall::Keyspace,
     pub workload_status: fjall::Keyspace,
     pub tenant_quotas: fjall::Keyspace,
+    pub control_addresses: fjall::Keyspace,
 }
 
 impl Keyspaces {
@@ -194,6 +198,8 @@ impl Keyspaces {
             (tables::OPERATOR_GRANT_KEYSPACE, &self.operator_grants),
             (tables::WORKLOAD_STATUS_KEYSPACE, &self.workload_status),
             (tables::TENANT_QUOTA_KEYSPACE, &self.tenant_quotas),
+            (tables::CRON_CHECKPOINT_KEYSPACE, &self.cron_checkpoints),
+            (tables::CONTROL_ADDRESS_KEYSPACE, &self.control_addresses),
         ]
     }
 }

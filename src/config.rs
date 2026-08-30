@@ -212,6 +212,9 @@ pub enum ClusterMode {
 pub struct RaftMemberConfig {
     pub id: u64,
     pub address: String,
+    /// The member's Data/Control listener address (V-2 leader-directed attestation).
+    #[serde(default)]
+    pub dc_address: String,
 }
 
 // ---------------------------------------------------------------------------

@@ -169,6 +169,11 @@ pub enum FleetosCommand {
         pool_id: String,
     },
 
+    /// Register a control node's listener addresses (V-2 leader-directed attestation).
+    RegisterControlAddress {
+        record: records::ControlNodeAddressRecord,
+    },
+
     // --- Operator JIT access (CR-8) ---
     GrantOperatorAccess {
         record: records::OperatorAccessGrantRecord,
@@ -221,6 +226,8 @@ pub struct JoinRequestPayload {
     pub node_id: u64,
     /// Address of the joiner's raft transport listener.
     pub address: String,
+    /// The joiner's Data/Control listener address (V-2).
+    pub dc_address: String,
 }
 
 /// Response payload for `RaftTransport.RequestJoin`.

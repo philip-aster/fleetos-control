@@ -20,6 +20,8 @@ pub struct AttestationServiceImpl {
     nonce_claims_keyspace: fjall::Keyspace,
     /// Single-use CSR issuance grants keyed by attested SPIFFE ID (M-3).
     svid_grants_keyspace: fjall::Keyspace,
+    raft: Arc<openraft::Raft<crate::raft::FleetosRaftConfig>>,
+    control_addresses: fjall::Keyspace,
 }
 
 impl AttestationServiceImpl {
@@ -29,6 +31,8 @@ impl AttestationServiceImpl {
         pcr_store: Arc<PcrPolicyStore>,
         nonce_claims_keyspace: fjall::Keyspace,
         svid_grants_keyspace: fjall::Keyspace,
+        raft: Arc<openraft::Raft<crate::raft::FleetosRaftConfig>>,
+        control_addresses: fjall::Keyspace,
     ) -> Self {
         Self {
             nonce_manager,
@@ -36,6 +40,8 @@ impl AttestationServiceImpl {
             pcr_store,
             nonce_claims_keyspace,
             svid_grants_keyspace,
+            raft,
+            control_addresses,
         }
     }
 
@@ -48,6 +54,32 @@ impl AttestationServiceImpl {
             .ok_or_else(|| Status::permission_denied("no claimed identity for this nonce"))?;
         String::from_utf8(claimed_bytes.to_vec())
             .map_err(|_| Status::internal("corrupt nonce claim".to_owned()))
+    }
+
+    /// Look up the Data/Control address of a control node by Raft node ID.
+    fn leader_dc_address(&self, leader_id: u64) -> Result<Option<String>, Status> {
+        match self
+            .control_addresses
+            .get(leader_id.to_be_bytes())
+            .map_err(|e| Status::internal(format!("address lookup failed: {}", e)))?
+        {
+            Some(bytes) => {
+                let rec: crate::raft::records::ControlNodeAddressRecord =
+                    postcard::from_bytes(&bytes)
+                        .map_err(|e| Status::internal(format!("corrupt address record: {}", e)))?;
+                Ok(Some(rec.dc_addr))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Build a gRPC status that tells the join client to retry against the leader.
+    fn redirect_to_leader(leader_addr: &str) -> Status {
+        let mut status = Status::unavailable("not the Raft leader; retry against the leader");
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(leader_addr) {
+            status.metadata_mut().insert("leader-dc-address", v);
+        }
+        status
     }
 }
 
@@ -95,9 +127,10 @@ impl AttestationService for AttestationServiceImpl {
         }
 
         let token_bytes = quote.join_token.as_bytes().to_vec();
+        // Read-only validation; removal happens in the Raft state machine.
         let token_record = self
             .join_token_store
-            .validate_and_consume(&token_bytes)
+            .validate_only(&token_bytes)
             .map_err(|e| {
                 Status::permission_denied(format!("join token validation failed: {}", e))
             })?;
@@ -184,6 +217,29 @@ impl AttestationService for AttestationServiceImpl {
                 )));
             }
         };
+
+        // Consume the join token through Raft (cluster-wide single use, V-2).
+        match self
+            .raft
+            .client_write(crate::raft::AuditedCommand::system(
+                crate::raft::FleetosCommand::ConsumeJoinToken { token: token_bytes },
+            ))
+            .await
+        {
+            Ok(_) => {}
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(fwd),
+            )) => {
+                let leader_id = fwd
+                    .leader_id
+                    .ok_or_else(|| Status::internal("forward response missing leader id"))?;
+                let leader_addr = self
+                    .leader_dc_address(leader_id)?
+                    .ok_or_else(|| Status::internal("leader DC address not registered"))?;
+                return Err(Self::redirect_to_leader(&leader_addr));
+            }
+            Err(e) => return Err(Status::internal(format!("token consumption failed: {}", e))),
+        }
 
         // Clean up the nonce claim after successful verification.
         self.nonce_claims_keyspace
