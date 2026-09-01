@@ -181,6 +181,20 @@ pub enum FleetosCommand {
     RevokeOperatorAccess {
         grant_id: String,
     },
+
+    /// Register a node Endorsement Key for secure attestation (CR-10).
+    RegisterNodeEk {
+        record: records::NodeEkRecord,
+    },
+    /// Transition an EK registration Pending → Joined and bind the node id.
+    ActivateNodeEk {
+        ek_fingerprint: String,
+        node_id: String,
+    },
+    /// Revoke an EK registration.
+    RevokeNodeEk {
+        ek_fingerprint: String,
+    },
 }
 
 /// Wraps a `FleetosCommand` with optional audit context so the audit record

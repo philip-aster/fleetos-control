@@ -68,6 +68,7 @@ impl FjallStateMachine {
                 );
                 Ok(ChangeKind::SchedulingUpdate)
             }
+
             FleetosCommand::DeleteTenant { tenant_id } => {
                 batch.remove(&self.keyspaces.tenants, tenant_id.as_bytes());
                 Ok(ChangeKind::SchedulingUpdate)
@@ -120,6 +121,7 @@ impl FjallStateMachine {
                 }
                 Ok(ChangeKind::SchedulingUpdate)
             }
+
             FleetosCommand::ScaleWorkload { record } => {
                 // 1. Replace the stored spec with the updated one.
                 let key = format!("{}:{}", record.tenant_id, record.workload_id);
@@ -181,6 +183,7 @@ impl FjallStateMachine {
                 }
                 Ok(ChangeKind::SchedulingUpdate)
             }
+
             FleetosCommand::SetTenantQuota { record } => {
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
                 batch.insert(
@@ -190,6 +193,7 @@ impl FjallStateMachine {
                 );
                 Ok(ChangeKind::SchedulingUpdate)
             }
+
             FleetosCommand::RegisterControlAddress { record } => {
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
                 batch.insert(
@@ -199,6 +203,61 @@ impl FjallStateMachine {
                 );
                 Ok(ChangeKind::ClusterMembership)
             }
+
+            FleetosCommand::RegisterNodeEk { record } => {
+                let value = postcard::to_allocvec(record).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.node_eks,
+                    record.ek_fingerprint.as_bytes(),
+                    value.as_slice(),
+                );
+                Ok(ChangeKind::ClusterMembership)
+            }
+
+            FleetosCommand::ActivateNodeEk {
+                ek_fingerprint,
+                node_id,
+            } => {
+                if let Some(bytes) = self
+                    .keyspaces
+                    .node_eks
+                    .get(ek_fingerprint.as_bytes())
+                    .map_err(read_err)?
+                {
+                    let mut record: records::NodeEkRecord =
+                        postcard::from_bytes(&bytes).map_err(ser_err)?;
+                    record.state = records::EkRegistrationState::Joined;
+                    record.node_id = node_id.clone();
+                    let value = postcard::to_allocvec(&record).map_err(ser_err)?;
+                    batch.insert(
+                        &self.keyspaces.node_eks,
+                        ek_fingerprint.as_bytes(),
+                        value.as_slice(),
+                    );
+                }
+                Ok(ChangeKind::ClusterMembership)
+            }
+
+            FleetosCommand::RevokeNodeEk { ek_fingerprint } => {
+                if let Some(bytes) = self
+                    .keyspaces
+                    .node_eks
+                    .get(ek_fingerprint.as_bytes())
+                    .map_err(read_err)?
+                {
+                    let mut record: records::NodeEkRecord =
+                        postcard::from_bytes(&bytes).map_err(ser_err)?;
+                    record.state = records::EkRegistrationState::Revoked;
+                    let value = postcard::to_allocvec(&record).map_err(ser_err)?;
+                    batch.insert(
+                        &self.keyspaces.node_eks,
+                        ek_fingerprint.as_bytes(),
+                        value.as_slice(),
+                    );
+                }
+                Ok(ChangeKind::ClusterMembership)
+            }
+
             FleetosCommand::SubmitCronWorkload { record, checkpoint } => {
                 let key = format!("cron:{}:{}", record.tenant_id, record.cron_workload_id);
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
@@ -938,6 +997,9 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::ScaleWorkload { .. } => "ScaleWorkload",
         FleetosCommand::SetTenantQuota { .. } => "SetTenantQuota",
         FleetosCommand::RegisterControlAddress { .. } => "RegisterControlAddress",
+        FleetosCommand::RegisterNodeEk { .. } => "RegisterNodeEk",
+        FleetosCommand::ActivateNodeEk { .. } => "ActivateNodeEk",
+        FleetosCommand::RevokeNodeEk { .. } => "RevokeNodeEk",
     }
 }
 

@@ -3,12 +3,24 @@
 use super::join_token::JoinTokenStore;
 use super::nonce::NonceManager;
 use super::pcr_policy::PcrPolicyStore;
-use fleetos_core::proto::identity::AttestationService;
 use fleetos_core::proto::identity::{
-    AttestationQuote, AttestedIdentity, NonceRequest, NonceResponse,
+    ActivationChallenge, ActivationProof, ActivationRequest, AttestationQuote, AttestationService,
+    AttestedIdentity, NonceRequest, NonceResponse, SvidResponse,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
+
+/// Node-local pending activation state for secure attestation (CR-10).
+/// Keyed by server_nonce. NOT replicated — transient, per-connection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PendingActivationRecord {
+    ek_fingerprint: String,
+    ak_pub: Vec<u8>,
+    server_nonce: Vec<u8>,
+    secret: Vec<u8>,
+    created_at: i64,
+    expires_at: i64,
+}
 
 /// The AttestationService gRPC implementation.
 pub struct AttestationServiceImpl {
@@ -22,6 +34,10 @@ pub struct AttestationServiceImpl {
     svid_grants_keyspace: fjall::Keyspace,
     raft: Arc<openraft::Raft<crate::raft::FleetosRaftConfig>>,
     control_addresses: fjall::Keyspace,
+    node_eks: fjall::Keyspace,
+    pending_activations: fjall::Keyspace,
+    data_control: Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>,
+    svid_ttl_secs: u64,
 }
 
 impl AttestationServiceImpl {
@@ -33,6 +49,10 @@ impl AttestationServiceImpl {
         svid_grants_keyspace: fjall::Keyspace,
         raft: Arc<openraft::Raft<crate::raft::FleetosRaftConfig>>,
         control_addresses: fjall::Keyspace,
+        node_eks: fjall::Keyspace,
+        pending_activations: fjall::Keyspace,
+        data_control: Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>,
+        svid_ttl_secs: u64,
     ) -> Self {
         Self {
             nonce_manager,
@@ -42,6 +62,10 @@ impl AttestationServiceImpl {
             svid_grants_keyspace,
             raft,
             control_addresses,
+            node_eks,
+            pending_activations,
+            data_control,
+            svid_ttl_secs,
         }
     }
 
@@ -277,6 +301,194 @@ impl AttestationService for AttestationServiceImpl {
             quote_type: quote.quote_type,
             pcr_digest: Vec::new(),
             verified_at_unix: now.unix_timestamp(),
+        }))
+    }
+
+    async fn request_activation(
+        &self,
+        request: Request<ActivationRequest>,
+    ) -> Result<Response<ActivationChallenge>, Status> {
+        let req = request.into_inner();
+
+        // Validate input.
+        if req.ak_pub.is_empty() {
+            return Err(Status::invalid_argument("ak_pub cannot be empty"));
+        }
+        if req.ek_cert_der.is_empty() && req.ek_pub.is_empty() {
+            return Err(Status::invalid_argument(
+                "either ek_cert_der or ek_pub must be provided",
+            ));
+        }
+
+        // Compute EK fingerprint — fleetos-core owns the convention (CR-11).
+        let fingerprint = if !req.ek_cert_der.is_empty() {
+            fleetos_core::attestation::EkFingerprint::of_ek_cert(&req.ek_cert_der).map_err(|e| {
+                Status::invalid_argument(format!("EK cert extraction failed: {}", e))
+            })?
+        } else {
+            fleetos_core::attestation::EkFingerprint::of_ek_pub(&req.ek_pub)
+        };
+        let fp_hex = fingerprint.to_hex();
+
+        // Look up EK registration — fail closed.
+        let ek_bytes = self
+            .node_eks
+            .get(fp_hex.as_bytes())
+            .map_err(|e| Status::internal(format!("EK lookup failed: {}", e)))?
+            .ok_or_else(|| Status::permission_denied("EK not registered"))?;
+
+        let ek_record: crate::raft::records::NodeEkRecord = postcard::from_bytes(&ek_bytes)
+            .map_err(|e| Status::internal(format!("corrupt EK record: {}", e)))?;
+
+        // Check state.
+        if ek_record.state == crate::raft::records::EkRegistrationState::Revoked {
+            return Err(Status::permission_denied(
+                "EK registration has been revoked",
+            ));
+        }
+
+        // Check TTL expiry.
+        if let Some(expires_at) = ek_record.expires_at {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            if now > expires_at {
+                return Err(Status::permission_denied("EK registration has expired"));
+            }
+        }
+
+        // TPM2_MakeCredential requires tss-esapi + TPM hardware.
+        // CR-10 security gate: the activation path is NOT production-enabled
+        // until TPM signature verification lands in attestation/tpm.rs.
+        // TODO: Generate server nonce + secret S, store PendingActivationRecord,
+        //       call TPM2_MakeCredential(ek_pub, ak_pub, S), return the blob.
+        Err(Status::unimplemented(
+            "TPM2_MakeCredential requires tss-esapi integration (not yet implemented). \
+             Secure attestation is not production-enabled until TPM verification lands.",
+        ))
+    }
+
+    async fn submit_activation_proof(
+        &self,
+        request: Request<ActivationProof>,
+    ) -> Result<Response<SvidResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.hmac.is_empty() {
+            return Err(Status::invalid_argument("hmac cannot be empty"));
+        }
+        if req.csr_der.is_empty() {
+            return Err(Status::invalid_argument("csr_der cannot be empty"));
+        }
+
+        // Find the matching pending activation by trying HMAC verification
+        // against each stored record. The number of pending activations is
+        // small (bounded by the nonce cap).
+        let mut matched: Option<PendingActivationRecord> = None;
+        let mut matched_nonce: Option<Vec<u8>> = None;
+        for guard in self.pending_activations.prefix(Vec::<u8>::new()) {
+            // FIX: use into_inner() to get both key and value without moving guard twice
+            let (key, value) = match guard.into_inner() {
+                Ok(kv) => kv,
+                Err(e) => {
+                    tracing::warn!(error = %e, "pending activation read failed");
+                    continue;
+                }
+            };
+            if let Ok(record) = postcard::from_bytes::<PendingActivationRecord>(value.as_ref()) {
+                // Check expiry.
+                let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                if now > record.expires_at {
+                    continue;
+                }
+                // Verify HMAC(key=S, payload=server_nonce) using BLAKE3 keyed hash.
+                let expected = blake3::keyed_hash(
+                    record
+                        .secret
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Status::internal("invalid secret length"))?,
+                    &record.server_nonce,
+                );
+                if expected.as_bytes() == req.hmac.as_slice() {
+                    matched = Some(record);
+                    matched_nonce = Some(key.to_vec());
+                    break;
+                }
+            }
+        }
+
+        let record = matched.ok_or_else(|| {
+            Status::permission_denied("no matching pending activation for this HMAC proof")
+        })?;
+
+        // Consume the pending activation (single-use).
+        if let Some(nonce_key) = matched_nonce {
+            let _ = self.pending_activations.remove(nonce_key.as_slice());
+        }
+
+        // Verify PCR quote — structural placeholder.
+        // TODO: Implement real TPM quote signature verification using tss-esapi.
+        // Until then, this is a structural check only (nonce binding + non-empty).
+        if req.quote.is_empty() {
+            return Err(Status::invalid_argument("quote cannot be empty"));
+        }
+        if req.quote_signature.is_empty() {
+            return Err(Status::invalid_argument("quote_signature cannot be empty"));
+        }
+
+        // Extract SPIFFE ID from the CSR.
+        // Extract SPIFFE ID from the CSR.
+        let spiffe_id = crate::ca::rcgen_impl::extract_spiffe_id_from_csr(&req.csr_der)
+            .map_err(|e| Status::invalid_argument(format!("CSR validation failed: {}", e)))?;
+
+        // Sign the CSR using the Data/Control CA.
+        // FIX: Scope the read lock so the RwLockReadGuard is dropped BEFORE the .await
+        let cert_der = {
+            let bundle = self.data_control.read();
+            crate::ca::rcgen_impl::sign_csr(
+                &req.csr_der,
+                &bundle.current_key,
+                &bundle.current_cert_der,
+                self.svid_ttl_secs,
+            )
+            .map_err(|e| Status::internal(format!("CSR signing failed: {}", e)))?
+        }; // bundle dropped here
+
+        // Propose ActivateNodeEk via Raft (Pending → Joined).
+        match self
+            .raft
+            .client_write(crate::raft::AuditedCommand::system(
+                crate::raft::FleetosCommand::ActivateNodeEk {
+                    ek_fingerprint: record.ek_fingerprint.clone(),
+                    node_id: spiffe_id.clone(),
+                },
+            ))
+            .await
+        {
+            Ok(_) => {}
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(fwd),
+            )) => {
+                let leader_id = fwd
+                    .leader_id
+                    .ok_or_else(|| Status::internal("forward response missing leader id"))?;
+                let leader_addr = self
+                    .leader_dc_address(leader_id)?
+                    .ok_or_else(|| Status::internal("leader DC address not registered"))?;
+                return Err(Self::redirect_to_leader(&leader_addr));
+            }
+            Err(e) => return Err(Status::internal(format!("node activation failed: {}", e))),
+        }
+
+        tracing::info!(
+            ek_fingerprint = %record.ek_fingerprint,
+            spiffe_id = %spiffe_id,
+            "secure attestation complete, node activated"
+        );
+
+        Ok(Response::new(SvidResponse {
+            cert_chain_der: cert_der,
+            keypair_der: Vec::new(), // Node holds its own private key (CR-10).
+            svid_version: 1,
         }))
     }
 }

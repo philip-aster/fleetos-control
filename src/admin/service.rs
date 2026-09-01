@@ -8,14 +8,13 @@ use crate::controllers::cron_controller::CronController;
 use crate::dummy_ip::allocator::DummyIpAllocator;
 use crate::raft::FleetosRaftConfig;
 use crate::storage::StorageEngine;
-use fleetos_core::proto::admin::AdminService;
-use fleetos_core::proto::admin::ClusterStatus;
 use fleetos_core::proto::admin::{
-    CreateTenantRequest, CreateTenantResponse, DelegatedKeyRequest, DelegatedKeyResponse,
-    DeleteSagRuleRequest, DeleteWorkloadRequest, GenerateJoinTokenRequest,
+    AdminService, ClusterStatus, CreateTenantRequest, CreateTenantResponse, DelegatedKeyRequest,
+    DelegatedKeyResponse, DeleteSagRuleRequest, DeleteWorkloadRequest, GenerateJoinTokenRequest,
     GenerateJoinTokenResponse, GetClusterStatusRequest, ListNodesRequest, ListNodesResponse,
-    NodeAck, NodeId, QuotaAck, QuotaRequest, QuotaResponse, SagRuleAck, ScaleWorkloadRequest,
-    SecretAck, SecretAclChange, StoreSecretRequest, UpsertSagRuleRequest, WorkloadSpecAck,
+    NodeAck, NodeId, QuotaAck, QuotaRequest, QuotaResponse, RegisterNodeEkRequest,
+    RegisterNodeEkResponse, RevokeNodeEkRequest, SagRuleAck, ScaleWorkloadRequest, SecretAck,
+    SecretAclChange, StoreSecretRequest, UpsertSagRuleRequest, WorkloadSpecAck,
 };
 use fleetos_core::proto::workload::{CronWorkload, WorkloadSpec};
 use fleetos_core::spiffe::SpiffeId;
@@ -34,6 +33,7 @@ pub struct AdminServiceImpl {
     secret_store: Arc<crate::secrets::SecretStore>,
     ca_data_control: Option<Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>>,
     delegated_key_ttl_secs: u64,
+    node_eks: fjall::Keyspace,
 }
 
 /// Admission hardening (G-12): identifiers must be DNS-label-shaped so they
@@ -75,6 +75,7 @@ impl AdminServiceImpl {
         secret_store: Arc<crate::secrets::SecretStore>,
         ca_data_control: Option<Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>>,
         delegated_key_ttl_secs: u64,
+        node_eks: fjall::Keyspace,
     ) -> Self {
         Self {
             storage,
@@ -86,6 +87,7 @@ impl AdminServiceImpl {
             secret_store,
             ca_data_control,
             delegated_key_ttl_secs,
+            node_eks,
         }
     }
 
@@ -1453,6 +1455,130 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(
             fleetos_core::proto::admin::ListAuditLogResponse { entries },
         ))
+    }
+
+    async fn register_node_ek(
+        &self,
+        request: Request<RegisterNodeEkRequest>,
+    ) -> Result<Response<RegisterNodeEkResponse>, Status> {
+        self.verify_caller(&request)?;
+        self.require_cluster_admin_write(&request)?;
+
+        // FIX: Extract audit context BEFORE consuming the request
+        let mut audit = self.build_audit_context(&request, "register_node_ek");
+
+        // NOW consume the request
+        let req = request.into_inner();
+
+        // Validate: at least one of ek_cert_der or ek_pub must be present.
+        if req.ek_cert_der.is_empty() && req.ek_pub.is_empty() {
+            return Err(Status::invalid_argument(
+                "either ek_cert_der or ek_pub must be provided",
+            ));
+        }
+
+        // Compute EK fingerprint — fleetos-core owns the convention (CR-11).
+        let fingerprint = if !req.ek_cert_der.is_empty() {
+            fleetos_core::attestation::EkFingerprint::of_ek_cert(&req.ek_cert_der).map_err(|e| {
+                Status::invalid_argument(format!("EK cert extraction failed: {}", e))
+            })?
+        } else {
+            fleetos_core::attestation::EkFingerprint::of_ek_pub(&req.ek_pub)
+        };
+        let fp_hex = fingerprint.to_hex();
+
+        // Update the audit target now that we have the computed fingerprint
+        audit.target = fp_hex.clone();
+
+        // Idempotency guard: reject if already registered.
+        let existing = self
+            .node_eks
+            .get(fp_hex.as_bytes())
+            .map_err(|e| Status::internal(format!("EK lookup failed: {}", e)))?;
+        if existing.is_some() {
+            return Err(Status::already_exists(format!(
+                "EK '{}' is already registered",
+                fp_hex
+            )));
+        }
+
+        // Compute TTL: 0 = use configured default (1 hour).
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let ttl = if req.ttl_secs == 0 {
+            3600
+        } else {
+            req.ttl_secs as i64
+        };
+
+        let record = crate::raft::records::NodeEkRecord {
+            ek_fingerprint: fp_hex.clone(),
+            ek_pub: req.ek_pub.clone(),
+            ek_cert_der: req.ek_cert_der.clone(),
+            node_id: req.node_id.clone(),
+            registered_at: now,
+            expires_at: Some(now + ttl),
+            state: crate::raft::records::EkRegistrationState::Pending,
+        };
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::RegisterNodeEk { record },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(ek_fingerprint = %fp_hex, "EK registered via raft");
+        Ok(Response::new(RegisterNodeEkResponse {
+            accepted: true,
+            ek_fingerprint: fp_hex,
+        }))
+    }
+
+    async fn revoke_node_ek(
+        &self,
+        request: Request<RevokeNodeEkRequest>,
+    ) -> Result<Response<NodeAck>, Status> {
+        self.verify_caller(&request)?;
+        self.require_cluster_admin_write(&request)?;
+
+        // FIX: Build audit context BEFORE consuming the request.
+        // We use get_ref() to peek at the payload without taking ownership.
+        let target_fp = request.get_ref().ek_fingerprint.clone();
+        let audit = self.build_audit_context(&request, &target_fp);
+
+        // NOW consume the request
+        let req = request.into_inner();
+
+        if req.ek_fingerprint.is_empty() {
+            return Err(Status::invalid_argument("ek_fingerprint cannot be empty"));
+        }
+
+        // Verify the EK exists before proposing revocation.
+        let exists = self
+            .node_eks
+            .get(req.ek_fingerprint.as_bytes())
+            .map_err(|e| Status::internal(format!("EK lookup failed: {}", e)))?
+            .is_some();
+        if !exists {
+            return Err(Status::not_found(format!(
+                "EK '{}' not found",
+                req.ek_fingerprint
+            )));
+        }
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::RevokeNodeEk {
+                    ek_fingerprint: req.ek_fingerprint.clone(),
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(ek_fingerprint = %req.ek_fingerprint, "EK revoked via raft");
+        Ok(Response::new(NodeAck { accepted: true }))
     }
 }
 

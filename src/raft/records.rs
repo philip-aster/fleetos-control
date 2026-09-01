@@ -179,3 +179,35 @@ pub struct ControlNodeAddressRecord {
     pub dc_addr: String,
     pub raft_addr: String,
 }
+
+/// Lifecycle state of an EK registration (secure attestation, CR-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EkRegistrationState {
+    /// EK registered, node has not yet completed attestation.
+    Pending,
+    /// Node attested and joined.
+    Joined,
+    /// EK revoked.
+    Revoked,
+}
+
+/// A registered node Endorsement Key (secure attestation, CR-10).
+///
+/// The EK is the cryptographic identity token. Registered out-of-band by an
+/// operator (AdminService.RegisterNodeEk), replicated via Raft, and matched
+/// when a node requests credential activation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeEkRecord {
+    /// Canonical id: lowercase hex of `EkFingerprint`. This is the storage key.
+    pub ek_fingerprint: String,
+    /// EK public key (SPKI DER, canonical form per CR-11).
+    pub ek_pub: Vec<u8>,
+    /// EK certificate (DER). Empty if registered by public key only.
+    pub ek_cert_der: Vec<u8>,
+    /// Optional pre-bound node SPIFFE ID. Empty until attestation binds it.
+    pub node_id: String,
+    pub registered_at: i64,
+    /// Optional expiry (unix seconds). None = no expiry.
+    pub expires_at: Option<i64>,
+    pub state: EkRegistrationState,
+}

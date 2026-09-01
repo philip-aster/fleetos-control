@@ -489,6 +489,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             keyspaces.svid_grants.clone(),
             raft_handle.raft.clone(),
             keyspaces.control_addresses.clone(),
+            keyspaces.node_eks.clone(),
+            keyspaces.pending_activations.clone(),
+            ca_service
+                .as_ref()
+                .map(|ca| ca.data_control.clone())
+                .expect("CA required for attestation service"),
+            config.svid.node_ttl_secs,
         );
 
     // CaService is only available when the local CA is loaded.
@@ -513,6 +520,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secret_store.clone(),
         ca_data_control,
         config.svid.delegated_key_ttl_secs,
+        keyspaces.node_eks.clone(),
     );
 
     let dc_addr: std::net::SocketAddr = config.listeners.data_control.parse()?;

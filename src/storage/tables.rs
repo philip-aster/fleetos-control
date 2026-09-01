@@ -40,3 +40,5 @@ pub const OPERATOR_GRANT_KEYSPACE: &str = "app_operator_grants";
 pub const WORKLOAD_STATUS_KEYSPACE: &str = "app_workload_status";
 pub const TENANT_QUOTA_KEYSPACE: &str = "app_tenant_quotas";
 pub const CONTROL_ADDRESS_KEYSPACE: &str = "app_control_addresses";
+pub const NODE_EK_KEYSPACE: &str = "app_node_eks";
+pub const PENDING_ACTIVATION_KEYSPACE: &str = "app_pending_activations";
