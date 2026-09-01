@@ -255,6 +255,35 @@ impl AttestationService for AttestationServiceImpl {
                 )));
             }
         };
+        // M-2(b): bind the claimed SPIFFE ID kind to the join token's node_kind.
+        // A join token minted for one node kind may only attest an identity of the
+        // matching kind. Secure mode supersedes this via EK binding (node_eks
+        // registry); this is defense-in-depth for the insecure/testing path.
+        let claimed_spiffe: fleetos_core::spiffe::SpiffeId =
+            claimed_spiffe_id.parse().map_err(|e| {
+                Status::invalid_argument(format!("claimed SPIFFE ID is malformed: {}", e))
+            })?;
+        let expected_kind = match token_record.node_kind {
+            crate::attestation::join_token::NodeKind::Agent => fleetos_core::spiffe::IdKind::Node,
+            crate::attestation::join_token::NodeKind::Router => {
+                fleetos_core::spiffe::IdKind::Router
+            }
+            crate::attestation::join_token::NodeKind::Gateway => {
+                fleetos_core::spiffe::IdKind::Gateway
+            }
+            crate::attestation::join_token::NodeKind::Control => {
+                fleetos_core::spiffe::IdKind::Control
+            }
+            crate::attestation::join_token::NodeKind::FleetctlProxy => {
+                fleetos_core::spiffe::IdKind::Ctrl
+            }
+        };
+        if claimed_spiffe.kind != expected_kind {
+            return Err(Status::permission_denied(format!(
+                "claimed SPIFFE ID kind '{:?}' does not match join token node_kind '{:?}'",
+                claimed_spiffe.kind, token_record.node_kind
+            )));
+        }
 
         // Consume the join token through Raft (cluster-wide single use, V-2).
         match self
