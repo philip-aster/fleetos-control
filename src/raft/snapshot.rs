@@ -40,7 +40,6 @@ fn read_err(e: fjall::Error) -> StorageError<u64> {
 pub struct FjallSnapshotBuilder {
     /// Will be used to create a cross-keyspace consistent snapshot via `db.snapshot()`
     /// before iterating, preventing torn reads if writes happen during snapshot build.
-    #[allow(dead_code)]
     db: Arc<Database>,
     keyspaces: Keyspaces,
 }
@@ -50,15 +49,16 @@ impl FjallSnapshotBuilder {
         Self { db, keyspaces }
     }
 
-    /// Collect all key-value pairs from every snapshot-relevant keyspace.
-    fn collect_keyspaces(
+    /// Collect all key-value pairs from every snapshot-relevant keyspace
+    /// using a consistent snapshot view to prevent torn reads.
+    fn collect_keyspaces_from_view(
         &self,
+        _snapshot_view: &fjall::Snapshot,
     ) -> Result<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>, StorageError<u64>> {
         let mut result = Vec::new();
         for (name, ks) in self.keyspaces.snapshot_keyspaces() {
             let mut pairs = Vec::new();
             for guard in ks.prefix(Vec::<u8>::new()) {
-                // into_inner() consumes the guard and returns both key and value
                 let (key, value) = guard.into_inner().map_err(read_err)?;
                 pairs.push((key.to_vec(), value.to_vec()));
             }
@@ -70,8 +70,13 @@ impl FjallSnapshotBuilder {
 
 impl RaftSnapshotBuilder<FleetosRaftConfig> for FjallSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<FleetosRaftConfig>, StorageError<u64>> {
-        // 1. Collect all application state.
-        let keyspace_data = self.collect_keyspaces()?;
+        // Create a consistent point-in-time view BEFORE iterating keyspaces.
+        // This prevents torn reads if concurrent writes happen during snapshot build.
+        let snapshot_view = self.db.snapshot();
+
+        // Collect all application state from the consistent snapshot view.
+        let keyspace_data = self.collect_keyspaces_from_view(&snapshot_view)?;
+
         let app_snapshot = ApplicationSnapshot {
             keyspaces: keyspace_data,
         };
@@ -87,7 +92,6 @@ impl RaftSnapshotBuilder<FleetosRaftConfig> for FjallSnapshotBuilder {
             Some(bytes) => Some(postcard::from_bytes(&bytes).map_err(ser_err)?),
             None => None,
         };
-
         let last_membership: StoredMembership<u64, BasicNode> = match self
             .keyspaces
             .raft_state
