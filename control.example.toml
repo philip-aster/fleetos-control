@@ -28,6 +28,13 @@ mode = "bootstrap"
 # For bootstrap mode: initial Raft membership (single node).
 # NOTE: address MUST be the raft transport address (listeners.raft),
 # not the Data/Control address.
+join_target = "10.0.1.1:9443"
+join_raft_target = "10.0.1.1:9445"
+join_token = ""
+# For join mode: path to the Data/Control root bundle PEM for the attestation TLS leg.
+# join_trust_bundle_path = "/etc/fleetos/dc-trust-bundle.pem"
+
+
 [[cluster.initial_members]]
 id = 1
 address = "10.0.1.1:9445"
@@ -87,6 +94,8 @@ master_key_path = "/var/lib/fleetos/master.key"
 # TTL for single-use join tokens (M-2 custody). Tokens are the sole gate to
 # cluster membership until hardware-quote verification lands, so they expire.
 join_token_ttl_secs = 3600
+# "insecure" = join-token only (testing). "secure" = TPM credential activation (production).
+mode = "insecure"
 
 # -----------------------------------------------------------------------------
 # gRPC listeners
