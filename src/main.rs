@@ -47,6 +47,9 @@ struct Cli {
 /// Everything main() needs from a first-boot join flow.
 struct JoinInfo {
     node_id: u64,
+    svid_cert_der: Vec<u8>,
+    svid_key_der: Vec<u8>,
+    trust_bundle_pem: String,
 }
 
 #[tokio::main]
@@ -364,13 +367,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("join_raft_target validated in init_raft_cluster");
         let our_raft_addr = config.listeners.raft.clone();
         let our_dc_addr = config.listeners.data_control.clone();
+        let trust_domain = config.trust_domains.data_control.clone();
         let node_id = info.node_id;
+        let svid_cert_der = info.svid_cert_der.clone();
+        let svid_key_der = info.svid_key_der.clone();
+        let trust_bundle_pem = info.trust_bundle_pem.clone();
         tokio::spawn(async move {
             match fleetos_control::join::request_membership(
                 &join_raft_target,
                 node_id,
                 &our_raft_addr,
                 &our_dc_addr,
+                &svid_cert_der,
+                &svid_key_der,
+                &trust_bundle_pem,
+                &trust_domain,
             )
             .await
             {
@@ -496,6 +507,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|ca| ca.data_control.clone())
                 .expect("CA required for attestation service"),
             config.svid.node_ttl_secs,
+            config.attestation.mode,
         );
 
     // CaService is only available when the local CA is loaded.
@@ -1098,11 +1110,29 @@ async fn init_raft_cluster(
                 }
             } else {
                 tracing::info!(join_target = %join_target, "join mode: attesting to existing cluster");
+                let join_trust_bundle_pem = config
+                    .cluster
+                    .join_trust_bundle_path
+                    .as_deref()
+                    .map(std::fs::read_to_string)
+                    .transpose()
+                    .map_err(|e| {
+                        Box::<dyn std::error::Error>::from(format!(
+                            "failed to read join_trust_bundle_path: {}",
+                            e
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        Box::<dyn std::error::Error>::from(
+                            "cluster.join_trust_bundle_path is required when mode = \"join\"",
+                        )
+                    })?;
                 let join_result = fleetos_control::join::join_cluster(
                     join_target,
                     &config.cluster.join_token,
                     &config.node.name,
                     &config.trust_domains.data_control,
+                    &join_trust_bundle_pem,
                 )
                 .await
                 .map_err(|e| {
@@ -1127,7 +1157,12 @@ async fn init_raft_cluster(
                     role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
                 };
 
-                join_info = Some(JoinInfo { node_id });
+                join_info = Some(JoinInfo {
+                    node_id,
+                    svid_cert_der: join_result.svid_cert_der.clone(),
+                    svid_key_der: join_result.svid_key_der.clone(),
+                    trust_bundle_pem: join_result.trust_bundle_pem.clone(),
+                });
                 mtls
             }
         }

@@ -267,6 +267,22 @@ pub fn derive_raft_node_id(handle: &str) -> u64 {
     ])
 }
 
+/// Connect a RaftTransportClient over TLS (used by the join membership leg).
+pub async fn connect_raft_client_tls(
+    endpoint: String,
+    tls_config: tonic::transport::ClientTlsConfig,
+) -> Result<RaftTransportClient<tonic::transport::Channel>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let channel = tonic::transport::Channel::from_shared(endpoint)
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?
+        .tls_config(tls_config)
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?
+        .connect()
+        .await
+        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+    Ok(RaftTransportClient::new(channel))
+}
+
 /// Shared handle to the running Raft node.
 #[derive(Clone)]
 pub struct RaftHandle {

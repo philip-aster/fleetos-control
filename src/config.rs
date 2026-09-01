@@ -194,6 +194,11 @@ pub struct ClusterConfig {
     #[serde(default)]
     pub join_token: String,
 
+    /// For `join` mode: path to a PEM file holding the Data/Control root
+    /// bundle. Trust anchor for the pre-SVID attestation TLS leg.
+    #[serde(default)]
+    pub join_trust_bundle_path: Option<String>,
+
     /// For `bootstrap` mode: initial single-node Raft cluster.
     /// Addresses MUST be raft transport addresses (listeners.raft).
     /// Ignored in join mode.
@@ -388,6 +393,16 @@ pub struct SecretsConfig {
 // ---------------------------------------------------------------------------
 // Attestation
 // ---------------------------------------------------------------------------
+/// Attestation mode: which join/attestation path the control plane accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttestationMode {
+    /// Join-token + structural-quote flow. TESTING ONLY.
+    Insecure,
+    /// TPM EK/AK credential-activation flow (CR-10). Production.
+    Secure,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttestationConfig {
     /// TTL for single-use join tokens (Master findings M-2/S-11).
@@ -396,14 +411,23 @@ pub struct AttestationConfig {
     /// expire. Default 1 hour.
     #[serde(default = "default_join_token_ttl_secs")]
     pub join_token_ttl_secs: u16,
+    /// Which attestation mode this control plane accepts.
+    /// Default `insecure` until the join client supports the secure leg.
+    #[serde(default = "default_attestation_mode")]
+    pub mode: AttestationMode,
 }
 
 impl Default for AttestationConfig {
     fn default() -> Self {
         Self {
             join_token_ttl_secs: default_join_token_ttl_secs(),
+            mode: default_attestation_mode(),
         }
     }
+}
+
+fn default_attestation_mode() -> AttestationMode {
+    AttestationMode::Insecure
 }
 
 fn default_join_token_ttl_secs() -> u16 {

@@ -7,7 +7,7 @@
 //! 2. `request_membership` — ask the cluster to add us as a learner (blocking
 //!    until we catch up) and promote us to voter, via the internal
 //!    `RaftTransport.RequestJoin` RPC. Follows leader redirects automatically.
-use crate::raft::{JoinRequestPayload, JoinResponsePayload, RaftRpc, RaftTransportClient};
+use crate::raft::{JoinRequestPayload, JoinResponsePayload, RaftRpc};
 use fleetos_core::proto::fleetos::attestation_service_client::AttestationServiceClient;
 use fleetos_core::proto::fleetos::ca_service_client::CaServiceClient;
 use fleetos_core::proto::identity::{
@@ -79,6 +79,7 @@ pub async fn join_cluster(
     join_token: &str,
     node_name: &str,
     trust_domain: &str,
+    join_trust_bundle_pem: &str,
 ) -> Result<JoinResult, JoinError> {
     tracing::info!(
         join_target = %join_target,
@@ -88,8 +89,16 @@ pub async fn join_cluster(
 
     let mut target = channel_addr(join_target);
     loop {
-        // 1. Connect (plaintext for the attestation leg — no SVID yet).
+        // Attestation leg: server-trust TLS (trust the DC root bundle,
+        // no client cert — the joiner is pre-SVID).
+        let tls_config = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(
+                join_trust_bundle_pem,
+            ))
+            .domain_name(trust_domain);
         let channel = tonic::transport::Channel::from_shared(target.clone())
+            .map_err(|e| JoinError::Connection(e.to_string()))?
+            .tls_config(tls_config)
             .map_err(|e| JoinError::Connection(e.to_string()))?
             .connect()
             .await
@@ -218,6 +227,10 @@ pub async fn request_membership(
     node_id: u64,
     our_raft_addr: &str,
     our_dc_addr: &str,
+    svid_cert_der: &[u8],
+    svid_key_der: &[u8],
+    trust_bundle_pem: &str,
+    trust_domain: &str,
 ) -> Result<(), JoinError> {
     let mut target = join_raft_target.to_owned();
     let payload = postcard::to_allocvec(&JoinRequestPayload {
@@ -226,8 +239,17 @@ pub async fn request_membership(
         dc_address: our_dc_addr.to_owned(),
     })?;
 
+    // Membership leg: full mTLS with the SVID from the attestation leg.
+    let cert_pem = der_to_pem(svid_cert_der, "CERTIFICATE").map_err(JoinError::Membership)?;
+    let key_pem = der_to_pem(svid_key_der, "PRIVATE KEY").map_err(JoinError::Membership)?;
+    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+
     loop {
-        match RaftTransportClient::connect(channel_addr(&target)).await {
+        let tls_config = tonic::transport::ClientTlsConfig::new()
+            .identity(identity.clone())
+            .ca_certificate(tonic::transport::Certificate::from_pem(trust_bundle_pem))
+            .domain_name(trust_domain);
+        match crate::raft::connect_raft_client_tls(channel_addr(&target), tls_config).await {
             Ok(mut client) => {
                 let rpc = RaftRpc {
                     sender_id: node_id,
@@ -261,6 +283,8 @@ pub async fn request_membership(
                 }
             }
             Err(e) => {
+                // Long-running RPC (blocking add_learner + snapshot transfer)
+                // can fail mid-way; safe to retry — add_learner is idempotent.
                 tracing::warn!(error = %e, target = %target, "cannot reach cluster, retrying");
             }
         }

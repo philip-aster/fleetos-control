@@ -38,6 +38,7 @@ pub struct AttestationServiceImpl {
     pending_activations: fjall::Keyspace,
     data_control: Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>,
     svid_ttl_secs: u64,
+    attestation_mode: crate::config::AttestationMode,
 }
 
 impl AttestationServiceImpl {
@@ -53,6 +54,7 @@ impl AttestationServiceImpl {
         pending_activations: fjall::Keyspace,
         data_control: Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>,
         svid_ttl_secs: u64,
+        attestation_mode: crate::config::AttestationMode,
     ) -> Self {
         Self {
             nonce_manager,
@@ -66,6 +68,7 @@ impl AttestationServiceImpl {
             pending_activations,
             data_control,
             svid_ttl_secs,
+            attestation_mode,
         }
     }
 
@@ -113,6 +116,11 @@ impl AttestationService for AttestationServiceImpl {
         &self,
         request: Request<NonceRequest>,
     ) -> Result<Response<NonceResponse>, Status> {
+        if self.attestation_mode == crate::config::AttestationMode::Secure {
+            return Err(Status::permission_denied(
+                "insecure (join-token) attestation is disabled in secure mode",
+            ));
+        }
         let req = request.into_inner();
         if req.claimed_spiffe_id.is_empty() {
             return Err(Status::invalid_argument(
@@ -142,6 +150,12 @@ impl AttestationService for AttestationServiceImpl {
         &self,
         request: Request<AttestationQuote>,
     ) -> Result<Response<AttestedIdentity>, Status> {
+        if self.attestation_mode == crate::config::AttestationMode::Secure {
+            return Err(Status::permission_denied(
+                "insecure (join-token) attestation is disabled in secure mode",
+            ));
+        }
+
         let quote = request.into_inner();
 
         if quote.join_token.is_empty() {
@@ -308,6 +322,12 @@ impl AttestationService for AttestationServiceImpl {
         &self,
         request: Request<ActivationRequest>,
     ) -> Result<Response<ActivationChallenge>, Status> {
+        if self.attestation_mode == crate::config::AttestationMode::Insecure {
+            return Err(Status::permission_denied(
+                "secure (credential-activation) attestation is disabled in insecure mode",
+            ));
+        }
+
         let req = request.into_inner();
 
         // Validate input.
@@ -370,6 +390,12 @@ impl AttestationService for AttestationServiceImpl {
         &self,
         request: Request<ActivationProof>,
     ) -> Result<Response<SvidResponse>, Status> {
+        if self.attestation_mode == crate::config::AttestationMode::Insecure {
+            return Err(Status::permission_denied(
+                "secure (credential-activation) attestation is disabled in insecure mode",
+            ));
+        }
+
         let req = request.into_inner();
 
         if req.hmac.is_empty() {
