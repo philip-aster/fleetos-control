@@ -185,30 +185,4 @@ impl ProvisioningReconciler {
 
         Ok(records)
     }
-
-    /// Store a node pool record in the `node_pools` keyspace.
-    ///
-    /// Key: `pool_id` bytes. Value: postcard-serialized `NodePoolRecord`.
-    pub fn store_pool(&self, record: &NodePoolRecord) -> Result<(), ProvisioningError> {
-        let serialized = postcard::to_allocvec(record).map_err(ProvisioningError::Serialization)?;
-
-        self.storage
-            .node_pools
-            .insert(record.pool_id.as_bytes(), serialized.as_slice())
-            .map_err(|e| ProvisioningError::Storage(crate::storage::StorageError::Storage(e)))?;
-
-        tracing::info!(pool_id = %record.pool_id, "node pool stored");
-        Ok(())
-    }
-
-    /// Delete a node pool record from the `node_pools` keyspace.
-    pub fn delete_pool(&self, pool_id: &str) -> Result<(), ProvisioningError> {
-        self.storage
-            .node_pools
-            .remove(pool_id.as_bytes())
-            .map_err(|e| ProvisioningError::Storage(crate::storage::StorageError::Storage(e)))?;
-
-        tracing::info!(pool_id = %pool_id, "node pool deleted");
-        Ok(())
-    }
 }

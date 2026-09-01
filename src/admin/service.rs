@@ -11,10 +11,12 @@ use crate::storage::StorageEngine;
 use fleetos_core::proto::admin::{
     AdminService, ClusterStatus, CreateTenantRequest, CreateTenantResponse, DelegatedKeyRequest,
     DelegatedKeyResponse, DeleteSagRuleRequest, DeleteWorkloadRequest, GenerateJoinTokenRequest,
-    GenerateJoinTokenResponse, GetClusterStatusRequest, ListNodesRequest, ListNodesResponse,
-    NodeAck, NodeId, QuotaAck, QuotaRequest, QuotaResponse, RegisterNodeEkRequest,
-    RegisterNodeEkResponse, RevokeNodeEkRequest, SagRuleAck, ScaleWorkloadRequest, SecretAck,
-    SecretAclChange, StoreSecretRequest, UpsertSagRuleRequest, WorkloadSpecAck,
+    GenerateJoinTokenResponse, GetClusterStatusRequest, ListNodePoolsRequest,
+    ListNodePoolsResponse, ListNodesRequest, ListNodesResponse, NodeAck, NodeId, NodePoolAck,
+    NodePoolCreateRequest, NodePoolDeleteRequest, NodePoolInfo, QuotaAck, QuotaRequest,
+    QuotaResponse, RegisterNodeEkRequest, RegisterNodeEkResponse, RevokeNodeEkRequest, SagRuleAck,
+    ScaleWorkloadRequest, SecretAck, SecretAclChange, StoreSecretRequest, UpsertSagRuleRequest,
+    WorkloadSpecAck,
 };
 use fleetos_core::proto::workload::{CronWorkload, WorkloadSpec};
 use fleetos_core::spiffe::SpiffeId;
@@ -1455,6 +1457,143 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(
             fleetos_core::proto::admin::ListAuditLogResponse { entries },
         ))
+    }
+
+    // --- CR-12: Node Pool Management (V-3 remediation) ---
+
+    async fn create_node_pool(
+        &self,
+        request: Request<NodePoolCreateRequest>,
+    ) -> Result<Response<NodePoolAck>, Status> {
+        self.verify_caller(&request)?;
+        self.require_cluster_admin_write(&request)?;
+
+        // CRITICAL: Extract target and build audit context BEFORE consuming the request.
+        let pool_id = request.get_ref().pool_id.clone();
+        let audit = self.build_audit_context(&request, &pool_id);
+
+        // NOW consume the request.
+        let req = request.into_inner();
+
+        // Validate pool_id.
+        if req.pool_id.is_empty() {
+            return Err(Status::invalid_argument("pool_id cannot be empty"));
+        }
+        validate_identifier(&req.pool_id, "pool_id")?;
+
+        // Convert proto NodeKind to internal.
+        let node_kind = crate::provisioning::node_kind_from_proto(req.node_kind)
+            .map_err(|e| Status::invalid_argument(format!("invalid node_kind: {}", e)))?;
+
+        // Idempotency guard: reject if pool already exists.
+        let existing = self
+            .storage
+            .get_node_pool(&req.pool_id)
+            .map_err(|e| Status::internal(format!("storage read failed: {}", e)))?;
+        if existing.is_some() {
+            return Err(Status::already_exists(format!(
+                "node pool '{}' already exists",
+                req.pool_id
+            )));
+        }
+
+        // Build the record.
+        let record = crate::provisioning::NodePoolRecord {
+            pool_id: req.pool_id.clone(),
+            node_kind,
+            desired_count: req.desired_count,
+            vcpus: req.vcpus,
+            memory_mb: req.memory_mb,
+            disk_gb: req.disk_gb,
+            region_hint: req.region_hint.clone(),
+        };
+
+        // Propose through Raft.
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::StoreNodePool { record },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(pool_id = %req.pool_id, "node pool created via raft");
+        Ok(Response::new(NodePoolAck { accepted: true }))
+    }
+
+    async fn delete_node_pool(
+        &self,
+        request: Request<NodePoolDeleteRequest>,
+    ) -> Result<Response<NodePoolAck>, Status> {
+        self.verify_caller(&request)?;
+        self.require_cluster_admin_write(&request)?;
+
+        // CRITICAL: Extract target and build audit context BEFORE consuming the request.
+        let pool_id = request.get_ref().pool_id.clone();
+        let audit = self.build_audit_context(&request, &pool_id);
+
+        // NOW consume the request.
+        let req = request.into_inner();
+
+        if req.pool_id.is_empty() {
+            return Err(Status::invalid_argument("pool_id cannot be empty"));
+        }
+
+        // Existence check.
+        let existing = self
+            .storage
+            .get_node_pool(&req.pool_id)
+            .map_err(|e| Status::internal(format!("storage read failed: {}", e)))?;
+        if existing.is_none() {
+            return Err(Status::not_found(format!(
+                "node pool '{}' not found",
+                req.pool_id
+            )));
+        }
+
+        // Propose through Raft.
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::DeleteNodePool {
+                    pool_id: req.pool_id.clone(),
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(pool_id = %req.pool_id, "node pool deleted via raft");
+        Ok(Response::new(NodePoolAck { accepted: true }))
+    }
+
+    async fn list_node_pools(
+        &self,
+        request: Request<ListNodePoolsRequest>,
+    ) -> Result<Response<ListNodePoolsResponse>, Status> {
+        self.verify_caller(&request)?;
+        self.require_read_access(&request)?;
+
+        let _ = request.into_inner();
+
+        let records = self
+            .storage
+            .list_node_pools()
+            .map_err(|e| Status::internal(format!("storage read failed: {}", e)))?;
+
+        let pools: Vec<NodePoolInfo> = records
+            .into_iter()
+            .map(|r| NodePoolInfo {
+                pool_id: r.pool_id,
+                node_kind: crate::provisioning::node_kind_to_proto(&r.node_kind),
+                desired_count: r.desired_count,
+                vcpus: r.vcpus,
+                memory_mb: r.memory_mb,
+                disk_gb: r.disk_gb,
+                region_hint: r.region_hint,
+            })
+            .collect();
+
+        Ok(Response::new(ListNodePoolsResponse { pools }))
     }
 
     async fn register_node_ek(

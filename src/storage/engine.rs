@@ -337,18 +337,6 @@ impl StorageEngine {
 
     // --- Node pool persistence ---
 
-    /// Store a node pool record.
-    pub fn store_node_pool(
-        &self,
-        record: &crate::provisioning::NodePoolRecord,
-    ) -> Result<(), crate::storage::StorageError> {
-        let serialized =
-            postcard::to_allocvec(record).map_err(crate::storage::StorageError::Serialization)?;
-        self.node_pools
-            .insert(record.pool_id.as_bytes(), serialized.as_slice())
-            .map_err(crate::storage::StorageError::Storage)
-    }
-
     /// Get a node pool record by pool_id.
     pub fn get_node_pool(
         &self,
@@ -366,13 +354,6 @@ impl StorageEngine {
             }
             None => Ok(None),
         }
-    }
-
-    /// Delete a node pool record.
-    pub fn delete_node_pool(&self, pool_id: &str) -> Result<(), crate::storage::StorageError> {
-        self.node_pools
-            .remove(pool_id.as_bytes())
-            .map_err(crate::storage::StorageError::Storage)
     }
 
     /// Load all node pool records.
