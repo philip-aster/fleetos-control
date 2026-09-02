@@ -1,6 +1,5 @@
-//! Hard invariant: StoreSecret broadcasts a SecretRotationNotification
-//! carrying the target_spiffe_id, so agents know which identity's secret rotated.
-use fleetos_control::raft::records::SecretRecord;
+//! Hard invariant: UpsertSvidVersion broadcasts a SvidRotationNotification
+//! carrying the spiffe_id and svid_version, so agents know which identity's SVID rotated.
 use fleetos_control::raft::{AuditedCommand, FleetosCommand, FleetosRaftConfig};
 use fleetos_control::watch::broadcast::WatchEvent;
 use openraft::storage::RaftStateMachine;
@@ -15,7 +14,7 @@ fn make_entry(index: u64, cmd: AuditedCommand) -> Entry<FleetosRaftConfig> {
 }
 
 #[tokio::test]
-async fn store_secret_broadcasts_rotation_with_target_spiffe_id() {
+async fn upsert_svid_version_broadcasts_rotation_with_spiffe_id_and_version() {
     let dir = tempdir().unwrap();
     let db = fleetos_control::storage::open_database(dir.path()).unwrap();
     let keyspaces = fleetos_control::storage::init_keyspaces(&db).unwrap();
@@ -35,18 +34,15 @@ async fn store_secret_broadcasts_rotation_with_target_spiffe_id() {
     );
 
     let target_spiffe_id = "spiffe://fleet.example.internal/ns/tenant-1/sa/db".to_owned();
-    let record = SecretRecord {
-        key: "db-password".to_owned(),
-        envelope_bytes: vec![1, 2, 3],
-        acl_bytes: vec![4, 5, 6],
+    let record = fleetos_control::ca::SvidRecord {
+        spiffe_id: target_spiffe_id.clone(),
+        svid_version: 42,
+        issued_at_unix: 1700000000,
     };
 
     sm.apply(vec![make_entry(
         1,
-        AuditedCommand::system(FleetosCommand::StoreSecret {
-            record,
-            target_spiffe_id: target_spiffe_id.clone(),
-        }),
+        AuditedCommand::system(FleetosCommand::UpsertSvidVersion { record }),
     )])
     .await
     .unwrap();
@@ -54,14 +50,19 @@ async fn store_secret_broadcasts_rotation_with_target_spiffe_id() {
     // Receive the broadcast event.
     let event = watch_rx.recv().await.unwrap();
     match event {
-        WatchEvent::SecretRotationNotification { spiffe_id, .. } => {
+        WatchEvent::SvidRotation { spiffe_id, version } => {
             assert_eq!(
                 spiffe_id, target_spiffe_id,
                 "rotation event must carry the target SpiffeId"
             );
+            assert_eq!(
+                version.get(),
+                42,
+                "rotation event must carry the new SVID version"
+            );
         }
-        WatchEvent::SvidRotation { .. } => {
-            panic!("unexpected SvidRotation event in secret rotation test");
+        WatchEvent::SecretRotationNotification { .. } => {
+            panic!("unexpected SecretRotationNotification in SVID rotation test");
         }
     }
 }

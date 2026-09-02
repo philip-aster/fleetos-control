@@ -27,11 +27,17 @@ pub enum ChangeKind {
     SagUpdate,
     TrustBundleRotation,
     ClusterMembership,
-    SecretRotation { target_spiffe_id: String },
+    SecretRotation {
+        target_spiffe_id: String,
+    },
     RevokedDelegations,
     SchedulingUpdate,
     DummyIpUpdate,
     Eviction,
+    SvidRotation {
+        spiffe_id: String,
+        svid_version: u64,
+    },
 }
 
 impl VersionedState {

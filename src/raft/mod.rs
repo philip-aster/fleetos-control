@@ -174,6 +174,14 @@ pub enum FleetosCommand {
         record: records::ControlNodeAddressRecord,
     },
 
+    /// Upsert the SVID version for a SpiffeId (leader-only issuance, V-4c).
+    /// The leader computes the next version and proposes it; the state machine
+    /// writes it to the `svids` keyspace. This makes SVID versions replicated
+    /// state, consistent across all nodes, and snapshot-safe.
+    UpsertSvidVersion {
+        record: crate::ca::SvidRecord,
+    },
+
     // --- Operator JIT access (CR-8) ---
     GrantOperatorAccess {
         record: records::OperatorAccessGrantRecord,

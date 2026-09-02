@@ -19,12 +19,14 @@ async fn broadcast_hub_delivers_events() {
     // Receive it
     let received = rx.recv().await.unwrap();
 
-    // Fix: Removed the unreachable `_ => panic!` arm since WatchEvent
-    // currently only has one variant.
+    // Replace the existing match block at the end of the test with this:
     match received {
         WatchEvent::SecretRotationNotification { spiffe_id, version } => {
             assert_eq!(spiffe_id, "spiffe://test/ns/tenant/sa/db");
             assert_eq!(version.get(), 42);
+        }
+        WatchEvent::SvidRotation { .. } => {
+            panic!("unexpected SvidRotation event in test");
         }
     }
 }

@@ -204,6 +204,19 @@ impl FjallStateMachine {
                 Ok(ChangeKind::ClusterMembership)
             }
 
+            FleetosCommand::UpsertSvidVersion { record } => {
+                let value = postcard::to_allocvec(record).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.svids,
+                    record.spiffe_id.as_bytes(),
+                    value.as_slice(),
+                );
+                Ok(ChangeKind::SvidRotation {
+                    spiffe_id: record.spiffe_id.clone(),
+                    svid_version: record.svid_version,
+                })
+            }
+
             FleetosCommand::RegisterNodeEk { record } => {
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
                 batch.insert(
@@ -760,6 +773,16 @@ impl FjallStateMachine {
                         version,
                     });
             }
+            ChangeKind::SvidRotation {
+                spiffe_id,
+                svid_version,
+            } => {
+                self.broadcast_hub
+                    .publish_watch_event(WatchEvent::SvidRotation {
+                        spiffe_id: spiffe_id.clone(),
+                        version: fleetos_core::MonotonicVersion::new(*svid_version),
+                    });
+            }
             ChangeKind::SchedulingUpdate => {
                 self.publish_schedule_update(version);
                 self.publish_route_update(version);
@@ -997,6 +1020,7 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::ScaleWorkload { .. } => "ScaleWorkload",
         FleetosCommand::SetTenantQuota { .. } => "SetTenantQuota",
         FleetosCommand::RegisterControlAddress { .. } => "RegisterControlAddress",
+        FleetosCommand::UpsertSvidVersion { .. } => "UpsertSvidVersion",
         FleetosCommand::RegisterNodeEk { .. } => "RegisterNodeEk",
         FleetosCommand::ActivateNodeEk { .. } => "ActivateNodeEk",
         FleetosCommand::RevokeNodeEk { .. } => "RevokeNodeEk",

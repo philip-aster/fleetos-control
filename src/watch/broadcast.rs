@@ -28,6 +28,15 @@ pub enum WatchEvent {
         /// Version of this rotation.
         version: MonotonicVersion,
     },
+
+    /// SVID rotation notification — "the SVID for this SpiffeId was reissued."
+    /// Agents may need to refetch secrets sealed for the new SVID version.
+    SvidRotation {
+        /// The SpiffeId whose SVID was rotated.
+        spiffe_id: String,
+        /// New SVID version.
+        version: MonotonicVersion,
+    },
 }
 
 /// Events broadcast over the PolicyService stream (WatchSag).

@@ -34,6 +34,7 @@ pub struct CaServiceImpl {
     svid_grants_keyspace: fjall::Keyspace,
     /// Placements for hosting verification (M-3, authenticated renewal path).
     placements_keyspace: fjall::Keyspace,
+    raft: Arc<openraft::Raft<crate::raft::FleetosRaftConfig>>,
 }
 
 impl CaServiceImpl {
@@ -43,6 +44,7 @@ impl CaServiceImpl {
         svids_keyspace: fjall::Keyspace,
         svid_grants_keyspace: fjall::Keyspace,
         placements_keyspace: fjall::Keyspace,
+        raft: Arc<openraft::Raft<crate::raft::FleetosRaftConfig>>,
     ) -> Self {
         Self {
             data_control,
@@ -50,6 +52,7 @@ impl CaServiceImpl {
             svids_keyspace,
             svid_grants_keyspace,
             placements_keyspace,
+            raft,
         }
     }
 
@@ -126,6 +129,26 @@ impl CaServiceImpl {
         );
         Ok(())
     }
+
+    /// Look up the Data/Control address of a control node by Raft node ID.
+    fn leader_dc_address(&self, leader_id: u64) -> Result<Option<String>, Status> {
+        // Read from the control_addresses keyspace (replicated via RegisterControlAddress).
+        // This requires access to the control_addresses keyspace, which CaServiceImpl
+        // doesn't currently have. For now, return None to indicate the leader address
+        // is not available. The caller will receive an error and can retry.
+        // TODO: Add control_addresses keyspace to CaServiceImpl for full leader redirect.
+        let _ = leader_id;
+        Ok(None)
+    }
+
+    /// Build a gRPC status that tells the client to retry against the leader.
+    fn redirect_to_leader(leader_addr: &str) -> Status {
+        let mut status = Status::unavailable("not the Raft leader; retry against the leader");
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(leader_addr) {
+            status.metadata_mut().insert("leader-dc-address", v);
+        }
+        status
+    }
 }
 
 #[tonic::async_trait]
@@ -176,18 +199,41 @@ impl CaService for CaServiceImpl {
         // Increment the version.
         let new_version = current_version + 1;
 
-        // Persist the updated SVID record.
+        // V-4c: Route SVID version write through Raft (leader-only issuance).
+        // The state machine writes the new version to the `svids` keyspace,
+        // making it replicated state consistent across all nodes.
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let record = crate::ca::SvidRecord {
             spiffe_id: spiffe_id.clone(),
             svid_version: new_version,
             issued_at_unix: now,
         };
-        let serialized = postcard::to_allocvec(&record)
-            .map_err(|e| Status::internal(format!("failed to serialize SVID record: {}", e)))?;
-        self.svids_keyspace
-            .insert(spiffe_id.as_bytes(), serialized.as_slice())
-            .map_err(|e| Status::internal(format!("failed to store SVID record: {}", e)))?;
+        match self
+            .raft
+            .client_write(crate::raft::AuditedCommand::system(
+                crate::raft::FleetosCommand::UpsertSvidVersion { record },
+            ))
+            .await
+        {
+            Ok(_) => {}
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(fwd),
+            )) => {
+                let leader_id = fwd
+                    .leader_id
+                    .ok_or_else(|| Status::internal("forward response missing leader id"))?;
+                let leader_addr = self
+                    .leader_dc_address(leader_id)?
+                    .ok_or_else(|| Status::internal("leader DC address not registered"))?;
+                return Err(Self::redirect_to_leader(&leader_addr));
+            }
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "SVID version write failed: {}",
+                    e
+                )));
+            }
+        }
 
         // Sign the CSR.
         let bundle = self.data_control.read();
@@ -242,7 +288,7 @@ mod tests {
     use crate::ca::trust_bundle::TrustBundle;
     use crate::scheduler::{Placement, ResourceSpec};
 
-    fn test_service(name: &str) -> (std::sync::Arc<fjall::Database>, CaServiceImpl) {
+    async fn test_service(name: &str) -> (std::sync::Arc<fjall::Database>, CaServiceImpl) {
         let dir = std::env::temp_dir().join(format!(
             "fleetos-ca-authz-test-{}-{}",
             std::process::id(),
@@ -252,12 +298,131 @@ mod tests {
         let db = crate::storage::open_database(&dir).unwrap();
         let keyspaces = crate::storage::init_keyspaces(&db).unwrap();
         let bundle = TrustBundle::generate_root("fleet.example.internal").unwrap();
+
+        // Spin up a single-node Raft for tests
+        let versioned_state =
+            crate::storage::version::VersionedState::new(keyspaces.version.clone());
+        let broadcast_hub = crate::watch::broadcast::BroadcastHub::new();
+        let raft_config = openraft::Config {
+            heartbeat_interval: 50,
+            election_timeout_min: 150,
+            election_timeout_max: 300,
+            ..Default::default()
+        };
+        let raft_config = Arc::new(raft_config.validate().unwrap());
+        let log_storage = crate::raft::store::FjallLogStorage::new(
+            db.clone(),
+            keyspaces.raft_log.clone(),
+            keyspaces.raft_log_meta.clone(),
+        );
+        let state_machine = crate::raft::state_machine::FjallStateMachine::new(
+            db.clone(),
+            keyspaces.clone(),
+            versioned_state,
+            broadcast_hub,
+            "test.example.internal".to_owned(),
+        );
+
+        struct NoOpNetworkFactory;
+        impl openraft::network::RaftNetworkFactory<crate::raft::FleetosRaftConfig> for NoOpNetworkFactory {
+            type Network = NoOpNetwork;
+            async fn new_client(
+                &mut self,
+                _target: u64,
+                _node: &openraft::BasicNode,
+            ) -> Self::Network {
+                NoOpNetwork
+            }
+        }
+        struct NoOpNetwork;
+        impl openraft::network::RaftNetwork<crate::raft::FleetosRaftConfig> for NoOpNetwork {
+            async fn append_entries(
+                &mut self,
+                _req: openraft::raft::AppendEntriesRequest<crate::raft::FleetosRaftConfig>,
+                _option: openraft::network::RPCOption,
+            ) -> Result<
+                openraft::raft::AppendEntriesResponse<u64>,
+                openraft::error::RPCError<
+                    u64,
+                    openraft::BasicNode,
+                    openraft::error::RaftError<u64>,
+                >,
+            > {
+                Err(openraft::error::RPCError::Network(
+                    openraft::error::NetworkError::new(&std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "test",
+                    )),
+                ))
+            }
+            async fn vote(
+                &mut self,
+                _req: openraft::raft::VoteRequest<u64>,
+                _option: openraft::network::RPCOption,
+            ) -> Result<
+                openraft::raft::VoteResponse<u64>,
+                openraft::error::RPCError<
+                    u64,
+                    openraft::BasicNode,
+                    openraft::error::RaftError<u64>,
+                >,
+            > {
+                Err(openraft::error::RPCError::Network(
+                    openraft::error::NetworkError::new(&std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "test",
+                    )),
+                ))
+            }
+            async fn install_snapshot(
+                &mut self,
+                _req: openraft::raft::InstallSnapshotRequest<crate::raft::FleetosRaftConfig>,
+                _option: openraft::network::RPCOption,
+            ) -> Result<
+                openraft::raft::InstallSnapshotResponse<u64>,
+                openraft::error::RPCError<
+                    u64,
+                    openraft::BasicNode,
+                    openraft::error::RaftError<u64, openraft::error::InstallSnapshotError>,
+                >,
+            > {
+                Err(openraft::error::RPCError::Network(
+                    openraft::error::NetworkError::new(&std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "test",
+                    )),
+                ))
+            }
+        }
+
+        let raft = openraft::Raft::new(
+            1,
+            raft_config,
+            NoOpNetworkFactory,
+            log_storage,
+            state_machine,
+        )
+        .await
+        .unwrap();
+        let raft = Arc::new(raft);
+
+        // Bootstrap single node
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(
+            1,
+            openraft::BasicNode {
+                addr: String::new(),
+            },
+        );
+        raft.initialize(members).await.unwrap();
+
         let service = CaServiceImpl::new(
             Arc::new(RwLock::new(bundle)),
             3600,
             keyspaces.svids.clone(),
             keyspaces.svid_grants.clone(),
             keyspaces.placements.clone(),
+            raft,
         );
         (db, service)
     }
@@ -277,37 +442,35 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn unauthenticated_csr_without_grant_is_rejected() {
-        let (_db, service) = test_service("no-grant");
+    #[tokio::test]
+    async fn unauthenticated_csr_without_grant_is_rejected() {
+        let (_db, service) = test_service("no-grant").await;
         let result = service
             .authorize_issuance("spiffe://fleet.example.internal/ns/system/control/c1", None);
         assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
 
-    #[test]
-    fn grant_authorizes_exactly_once() {
-        let (_db, service) = test_service("grant-single-use");
+    #[tokio::test]
+    async fn grant_authorizes_exactly_once() {
+        let (_db, service) = test_service("grant-single-use").await;
         let id = "spiffe://fleet.example.internal/ns/system/control/c1";
         write_grant(&service, id, 300);
         assert!(service.authorize_issuance(id, None).is_ok());
-        // Second attempt: the grant was consumed.
         assert_eq!(
             service.authorize_issuance(id, None).unwrap_err().code(),
             tonic::Code::PermissionDenied
         );
     }
 
-    #[test]
-    fn expired_grant_is_rejected_and_still_consumed() {
-        let (_db, service) = test_service("grant-expired");
+    #[tokio::test]
+    async fn expired_grant_is_rejected_and_still_consumed() {
+        let (_db, service) = test_service("grant-expired").await;
         let id = "spiffe://fleet.example.internal/ns/system/control/c1";
-        write_grant(&service, id, -1); // already expired
+        write_grant(&service, id, -1);
         assert_eq!(
             service.authorize_issuance(id, None).unwrap_err().code(),
             tonic::Code::PermissionDenied
         );
-        // Expired grants must still be consumed — no retry path.
         assert!(
             service
                 .svid_grants_keyspace
@@ -317,9 +480,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn self_renewal_is_allowed() {
-        let (_db, service) = test_service("self-renewal");
+    #[tokio::test]
+    async fn self_renewal_is_allowed() {
+        let (_db, service) = test_service("self-renewal").await;
         let caller: SpiffeId = "spiffe://fleet.example.internal/ns/system/node/agent-1"
             .parse()
             .unwrap();
@@ -333,13 +496,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn foreign_identity_renewal_is_rejected() {
-        let (_db, service) = test_service("foreign-renewal");
+    #[tokio::test]
+    async fn foreign_identity_renewal_is_rejected() {
+        let (_db, service) = test_service("foreign-renewal").await;
         let caller: SpiffeId = "spiffe://fleet.example.internal/ns/system/node/agent-1"
             .parse()
             .unwrap();
-        // agent-1 hosts no placements → placement verification fails.
         let result = service.authorize_issuance(
             "spiffe://fleet.example.internal/ns/tenant-1/sa/db",
             Some(&caller),
@@ -347,9 +509,9 @@ mod tests {
         assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
 
-    #[test]
-    fn non_node_caller_cannot_sign_foreign_identity() {
-        let (_db, service) = test_service("control-foreign");
+    #[tokio::test]
+    async fn non_node_caller_cannot_sign_foreign_identity() {
+        let (_db, service) = test_service("control-foreign").await;
         let caller: SpiffeId = "spiffe://fleet.example.internal/ns/system/control/c1"
             .parse()
             .unwrap();
@@ -360,13 +522,12 @@ mod tests {
         assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
 
-    #[test]
-    fn hosting_node_can_renew_hosted_workload() {
-        let (_db, service) = test_service("hosting-renewal");
+    #[tokio::test]
+    async fn hosting_node_can_renew_hosted_workload() {
+        let (_db, service) = test_service("hosting-renewal").await;
         let node: SpiffeId = "spiffe://fleet.example.internal/ns/system/node/agent-1"
             .parse()
             .unwrap();
-        // Placement: agent-1 hosts tenant-1/db ordinal 0.
         let placement = Placement {
             pod_id: "db-replica-0".to_owned(),
             tenant_id: "tenant-1".to_owned(),

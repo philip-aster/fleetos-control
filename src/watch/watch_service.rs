@@ -12,7 +12,8 @@ use tonic::{Request, Response, Status};
 
 use fleetos_core::proto::fleetos::watch_event;
 use fleetos_core::proto::state::{
-    SecretRotationNotification, WatchEvent as ProtoWatchEvent, WatchRequest, WatchService,
+    SecretRotationNotification, SvidRotationNotification, WatchEvent as ProtoWatchEvent,
+    WatchRequest, WatchService,
 };
 
 use super::broadcast::BroadcastHub;
@@ -38,7 +39,6 @@ impl WatchService for WatchServiceImpl {
         _request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchEventsStream>, Status> {
         let mut rx = self.hub.subscribe_watch();
-
         let stream = async_stream::stream! {
             loop {
                 match rx.recv().await {
@@ -50,6 +50,17 @@ impl WatchService for WatchServiceImpl {
                             } => ProtoWatchEvent {
                                 event: Some(watch_event::Event::SecretRotation(
                                     SecretRotationNotification { spiffe_id },
+                                )),
+                            },
+                            super::broadcast::WatchEvent::SvidRotation {
+                                spiffe_id,
+                                version,
+                            } => ProtoWatchEvent {
+                                event: Some(watch_event::Event::SvidRotation(
+                                    SvidRotationNotification {
+                                        spiffe_id,
+                                        svid_version: version.get(),
+                                    },
                                 )),
                             },
                         };
