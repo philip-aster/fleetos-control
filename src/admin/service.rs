@@ -1615,7 +1615,13 @@ impl AdminService for AdminServiceImpl {
                 "either ek_cert_der or ek_pub must be provided",
             ));
         }
-
+        // Step 8 (ATT-EKVAL): if a certificate is presented, validate its chain
+        // against the configured manufacturer roots before anything else.
+        if !req.ek_cert_der.is_empty() {
+            crate::attestation::ek_cert::validate_ek_cert_chain(&req.ek_cert_der).map_err(|e| {
+                Status::invalid_argument(format!("EK certificate chain validation failed: {}", e))
+            })?;
+        }
         // Compute EK fingerprint — fleetos-core owns the convention (CR-11).
         let fingerprint = if !req.ek_cert_der.is_empty() {
             fleetos_core::attestation::EkFingerprint::of_ek_cert(&req.ek_cert_der).map_err(|e| {
@@ -1624,6 +1630,16 @@ impl AdminService for AdminServiceImpl {
         } else {
             fleetos_core::attestation::EkFingerprint::of_ek_pub(&req.ek_pub)
         };
+        // CR-11 convergence invariant: if both forms are provided, they must
+        // fingerprint identically. One EK yields one fingerprint.
+        if !req.ek_cert_der.is_empty() && !req.ek_pub.is_empty() {
+            let fp_pub = fleetos_core::attestation::EkFingerprint::of_ek_pub(&req.ek_pub);
+            if fingerprint != fp_pub {
+                return Err(Status::invalid_argument(
+                    "EK convergence check failed: cert and public key fingerprints differ",
+                ));
+            }
+        }
         let fp_hex = fingerprint.to_hex();
 
         // Update the audit target now that we have the computed fingerprint

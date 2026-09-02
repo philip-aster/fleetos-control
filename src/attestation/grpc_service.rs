@@ -325,7 +325,7 @@ impl AttestationService for AttestationServiceImpl {
             node_kind: token_record.node_kind as u8,
             granted_at: now.unix_timestamp(),
             expires_at: now.unix_timestamp() + crate::ca::SVID_GRANT_TTL_SECS,
-            agent_x25519_pubkey: vec![],
+            agent_x25519_pubkey: quote.agent_x25519_pubkey.clone(),
         };
         let grant_bytes = postcard::to_allocvec(&grant)
             .map_err(|e| Status::internal(format!("grant serialization failed: {}", e)))?;
@@ -373,6 +373,18 @@ impl AttestationService for AttestationServiceImpl {
             return Err(Status::invalid_argument(
                 "either ek_cert_der or ek_pub must be provided",
             ));
+        }
+
+        if req.ek_cert_der.is_empty() && req.ek_pub.is_empty() {
+            return Err(Status::invalid_argument(
+                "either ek_cert_der or ek_pub must be provided",
+            ));
+        }
+        // Step 8 (ATT-EKVAL): validate the EK certificate chain if present.
+        if !req.ek_cert_der.is_empty() {
+            crate::attestation::ek_cert::validate_ek_cert_chain(&req.ek_cert_der).map_err(|e| {
+                Status::invalid_argument(format!("EK certificate chain validation failed: {}", e))
+            })?;
         }
 
         // Compute EK fingerprint — fleetos-core owns the convention (CR-11).

@@ -12,6 +12,7 @@
 //! `fleetos-guest-init` quotes. We only verify the agent's TPM quote.
 
 pub mod apple_se;
+pub mod ek_cert;
 pub mod grpc_service;
 pub mod join_token;
 pub mod nonce;
