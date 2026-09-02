@@ -39,6 +39,7 @@ pub struct SvidRecord {
     pub svid_version: u64,
     /// Unix timestamp of the most recent issuance.
     pub issued_at_unix: i64,
+    pub agent_x25519_pubkey: Vec<u8>,
 }
 
 /// TTL for single-use CSR issuance grants (Master finding M-3, join path).
@@ -61,6 +62,7 @@ pub struct SvidGrantRecord {
     pub node_kind: u8,
     pub granted_at: i64,
     pub expires_at: i64,
+    pub agent_x25519_pubkey: Vec<u8>,
 }
 
 /// Errors from CA operations.

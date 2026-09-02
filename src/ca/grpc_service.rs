@@ -65,10 +65,16 @@ impl CaServiceImpl {
         &self,
         csr_spiffe_id: &str,
         caller: Option<&SpiffeId>,
-    ) -> Result<(), Status> {
+    ) -> Result<Option<Vec<u8>>, Status> {
         match caller {
-            Some(caller_id) => self.authorize_authenticated(csr_spiffe_id, caller_id),
-            None => self.authorize_via_grant(csr_spiffe_id),
+            Some(caller_id) => {
+                self.authorize_authenticated(csr_spiffe_id, caller_id)?;
+                Ok(None) // pubkey comes from existing SvidRecord
+            }
+            None => {
+                let pubkey = self.authorize_via_grant(csr_spiffe_id)?;
+                Ok(Some(pubkey))
+            }
         }
     }
 
@@ -107,7 +113,7 @@ impl CaServiceImpl {
     /// Unauthenticated join path: single-use attestation grant only.
     /// The grant is consumed before expiry validation — an expired grant
     /// must never be retryable.
-    fn authorize_via_grant(&self, csr_spiffe_id: &str) -> Result<(), Status> {
+    fn authorize_via_grant(&self, csr_spiffe_id: &str) -> Result<Vec<u8>, Status> {
         let grant_bytes = self
             .svid_grants_keyspace
             .get(csr_spiffe_id.as_bytes())
@@ -131,7 +137,7 @@ impl CaServiceImpl {
             node_kind = grant.node_kind,
             "CSR authorized via attestation grant"
         );
-        Ok(())
+        Ok(grant.agent_x25519_pubkey)
     }
 
     /// Look up the Data/Control address of a control node by Raft node ID.
@@ -190,10 +196,10 @@ impl CaService for CaServiceImpl {
             .map_err(|e| Status::invalid_argument(format!("CSR validation failed: {}", e)))?;
 
         // M-3 / CR-6: bind issuance to the caller, fail-closed.
-        self.authorize_issuance(&spiffe_id, caller.as_ref())?;
+        let grant_pubkey = self.authorize_issuance(&spiffe_id, caller.as_ref())?;
 
-        // Load the current SVID version for this SpiffeId, or start at 0.
-        let current_version = match self
+        // Load the current SVID record for this SpiffeId.
+        let (current_version, existing_pubkey) = match self
             .svids_keyspace
             .get(spiffe_id.as_bytes())
             .map_err(|e| Status::internal(format!("failed to read SVID record: {}", e)))?
@@ -201,22 +207,25 @@ impl CaService for CaServiceImpl {
             Some(bytes) => {
                 let record: crate::ca::SvidRecord = postcard::from_bytes(&bytes)
                     .map_err(|e| Status::internal(format!("failed to parse SVID record: {}", e)))?;
-                record.svid_version
+                (record.svid_version, record.agent_x25519_pubkey)
             }
-            None => 0,
+            None => (0, vec![]),
         };
+
+        // Determine the pubkey to store: grant pubkey for first issuance,
+        // existing pubkey for renewals.
+        let pubkey_to_store = grant_pubkey.unwrap_or(existing_pubkey);
 
         // Increment the version.
         let new_version = current_version + 1;
 
         // V-4c: Route SVID version write through Raft (leader-only issuance).
-        // The state machine writes the new version to the `svids` keyspace,
-        // making it replicated state consistent across all nodes.
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let record = crate::ca::SvidRecord {
             spiffe_id: spiffe_id.clone(),
             svid_version: new_version,
             issued_at_unix: now,
+            agent_x25519_pubkey: pubkey_to_store,
         };
         match self
             .raft
@@ -445,6 +454,7 @@ mod tests {
             node_kind: 0,
             granted_at: now,
             expires_at: now + ttl_secs,
+            agent_x25519_pubkey: vec![],
         };
         let bytes = postcard::to_allocvec(&grant).unwrap();
         service

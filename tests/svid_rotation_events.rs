@@ -38,6 +38,7 @@ async fn upsert_svid_version_broadcasts_rotation_with_spiffe_id_and_version() {
         spiffe_id: target_spiffe_id.clone(),
         svid_version: 42,
         issued_at_unix: 1700000000,
+        agent_x25519_pubkey: vec![],
     };
 
     sm.apply(vec![make_entry(

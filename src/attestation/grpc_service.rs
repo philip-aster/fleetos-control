@@ -325,6 +325,7 @@ impl AttestationService for AttestationServiceImpl {
             node_kind: token_record.node_kind as u8,
             granted_at: now.unix_timestamp(),
             expires_at: now.unix_timestamp() + crate::ca::SVID_GRANT_TTL_SECS,
+            agent_x25519_pubkey: vec![],
         };
         let grant_bytes = postcard::to_allocvec(&grant)
             .map_err(|e| Status::internal(format!("grant serialization failed: {}", e)))?;

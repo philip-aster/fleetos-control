@@ -155,15 +155,17 @@ impl SecretServiceImpl {
             .map_err(|e| format!("storage error: {}", e))?
             .ok_or_else(|| format!("X25519 pubkey not registered for {}", spiffe_id))?;
 
-        if bytes.len() != 32 {
+        let record: crate::ca::SvidRecord = postcard::from_bytes(&bytes)
+            .map_err(|e| format!("failed to parse SVID record: {}", e))?;
+
+        if record.agent_x25519_pubkey.len() != 32 {
             return Err(format!(
                 "invalid X25519 pubkey length: expected 32, got {}",
-                bytes.len()
+                record.agent_x25519_pubkey.len()
             ));
         }
-
         let mut pubkey = [0u8; 32];
-        pubkey.copy_from_slice(bytes.as_ref());
+        pubkey.copy_from_slice(&record.agent_x25519_pubkey);
         Ok(RecipientX25519Pubkey(pubkey))
     }
 }
