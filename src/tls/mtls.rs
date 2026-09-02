@@ -24,6 +24,9 @@ pub struct MtlsConfig {
 
 /// Build a `rustls::ServerConfig` for a gRPC listener with mTLS enforcement.
 pub fn build_server_config(mtls: &MtlsConfig) -> Result<ServerConfig, TlsError> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     let mut root_store = rustls::RootCertStore::empty();
     let certs = rustls_pemfile::certs(&mut mtls.trust_bundle_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
@@ -53,6 +56,9 @@ pub fn build_server_config(mtls: &MtlsConfig) -> Result<ServerConfig, TlsError> 
 /// so joiners connect without a client certificate. Peers that DO present
 /// a certificate are still fully validated against the trust bundle.
 pub fn build_server_config_optional_auth(mtls: &MtlsConfig) -> Result<ServerConfig, TlsError> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     let mut root_store = rustls::RootCertStore::empty();
 
     let certs = rustls_pemfile::certs(&mut mtls.trust_bundle_pem.as_bytes())
@@ -80,6 +86,9 @@ pub fn build_server_config_optional_auth(mtls: &MtlsConfig) -> Result<ServerConf
 
 /// Build a `rustls::ClientConfig` for outbound connections.
 pub fn build_client_config(mtls: &MtlsConfig) -> Result<ClientConfig, TlsError> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     let mut root_store = rustls::RootCertStore::empty();
     let certs = rustls_pemfile::certs(&mut mtls.trust_bundle_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
@@ -275,6 +284,9 @@ pub fn build_server_config_dynamic(
     trust_bundle_pem: &str,
     resolver: Arc<DynamicCertResolver>,
 ) -> Result<rustls::ServerConfig, TlsError> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     let mut root_store = rustls::RootCertStore::empty();
     let certs = rustls_pemfile::certs(&mut trust_bundle_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
@@ -297,6 +309,9 @@ pub fn build_server_config_optional_auth_dynamic(
     trust_bundle_pem: &str,
     resolver: Arc<DynamicCertResolver>,
 ) -> Result<rustls::ServerConfig, TlsError> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     let mut root_store = rustls::RootCertStore::empty();
     let certs = rustls_pemfile::certs(&mut trust_bundle_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()

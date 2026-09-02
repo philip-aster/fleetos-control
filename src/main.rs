@@ -502,10 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             keyspaces.control_addresses.clone(),
             keyspaces.node_eks.clone(),
             keyspaces.pending_activations.clone(),
-            ca_service
-                .as_ref()
-                .map(|ca| ca.data_control.clone())
-                .expect("CA required for attestation service"),
+            ca_service.as_ref().map(|ca| ca.data_control.clone()),
             config.svid.node_ttl_secs,
             config.attestation.mode,
         );

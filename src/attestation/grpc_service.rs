@@ -36,7 +36,7 @@ pub struct AttestationServiceImpl {
     control_addresses: fjall::Keyspace,
     node_eks: fjall::Keyspace,
     pending_activations: fjall::Keyspace,
-    data_control: Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>,
+    data_control: Option<Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>>,
     svid_ttl_secs: u64,
     attestation_mode: crate::config::AttestationMode,
 }
@@ -52,7 +52,7 @@ impl AttestationServiceImpl {
         control_addresses: fjall::Keyspace,
         node_eks: fjall::Keyspace,
         pending_activations: fjall::Keyspace,
-        data_control: Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>,
+        data_control: Option<Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>>,
         svid_ttl_secs: u64,
         attestation_mode: crate::config::AttestationMode,
     ) -> Self {
@@ -356,7 +356,12 @@ impl AttestationService for AttestationServiceImpl {
                 "secure (credential-activation) attestation is disabled in insecure mode",
             ));
         }
-
+        // fail closed if the CA hasn't been replicated yet (first join boot).
+        if self.data_control.is_none() {
+            return Err(Status::unavailable(
+                "CA not yet replicated; secure attestation unavailable until catch-up",
+            ));
+        }
         let req = request.into_inner();
 
         // Validate input.
@@ -424,7 +429,12 @@ impl AttestationService for AttestationServiceImpl {
                 "secure (credential-activation) attestation is disabled in insecure mode",
             ));
         }
-
+        // NEW: extract the CA guard early, returning UNAVAILABLE if missing.
+        let bundle_guard = self.data_control.as_ref().ok_or_else(|| {
+            Status::unavailable(
+                "CA not yet replicated; secure attestation unavailable until catch-up",
+            )
+        })?;
         let req = request.into_inner();
 
         if req.hmac.is_empty() {
@@ -496,9 +506,8 @@ impl AttestationService for AttestationServiceImpl {
             .map_err(|e| Status::invalid_argument(format!("CSR validation failed: {}", e)))?;
 
         // Sign the CSR using the Data/Control CA.
-        // FIX: Scope the read lock so the RwLockReadGuard is dropped BEFORE the .await
         let cert_der = {
-            let bundle = self.data_control.read();
+            let bundle = bundle_guard.read();
             crate::ca::rcgen_impl::sign_csr(
                 &req.csr_der,
                 &bundle.current_key,
@@ -506,7 +515,7 @@ impl AttestationService for AttestationServiceImpl {
                 self.svid_ttl_secs,
             )
             .map_err(|e| Status::internal(format!("CSR signing failed: {}", e)))?
-        }; // bundle dropped here
+        };
 
         // Propose ActivateNodeEk via Raft (Pending → Joined).
         match self
@@ -545,5 +554,310 @@ impl AttestationService for AttestationServiceImpl {
             keypair_der: Vec::new(), // Node holds its own private key (CR-10).
             svid_version: 1,
         }))
+    }
+}
+
+#[cfg(test)]
+mod mode_enforcement_tests {
+    use super::*;
+    use crate::config::AttestationMode;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tonic::Code;
+
+    // --- No-op Raft network (mode gate fires before any network use) ---
+    struct NoOpNetworkFactory;
+    impl openraft::network::RaftNetworkFactory<crate::raft::FleetosRaftConfig> for NoOpNetworkFactory {
+        type Network = NoOpNetwork;
+        async fn new_client(&mut self, _target: u64, _node: &openraft::BasicNode) -> Self::Network {
+            NoOpNetwork
+        }
+    }
+    struct NoOpNetwork;
+    impl openraft::network::RaftNetwork<crate::raft::FleetosRaftConfig> for NoOpNetwork {
+        async fn append_entries(
+            &mut self,
+            _req: openraft::raft::AppendEntriesRequest<crate::raft::FleetosRaftConfig>,
+            _option: openraft::network::RPCOption,
+        ) -> Result<
+            openraft::raft::AppendEntriesResponse<u64>,
+            openraft::error::RPCError<u64, openraft::BasicNode, openraft::error::RaftError<u64>>,
+        > {
+            Err(openraft::error::RPCError::Network(
+                openraft::error::NetworkError::new(&std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "test",
+                )),
+            ))
+        }
+        async fn vote(
+            &mut self,
+            _req: openraft::raft::VoteRequest<u64>,
+            _option: openraft::network::RPCOption,
+        ) -> Result<
+            openraft::raft::VoteResponse<u64>,
+            openraft::error::RPCError<u64, openraft::BasicNode, openraft::error::RaftError<u64>>,
+        > {
+            Err(openraft::error::RPCError::Network(
+                openraft::error::NetworkError::new(&std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "test",
+                )),
+            ))
+        }
+        async fn install_snapshot(
+            &mut self,
+            _req: openraft::raft::InstallSnapshotRequest<crate::raft::FleetosRaftConfig>,
+            _option: openraft::network::RPCOption,
+        ) -> Result<
+            openraft::raft::InstallSnapshotResponse<u64>,
+            openraft::error::RPCError<
+                u64,
+                openraft::BasicNode,
+                openraft::error::RaftError<u64, openraft::error::InstallSnapshotError>,
+            >,
+        > {
+            Err(openraft::error::RPCError::Network(
+                openraft::error::NetworkError::new(&std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "test",
+                )),
+            ))
+        }
+    }
+
+    /// Build a real AttestationServiceImpl backed by a single-node Raft, in the given mode.
+    async fn service_with_mode(name: &str, mode: AttestationMode) -> AttestationServiceImpl {
+        let dir = std::env::temp_dir().join(format!(
+            "fleetos-attest-mode-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = crate::storage::open_database(&dir).unwrap();
+        let keyspaces = crate::storage::init_keyspaces(&db).unwrap();
+
+        let versioned_state =
+            crate::storage::version::VersionedState::new(keyspaces.version.clone());
+        let broadcast_hub = crate::watch::broadcast::BroadcastHub::new();
+        let raft_config = Arc::new(
+            openraft::Config {
+                heartbeat_interval: 50,
+                election_timeout_min: 150,
+                election_timeout_max: 300,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        );
+        let log_storage = crate::raft::store::FjallLogStorage::new(
+            db.clone(),
+            keyspaces.raft_log.clone(),
+            keyspaces.raft_log_meta.clone(),
+        );
+        let state_machine = crate::raft::state_machine::FjallStateMachine::new(
+            db.clone(),
+            keyspaces.clone(),
+            versioned_state,
+            broadcast_hub,
+            "test.example.internal".to_owned(),
+        );
+        let raft = openraft::Raft::new(
+            1,
+            raft_config,
+            NoOpNetworkFactory,
+            log_storage,
+            state_machine,
+        )
+        .await
+        .unwrap();
+        let raft = Arc::new(raft);
+        let mut members = BTreeMap::new();
+        members.insert(
+            1,
+            openraft::BasicNode {
+                addr: String::new(),
+            },
+        );
+        raft.initialize(members).await.unwrap();
+
+        let bundle =
+            crate::ca::trust_bundle::TrustBundle::generate_root("test.example.internal").unwrap();
+
+        AttestationServiceImpl::new(
+            Arc::new(crate::attestation::nonce::NonceManager::new(
+                keyspaces.nonces.clone(),
+            )),
+            Arc::new(crate::attestation::join_token::JoinTokenStore::new(
+                keyspaces.join_tokens.clone(),
+            )),
+            Arc::new(crate::attestation::pcr_policy::PcrPolicyStore::new(
+                keyspaces.pcr_policies.clone(),
+            )),
+            keyspaces.nonce_claims.clone(),
+            keyspaces.svid_grants.clone(),
+            raft,
+            keyspaces.control_addresses.clone(),
+            keyspaces.node_eks.clone(),
+            keyspaces.pending_activations.clone(),
+            Some(Arc::new(parking_lot::RwLock::new(bundle))),
+            3600,
+            mode,
+        )
+    }
+
+    fn is_mode_gate(err: &tonic::Status) -> bool {
+        err.code() == Code::PermissionDenied && err.message().contains("disabled in")
+    }
+
+    // --- secure mode: insecure flow rejected, secure flow passes the gate ---
+
+    #[tokio::test]
+    async fn secure_mode_rejects_request_nonce() {
+        let svc = service_with_mode("sec-nonce", AttestationMode::Secure).await;
+        let err = svc
+            .request_nonce(Request::new(NonceRequest {
+                claimed_spiffe_id: "spiffe://test.example.internal/ns/system/node/n1".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            is_mode_gate(&err),
+            "expected mode-gate reject, got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn secure_mode_rejects_submit_quote() {
+        let svc = service_with_mode("sec-quote", AttestationMode::Secure).await;
+        let err = svc
+            .submit_quote(Request::new(AttestationQuote::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            is_mode_gate(&err),
+            "expected mode-gate reject, got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn secure_mode_passes_request_activation_gate() {
+        let svc = service_with_mode("sec-act", AttestationMode::Secure).await;
+        // Empty ak_pub fails validation (InvalidArgument), proving it got PAST the mode gate.
+        let err = svc
+            .request_activation(Request::new(ActivationRequest::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            !is_mode_gate(&err),
+            "must not be a mode-gate reject, got {:?}",
+            err
+        );
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn secure_mode_passes_submit_activation_proof_gate() {
+        let svc = service_with_mode("sec-proof", AttestationMode::Secure).await;
+        // Empty hmac fails validation (InvalidArgument), proving it got PAST the mode gate.
+        let err = svc
+            .submit_activation_proof(Request::new(ActivationProof::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            !is_mode_gate(&err),
+            "must not be a mode-gate reject, got {:?}",
+            err
+        );
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    // --- insecure mode: insecure flow allowed, secure flow rejected (current code) ---
+
+    #[tokio::test]
+    async fn insecure_mode_allows_request_nonce() {
+        let svc = service_with_mode("ins-nonce", AttestationMode::Insecure).await;
+        let resp = svc
+            .request_nonce(Request::new(NonceRequest {
+                claimed_spiffe_id: "spiffe://test.example.internal/ns/system/node/n1".into(),
+            }))
+            .await;
+        assert!(
+            resp.is_ok(),
+            "insecure mode must serve RequestNonce, got {:?}",
+            resp.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn insecure_mode_passes_submit_quote_gate() {
+        let svc = service_with_mode("ins-quote", AttestationMode::Insecure).await;
+        // Empty join_token fails validation (InvalidArgument), proving it got PAST the mode gate.
+        let err = svc
+            .submit_quote(Request::new(AttestationQuote::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            !is_mode_gate(&err),
+            "must not be a mode-gate reject, got {:?}",
+            err
+        );
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    // DECISION-DEPENDENT: matches current code (reject). Flip to "passes gate"
+    // if we adopt the handover's "insecure allows both."
+    #[tokio::test]
+    async fn insecure_mode_rejects_request_activation() {
+        let svc = service_with_mode("ins-act", AttestationMode::Insecure).await;
+        let err = svc
+            .request_activation(Request::new(ActivationRequest::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            is_mode_gate(&err),
+            "expected mode-gate reject, got {:?}",
+            err
+        );
+    }
+
+    // DECISION-DEPENDENT: matches current code (reject).
+    #[tokio::test]
+    async fn insecure_mode_rejects_submit_activation_proof() {
+        let svc = service_with_mode("ins-proof", AttestationMode::Insecure).await;
+        let err = svc
+            .submit_activation_proof(Request::new(ActivationProof::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            is_mode_gate(&err),
+            "expected mode-gate reject, got {:?}",
+            err
+        );
+    }
+
+    // --- config surface ---
+
+    #[test]
+    fn attestation_mode_deserializes_both_variants() {
+        // `toml::from_str` requires a full TOML document (key = value), not a
+        // bare value. Deserialize through AttestationConfig — the actual
+        // config path that carries the `mode` field.
+        let insecure: crate::config::AttestationConfig =
+            toml::from_str("mode = \"insecure\"").unwrap();
+        assert_eq!(insecure.mode, AttestationMode::Insecure);
+
+        let secure: crate::config::AttestationConfig = toml::from_str("mode = \"secure\"").unwrap();
+        assert_eq!(secure.mode, AttestationMode::Secure);
+    }
+
+    #[test]
+    fn attestation_mode_defaults_to_insecure_when_omitted() {
+        // Fail-safe default: an omitted [attestation].mode must not silently
+        // enable the secure path, and must not panic.
+        let cfg: crate::config::AttestationConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.mode, AttestationMode::Insecure);
     }
 }
