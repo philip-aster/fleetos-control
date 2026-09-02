@@ -515,6 +515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             keyspaces.svids.clone(),
             keyspaces.svid_grants.clone(),
             keyspaces.placements.clone(),
+            keyspaces.control_addresses.clone(),
             raft_handle.raft.clone(),
         )
     });

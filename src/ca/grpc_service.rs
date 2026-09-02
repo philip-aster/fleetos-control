@@ -34,6 +34,8 @@ pub struct CaServiceImpl {
     svid_grants_keyspace: fjall::Keyspace,
     /// Placements for hosting verification (M-3, authenticated renewal path).
     placements_keyspace: fjall::Keyspace,
+    /// Control node addresses for leader redirect (N-1).
+    control_addresses: fjall::Keyspace,
     raft: Arc<openraft::Raft<crate::raft::FleetosRaftConfig>>,
 }
 
@@ -44,6 +46,7 @@ impl CaServiceImpl {
         svids_keyspace: fjall::Keyspace,
         svid_grants_keyspace: fjall::Keyspace,
         placements_keyspace: fjall::Keyspace,
+        control_addresses: fjall::Keyspace,
         raft: Arc<openraft::Raft<crate::raft::FleetosRaftConfig>>,
     ) -> Self {
         Self {
@@ -52,6 +55,7 @@ impl CaServiceImpl {
             svids_keyspace,
             svid_grants_keyspace,
             placements_keyspace,
+            control_addresses,
             raft,
         }
     }
@@ -132,13 +136,19 @@ impl CaServiceImpl {
 
     /// Look up the Data/Control address of a control node by Raft node ID.
     fn leader_dc_address(&self, leader_id: u64) -> Result<Option<String>, Status> {
-        // Read from the control_addresses keyspace (replicated via RegisterControlAddress).
-        // This requires access to the control_addresses keyspace, which CaServiceImpl
-        // doesn't currently have. For now, return None to indicate the leader address
-        // is not available. The caller will receive an error and can retry.
-        // TODO: Add control_addresses keyspace to CaServiceImpl for full leader redirect.
-        let _ = leader_id;
-        Ok(None)
+        match self
+            .control_addresses
+            .get(leader_id.to_be_bytes())
+            .map_err(|e| Status::internal(format!("address lookup failed: {}", e)))?
+        {
+            Some(bytes) => {
+                let rec: crate::raft::records::ControlNodeAddressRecord =
+                    postcard::from_bytes(&bytes)
+                        .map_err(|e| Status::internal(format!("corrupt address record: {}", e)))?;
+                Ok(Some(rec.dc_addr))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Build a gRPC status that tells the client to retry against the leader.
@@ -422,6 +432,7 @@ mod tests {
             keyspaces.svids.clone(),
             keyspaces.svid_grants.clone(),
             keyspaces.placements.clone(),
+            keyspaces.control_addresses.clone(),
             raft,
         );
         (db, service)
