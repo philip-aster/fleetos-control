@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use super::{FleetosRaftConfig, RaftRpc, RaftTransportClient, SnapshotWire};
+use super::{FleetosRaftConfig, RaftRpc, RaftTransportClient};
 
 fn der_to_pem(der: &[u8], label: &str) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -198,43 +198,40 @@ impl RaftNetwork<FleetosRaftConfig> for TonicRaftNetwork {
         _option: RPCOption,
     ) -> Result<SnapshotResponse<u64>, StreamingError<FleetosRaftConfig, Fatal<u64>>> {
         use std::io::Read;
-
         let mut client = self
             .get_client()
             .await
             .map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
-
-        // Extract bytes from the Cursor<Vec<u8>>
+        // Extract bytes from the Cursor<Vec<u8>> — `openraft::Snapshot` has
+        // no `.data` field; the payload lives in the boxed cursor.
         let mut cursor = snapshot.snapshot;
         cursor.set_position(0);
         let mut data = Vec::new();
         cursor
             .read_to_end(&mut data)
             .map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
-
-        let wire = SnapshotWire {
-            meta: snapshot.meta,
-            data,
+        // Ship an InstallSnapshotRequest directly — the single wire format,
+        // identical to what the in-memory test networks build.
+        let req = InstallSnapshotRequest::<FleetosRaftConfig> {
             vote,
+            meta: snapshot.meta,
+            offset: 0,
+            data,
+            done: true,
         };
-
         let payload =
-            Self::serialize(&wire).map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
-
+            Self::serialize(&req).map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
         let rpc = RaftRpc {
-            sender_id: vote.leader_id.node_id,
+            sender_id: req.vote.leader_id.node_id,
             target_id: self.target,
             payload,
         };
-
         let response = client.install_snapshot(rpc).await.map_err(|e| {
             let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
             StreamingError::Network(NetworkError::new(&io_err))
         })?;
-
         let resp: InstallSnapshotResponse<u64> = Self::deserialize(&response.into_inner().payload)
             .map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
-
         Ok(SnapshotResponse { vote: resp.vote })
     }
 

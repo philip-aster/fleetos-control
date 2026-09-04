@@ -5,7 +5,6 @@ use tonic::{Request, Response, Status};
 
 use super::{
     FleetosRaftConfig, JoinRequestPayload, JoinResponsePayload, RaftRpc, RaftTransportService,
-    SnapshotWire,
 };
 
 pub struct RaftTransportServerImpl {
@@ -68,32 +67,17 @@ impl RaftTransportService for RaftTransportServerImpl {
         request: Request<RaftRpc>,
     ) -> Result<Response<RaftRpc>, Status> {
         let rpc = request.into_inner();
-
-        // Try InstallSnapshotRequest first (chunked installs)
-        let resp = if let Ok(req) =
-            postcard::from_bytes::<InstallSnapshotRequest<FleetosRaftConfig>>(&rpc.payload)
-        {
-            self.raft.install_snapshot(req).await
-        } else {
-            // Try SnapshotWire format (from full_snapshot)
-            let wire: SnapshotWire = postcard::from_bytes(&rpc.payload)
-                .map_err(|e| Status::invalid_argument(format!("deserialize failed: {}", e)))?;
-
-            let req = InstallSnapshotRequest {
-                vote: wire.vote,
-                meta: wire.meta,
-                offset: 0,
-                data: wire.data,
-                done: true,
-            };
-            self.raft.install_snapshot(req).await
-        };
-
-        let resp = resp.map_err(|e| Status::internal(format!("raft error: {}", e)))?;
-
+        // Single wire format: InstallSnapshotRequest. Both chunked installs
+        // and full_snapshot send this type — no format guessing.
+        let req: InstallSnapshotRequest<FleetosRaftConfig> = postcard::from_bytes(&rpc.payload)
+            .map_err(|e| Status::invalid_argument(format!("deserialize failed: {}", e)))?;
+        let resp = self
+            .raft
+            .install_snapshot(req)
+            .await
+            .map_err(|e| Status::internal(format!("raft error: {}", e)))?;
         let payload = postcard::to_allocvec(&resp)
             .map_err(|e| Status::internal(format!("serialize failed: {}", e)))?;
-
         Ok(Response::new(RaftRpc {
             sender_id: rpc.target_id,
             target_id: rpc.sender_id,
