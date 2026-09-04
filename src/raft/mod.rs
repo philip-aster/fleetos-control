@@ -31,6 +31,7 @@ pub enum FleetosCommand {
     // --- Tenant lifecycle ---
     CreateTenant {
         record: records::TenantRecord,
+        block: crate::dummy_ip::allocator::TenantBlock,
     },
     DeleteTenant {
         tenant_id: String,

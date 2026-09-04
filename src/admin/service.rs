@@ -35,6 +35,7 @@ pub struct AdminServiceImpl {
     secret_store: Arc<crate::secrets::SecretStore>,
     ca_data_control: Option<Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>>,
     delegated_key_ttl_secs: u64,
+    svid_refresh_fraction: f64,
     node_eks: fjall::Keyspace,
 }
 
@@ -78,6 +79,7 @@ impl AdminServiceImpl {
         ca_data_control: Option<Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>>,
         delegated_key_ttl_secs: u64,
         node_eks: fjall::Keyspace,
+        svid_refresh_fraction: f64,
     ) -> Self {
         Self {
             storage,
@@ -90,6 +92,7 @@ impl AdminServiceImpl {
             ca_data_control,
             delegated_key_ttl_secs,
             node_eks,
+            svid_refresh_fraction,
         }
     }
 
@@ -418,23 +421,16 @@ impl AdminService for AdminServiceImpl {
             .compute_tenant_block_allocation(&tenant_id)
             .map_err(|e| Status::internal(format!("failed to allocate dummy IP block: {}", e)))?;
 
-        self.raft
-            .client_write(crate::raft::AuditedCommand {
-                cmd: crate::raft::FleetosCommand::AllocateTenantBlock { record: block },
-                audit: Some(audit.clone()),
-            })
-            .await
-            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
-
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let record = crate::raft::records::TenantRecord {
             tenant_id: tenant_id.clone(),
             created_at: now,
         };
 
+        // Single atomic Raft entry: tenant record + dummy-IP block (E12c).
         self.raft
             .client_write(crate::raft::AuditedCommand {
-                cmd: crate::raft::FleetosCommand::CreateTenant { record },
+                cmd: crate::raft::FleetosCommand::CreateTenant { record, block },
                 audit: Some(audit),
             })
             .await
@@ -993,8 +989,7 @@ impl AdminService for AdminServiceImpl {
         let now = time::OffsetDateTime::now_utc();
         let issued_at = now.unix_timestamp();
         let expires_at = issued_at + ttl as i64;
-        let refresh_at = issued_at + (ttl as f64 * 0.75) as i64;
-
+        let refresh_at = issued_at + (ttl as f64 * self.svid_refresh_fraction) as i64;
         let record = crate::delegation::DelegationRecord {
             delegation_id: bundle.delegation_id.clone(),
             node_id: node_spiffe,

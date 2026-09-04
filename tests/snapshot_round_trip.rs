@@ -48,10 +48,19 @@ async fn snapshot_round_trip_preserves_state() {
         tenant_id: "tenant-1".to_owned(),
         created_at: 1000,
     };
+    let block = fleetos_control::dummy_ip::allocator::TenantBlock {
+        tenant_id: "tenant-1".to_owned(),
+        base: 0xF000_0000,
+        prefix: 16,
+        next_offset: 0,
+    };
     src_sm
         .apply(vec![make_entry(
             1,
-            AuditedCommand::system(FleetosCommand::CreateTenant { record: tenant }),
+            AuditedCommand::system(FleetosCommand::CreateTenant {
+                record: tenant,
+                block,
+            }),
         )])
         .await
         .unwrap();

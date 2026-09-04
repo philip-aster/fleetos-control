@@ -66,6 +66,11 @@ impl NonceManager {
         Ok(nonce)
     }
 
+    /// Check whether a nonce is still pending (exists, not consumed).
+    pub fn is_nonce_pending(&self, nonce: &[u8]) -> bool {
+        matches!(self.keyspaces.get(nonce), Ok(Some(_)))
+    }
+
     /// Count currently-pending nonces.
     fn count_pending(&self) -> Result<usize, AttestationError> {
         let mut count = 0;

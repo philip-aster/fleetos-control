@@ -318,6 +318,12 @@ async fn three_node_cluster_replicates_commands() {
         .raft
         .client_write(AuditedCommand::system(FleetosCommand::CreateTenant {
             record: tenant_record("tenant-replicated"),
+            block: fleetos_control::dummy_ip::allocator::TenantBlock {
+                tenant_id: "tenant-replicated".to_owned(),
+                base: 0xF000_0000,
+                prefix: 16,
+                next_offset: 0,
+            },
         }))
         .await
         .unwrap();

@@ -132,6 +132,25 @@ impl AttestationService for AttestationServiceImpl {
             ));
         }
 
+        // E12b: sweep stale nonce claims (best-effort). A claim is stale when
+        // its nonce is no longer pending (expired without being consumed).
+        let mut stale_claims: Vec<Vec<u8>> = Vec::new();
+        for guard in self.nonce_claims_keyspace.prefix(Vec::<u8>::new()) {
+            match guard.key() {
+                Ok(key) => {
+                    if !self.nonce_manager.is_nonce_pending(&key) {
+                        stale_claims.push(key.to_vec());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "nonce claim read failed during sweep");
+                }
+            }
+        }
+        for key in stale_claims {
+            let _ = self.nonce_claims_keyspace.remove(key);
+        }
+
         let nonce = self.nonce_manager.generate_nonce().map_err(|e| match e {
             super::AttestationError::RateLimited(msg) => Status::resource_exhausted(msg),
             other => Status::internal(format!("nonce generation failed: {}", other)),

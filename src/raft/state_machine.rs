@@ -59,12 +59,20 @@ impl FjallStateMachine {
     ) -> Result<ChangeKind, StorageError<u64>> {
         match cmd {
             // --- Tenant lifecycle ---
-            FleetosCommand::CreateTenant { record } => {
+            FleetosCommand::CreateTenant { record, block } => {
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
                 batch.insert(
                     &self.keyspaces.tenants,
                     record.tenant_id.as_bytes(),
                     value.as_slice(),
+                );
+                // E12c: dummy-IP block commits atomically with the tenant record.
+                let block_key = format!("tenant:{}", record.tenant_id);
+                let block_value = postcard::to_allocvec(block).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.dummy_ips,
+                    block_key.as_bytes(),
+                    block_value.as_slice(),
                 );
                 Ok(ChangeKind::SchedulingUpdate)
             }

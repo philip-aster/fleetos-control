@@ -533,6 +533,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ca_data_control,
         config.svid.delegated_key_ttl_secs,
         keyspaces.node_eks.clone(),
+        config.svid.refresh_fraction,
     );
 
     let dc_addr: std::net::SocketAddr = config.listeners.data_control.parse()?;
