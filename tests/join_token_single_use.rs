@@ -1,40 +1,82 @@
 //! Hard invariant: join tokens are strictly single-use.
 //!
-//! Minting is Raft-replicated (FleetosCommand::MintJoinToken), so this test
-//! persists the computed record exactly the way the state machine's apply
-//! does, then exercises the consume path.
+//! Exercises the Raft consumption path: MintJoinToken persists the token,
+//! ConsumeJoinToken deletes it cluster-wide, and validate_only rejects
+//! any subsequent attempt.
+
 use fleetos_control::attestation::AttestationError;
 use fleetos_control::attestation::join_token::{JoinTokenStore, NodeKind};
-use tempfile::tempdir;
+use fleetos_control::raft::state_machine::FjallStateMachine;
+use fleetos_control::raft::{AuditedCommand, FleetosCommand, FleetosRaftConfig};
+use fleetos_control::storage::version::VersionedState;
+use fleetos_control::watch::broadcast::BroadcastHub;
+use openraft::LogId;
+use openraft::storage::RaftStateMachine;
 
-#[test]
-fn join_token_cannot_be_reused() {
-    let dir = tempdir().unwrap();
-    let db = fjall::Database::builder(dir.path())
-        .open()
-        .expect("failed to open database");
-    let keyspace = db
-        .keyspace("join_tokens", fjall::KeyspaceCreateOptions::default)
-        .expect("failed to open keyspace");
-    let store = JoinTokenStore::new(keyspace.clone());
+fn make_entry(index: u64, cmd: AuditedCommand) -> openraft::Entry<FleetosRaftConfig> {
+    openraft::Entry {
+        log_id: LogId {
+            leader_id: openraft::LeaderId {
+                term: 1,
+                node_id: 1,
+            },
+            index,
+        },
+        payload: openraft::EntryPayload::Normal(cmd),
+    }
+}
 
-    // 1. Compute a token record and persist it the way the Raft state
-    //    machine's MintJoinToken apply does.
+#[tokio::test]
+async fn join_token_cannot_be_reused() {
+    let dir = std::env::temp_dir().join(format!(
+        "fleetos-join-token-single-use-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = fleetos_control::storage::open_database(&dir).unwrap();
+    let keyspaces = fleetos_control::storage::init_keyspaces(&db).unwrap();
+    let versioned_state = VersionedState::new(keyspaces.version.clone());
+    let broadcast_hub = BroadcastHub::new();
+
+    let mut sm = FjallStateMachine::new(
+        db.clone(),
+        keyspaces.clone(),
+        versioned_state,
+        broadcast_hub,
+        "test.example.internal".to_owned(),
+    );
+
+    // 1. Compute a token record (random, not yet persisted).
+    let store = JoinTokenStore::new(keyspaces.join_tokens.clone());
     let record = store.compute_token_record(NodeKind::Agent).unwrap();
     let token = record.token.clone();
-    let serialized = postcard::to_allocvec(&record).unwrap();
-    keyspace
-        .insert(token.as_slice(), serialized.as_slice())
-        .unwrap();
 
-    // 2. First use succeeds.
-    let consumed = store.validate_and_consume(&token).unwrap();
-    assert_eq!(consumed.node_kind, NodeKind::Agent);
+    // 2. Mint via Raft (persists the token).
+    sm.apply(vec![make_entry(
+        1,
+        AuditedCommand::system(FleetosCommand::MintJoinToken { record }),
+    )])
+    .await
+    .unwrap();
 
-    // 3. Second use MUST fail.
-    let result = store.validate_and_consume(&token);
+    // 3. Token is valid after minting.
+    assert!(store.validate_only(&token).is_ok());
+
+    // 4. Consume via Raft (deletes the token cluster-wide).
+    sm.apply(vec![make_entry(
+        2,
+        AuditedCommand::system(FleetosCommand::ConsumeJoinToken {
+            token: token.clone(),
+        }),
+    )])
+    .await
+    .unwrap();
+
+    // 5. Second use MUST fail — token is gone.
+    let result = store.validate_only(&token);
     assert!(
         matches!(result, Err(AttestationError::JoinTokenNotFound)),
-        "Second use of join token must be rejected"
+        "second use of join token must be rejected, got {:?}",
+        result
     );
 }

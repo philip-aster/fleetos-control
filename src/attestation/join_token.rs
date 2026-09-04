@@ -113,53 +113,6 @@ impl JoinTokenStore {
         Ok(record)
     }
 
-    /// Validate and consume a join token (strict single-use).
-    ///
-    /// If the token exists and has not been consumed:
-    ///   - Mark it as consumed (delete from storage)
-    ///   - Return the token record
-    ///
-    /// If the token doesn't exist or was already consumed:
-    ///   - Return an error
-    pub fn validate_and_consume(&self, token: &[u8]) -> Result<JoinTokenRecord, AttestationError> {
-        let bytes = self
-            .keyspace
-            .get(token)
-            .map_err(|e| AttestationError::Storage(crate::storage::StorageError::Storage(e)))?
-            .ok_or(AttestationError::JoinTokenNotFound)?;
-
-        let record: JoinTokenRecord =
-            postcard::from_bytes(&bytes).map_err(AttestationError::Serialization)?;
-
-        if record.consumed {
-            return Err(AttestationError::JoinTokenAlreadyUsed);
-        }
-
-        // Check expiry.
-        if let Some(expires_at) = record.expires_at {
-            let now = time::OffsetDateTime::now_utc().unix_timestamp();
-            if now > expires_at {
-                // Expired — delete and reject.
-                self.keyspace.remove(token).map_err(|e| {
-                    AttestationError::Storage(crate::storage::StorageError::Storage(e))
-                })?;
-                return Err(AttestationError::JoinToken("token expired".to_owned()));
-            }
-        }
-
-        // Consume: delete from storage (strict single-use).
-        self.keyspace
-            .remove(token)
-            .map_err(|e| AttestationError::Storage(crate::storage::StorageError::Storage(e)))?;
-
-        tracing::info!(
-            node_kind = ?record.node_kind,
-            "join token consumed"
-        );
-
-        Ok(record)
-    }
-
     /// List all active (unconsumed) join tokens.
     ///
     /// Used by `AdminService.ListJoinTokens` for operator visibility.
@@ -254,32 +207,6 @@ mod tests {
             Some(record.created_at + DEFAULT_JOIN_TOKEN_TTL_SECS as i64),
             "token must expire at created_at + ttl"
         );
-    }
-
-    #[test]
-    fn expired_token_is_rejected_and_removed() {
-        let (_db, store) = test_store("expired", DEFAULT_JOIN_TOKEN_TTL_SECS);
-
-        // Manually insert an already-expired token to avoid sleeping in tests.
-        let token = vec![0xAA; TOKEN_LENGTH];
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let record = JoinTokenRecord {
-            token: token.clone(),
-            node_kind: NodeKind::Agent,
-            created_at: now - (DEFAULT_JOIN_TOKEN_TTL_SECS as i64 + 7200),
-            expires_at: Some(now - DEFAULT_JOIN_TOKEN_TTL_SECS as i64), // expired 1 hour ago
-            consumed: false,
-        };
-        let serialized = postcard::to_allocvec(&record).unwrap();
-        store
-            .keyspace
-            .insert(token.as_slice(), serialized.as_slice())
-            .unwrap();
-
-        let result = store.validate_and_consume(&token);
-        assert!(matches!(result, Err(AttestationError::JoinToken(_))));
-        // Expired tokens must be deleted — no retry path.
-        assert!(store.keyspace.get(&token).unwrap().is_none());
     }
 
     #[test]

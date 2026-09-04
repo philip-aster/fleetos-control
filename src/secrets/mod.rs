@@ -78,43 +78,6 @@ impl SecretStore {
         }
     }
 
-    /// Store a secret, granting access to the given SpiffeIds.
-    pub fn store_secret(
-        &self,
-        secret_key: &str,
-        plaintext: &[u8],
-        authorized: &[SpiffeId],
-    ) -> Result<(), SecretError> {
-        // Encrypt at rest (envelope encryption).
-        let envelope = crypto::encrypt_at_rest(plaintext, self.master_key.as_ref())?;
-
-        // Build the ACL for this secret.
-        let mut acl = acl::SecretAcl::new();
-        for spiffe_id in authorized {
-            acl.grant(secret_key, spiffe_id);
-        }
-
-        // Persist the envelope.
-        let secret_storage_key = format!("{}{}", SECRET_KEY_PREFIX, secret_key);
-        let envelope_serialized =
-            postcard::to_allocvec(&envelope).map_err(SecretError::Serialization)?;
-        self.keyspace
-            .insert(
-                secret_storage_key.as_bytes(),
-                envelope_serialized.as_slice(),
-            )
-            .map_err(|e| SecretError::Storage(crate::storage::StorageError::Storage(e)))?;
-
-        // Persist the ACL.
-        let acl_storage_key = format!("{}{}", ACL_KEY_PREFIX, secret_key);
-        let acl_serialized = postcard::to_allocvec(&acl).map_err(SecretError::Serialization)?;
-        self.keyspace
-            .insert(acl_storage_key.as_bytes(), acl_serialized.as_slice())
-            .map_err(|e| SecretError::Storage(crate::storage::StorageError::Storage(e)))?;
-
-        Ok(())
-    }
-
     /// Fetch a secret's plaintext, checking ACL authorization first.
     ///
     /// Returns `Zeroizing` plaintext. The caller is responsible for delivery-sealing

@@ -467,8 +467,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status_service = fleetos_control::watch::status_service::WorkloadStatusServiceImpl::new(
         raft_handle.raft.clone(),
     );
-    let policy_service =
-        fleetos_control::watch::policy_stream::PolicyServiceImpl::new(broadcast_hub.clone());
     let watch_service =
         fleetos_control::watch::watch_service::WatchServiceImpl::new(broadcast_hub.clone());
     let scheduler_service =
@@ -619,7 +617,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut server = tonic::transport::Server::builder()
             .add_service(fleetos_core::proto::fleetos::workload_status_service_server::WorkloadStatusServiceServer::new(status_service))
-            .add_service(fleetos_core::proto::fleetos::policy_service_server::PolicyServiceServer::new(policy_service))
             .add_service(fleetos_core::proto::fleetos::watch_service_server::WatchServiceServer::new(watch_service))
             .add_service(fleetos_core::proto::fleetos::scheduler_service_server::SchedulerServiceServer::new(scheduler_service))
             .add_service(fleetos_core::proto::fleetos::router_assignment_service_server::RouterAssignmentServiceServer::new(router_service))

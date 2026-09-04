@@ -93,17 +93,6 @@ impl StorageEngine {
         }
     }
 
-    // --- Tenant persistence ---
-
-    /// Store a tenant record.
-    pub fn store_tenant(&self, record: &TenantRecord) -> Result<(), crate::storage::StorageError> {
-        let serialized =
-            postcard::to_allocvec(record).map_err(crate::storage::StorageError::Serialization)?;
-        self.tenants
-            .insert(record.tenant_id.as_bytes(), serialized.as_slice())
-            .map_err(crate::storage::StorageError::Storage)
-    }
-
     /// Get a tenant record by ID.
     pub fn get_tenant(
         &self,
@@ -135,21 +124,6 @@ impl StorageEngine {
             }
         }
         Ok(records)
-    }
-
-    // --- Workload persistence ---
-
-    /// Store a serialized WorkloadSpec.
-    pub fn store_workload_spec(
-        &self,
-        tenant_id: &str,
-        workload_id: &str,
-        bytes: &[u8],
-    ) -> Result<(), crate::storage::StorageError> {
-        let key = format!("{}:{}", tenant_id, workload_id);
-        self.workloads
-            .insert(key.as_bytes(), bytes)
-            .map_err(crate::storage::StorageError::Storage)
     }
 
     /// Get a stored WorkloadSpec.
@@ -205,26 +179,6 @@ impl StorageEngine {
         Ok(records)
     }
 
-    // --- Node persistence ---
-
-    /// Store a serialized node record.
-    pub fn store_node(
-        &self,
-        node_id: &str,
-        bytes: &[u8],
-    ) -> Result<(), crate::storage::StorageError> {
-        self.nodes
-            .insert(node_id.as_bytes(), bytes)
-            .map_err(crate::storage::StorageError::Storage)
-    }
-
-    /// Mark a node as evicted (removes from schedulable set).
-    pub fn mark_node_evicted(&self, node_id: &str) -> Result<(), crate::storage::StorageError> {
-        self.nodes
-            .remove(node_id.as_bytes())
-            .map_err(crate::storage::StorageError::Storage)
-    }
-
     /// Load all node records from storage.
     ///
     /// Returns `NodeRecord` (the replicated record type). Use
@@ -240,20 +194,6 @@ impl StorageEngine {
             }
         }
         Ok(records)
-    }
-
-    // --- Placement persistence ---
-
-    /// Store a placement decision.
-    pub fn store_placement(
-        &self,
-        placement: &Placement,
-    ) -> Result<(), crate::storage::StorageError> {
-        let serialized = postcard::to_allocvec(placement)
-            .map_err(crate::storage::StorageError::Serialization)?;
-        self.placements
-            .insert(placement.pod_id.as_bytes(), serialized.as_slice())
-            .map_err(crate::storage::StorageError::Storage)
     }
 
     /// Get a placement by pod_id.
@@ -273,13 +213,6 @@ impl StorageEngine {
             }
             None => Ok(None),
         }
-    }
-
-    /// Delete a placement.
-    pub fn delete_placement(&self, pod_id: &str) -> Result<(), crate::storage::StorageError> {
-        self.placements
-            .remove(pod_id.as_bytes())
-            .map_err(crate::storage::StorageError::Storage)
     }
 
     /// Load all placements from storage.
@@ -303,36 +236,6 @@ impl StorageEngine {
     ) -> Result<Vec<Placement>, crate::storage::StorageError> {
         let all = self.list_placements()?;
         Ok(all.into_iter().filter(|p| p.node_id == *node_id).collect())
-    }
-
-    /// Update the pod_id for an existing placement (replace-in-place).
-    pub fn update_placement_pod_id(
-        &self,
-        tenant_id: &str,
-        workload_id: &str,
-        role: &str,
-        ordinal: u32,
-        new_pod_id: &str,
-    ) -> Result<(), crate::storage::StorageError> {
-        let all = self.list_placements()?;
-        for placement in &all {
-            if placement.tenant_id == tenant_id
-                && placement.service == workload_id
-                && placement.role == role
-                && placement.ordinal == ordinal
-            {
-                self.placements
-                    .remove(placement.pod_id.as_bytes())
-                    .map_err(crate::storage::StorageError::Storage)?;
-                let mut updated = placement.clone();
-                updated.pod_id = new_pod_id.to_owned();
-                return self.store_placement(&updated);
-            }
-        }
-        Err(crate::storage::StorageError::NotFound(format!(
-            "placement for {}:{}:{}:{}",
-            tenant_id, workload_id, role, ordinal
-        )))
     }
 
     // --- Node pool persistence ---

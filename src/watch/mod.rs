@@ -10,7 +10,6 @@
 //! - `RouterAssignmentService` (routers): WatchRoutes streaming RouteEntries
 
 pub mod broadcast;
-pub mod policy_stream;
 pub mod router_assignment;
 pub mod scheduler_stream;
 pub mod secret_service;
