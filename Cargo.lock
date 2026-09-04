@@ -1007,6 +1007,7 @@ dependencies = [
  "prost",
  "rand 0.10.2",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "security-framework",

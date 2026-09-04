@@ -97,6 +97,19 @@ join_token_ttl_secs = 3600
 # "insecure" = join-token only (testing). "secure" = TPM credential activation (production).
 mode = "insecure"
 
+# ---------------------------------------------------------------------------
+# TPM backend (secure attestation, Step 10)
+# ---------------------------------------------------------------------------
+# backend:
+#   "device" — hardware TPM via the kernel resource manager (default).
+#   "swtpm"  — software TPM over TCP (dev/test fallback).
+#   "mssim"  — Microsoft TPM simulator over TCP.
+[tpm]
+backend = "device"
+device_path = "/dev/tpmrm0"
+host = "localhost"
+port = 2321
+
 # -----------------------------------------------------------------------------
 # gRPC listeners
 # -----------------------------------------------------------------------------

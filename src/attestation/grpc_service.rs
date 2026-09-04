@@ -39,6 +39,8 @@ pub struct AttestationServiceImpl {
     data_control: Option<Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>>,
     svid_ttl_secs: u64,
     attestation_mode: crate::config::AttestationMode,
+    #[cfg_attr(not(feature = "tpm"), allow(dead_code))]
+    tpm_config: crate::config::TpmConfig,
 }
 
 impl AttestationServiceImpl {
@@ -55,6 +57,7 @@ impl AttestationServiceImpl {
         data_control: Option<Arc<parking_lot::RwLock<crate::ca::trust_bundle::TrustBundle>>>,
         svid_ttl_secs: u64,
         attestation_mode: crate::config::AttestationMode,
+        tpm_config: crate::config::TpmConfig,
     ) -> Self {
         Self {
             nonce_manager,
@@ -69,6 +72,7 @@ impl AttestationServiceImpl {
             data_control,
             svid_ttl_secs,
             attestation_mode,
+            tpm_config,
         }
     }
 
@@ -422,15 +426,71 @@ impl AttestationService for AttestationServiceImpl {
             }
         }
 
-        // TPM2_MakeCredential requires tss-esapi + TPM hardware.
-        // CR-10 security gate: the activation path is NOT production-enabled
-        // until TPM signature verification lands in attestation/tpm.rs.
-        // TODO: Generate server nonce + secret S, store PendingActivationRecord,
-        //       call TPM2_MakeCredential(ek_pub, ak_pub, S), return the blob.
-        Err(Status::unimplemented(
-            "TPM2_MakeCredential requires tss-esapi integration (not yet implemented). \
-             Secure attestation is not production-enabled until TPM verification lands.",
-        ))
+        // Generate the server nonce and a fresh 32-byte secret S.
+        let server_nonce = self
+            .nonce_manager
+            .generate_nonce()
+            .map_err(|e| Status::internal(format!("nonce generation failed: {}", e)))?;
+
+        let mut secret = [0u8; 32];
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut secret);
+
+        // Record the pending activation (node-local, transient).
+        let now = time::OffsetDateTime::now_utc();
+        let record = PendingActivationRecord {
+            ek_fingerprint: fp_hex.clone(),
+            ak_pub: req.ak_pub.clone(),
+            server_nonce: server_nonce.clone(),
+            secret: secret.to_vec(),
+            created_at: now.unix_timestamp(),
+            expires_at: now.unix_timestamp() + 300, // 5 minute TTL
+        };
+
+        let record_bytes = postcard::to_allocvec(&record)
+            .map_err(|e| Status::internal(format!("record serialization failed: {}", e)))?;
+        self.pending_activations
+            .insert(server_nonce.as_slice(), record_bytes.as_slice())
+            .map_err(|e| Status::internal(format!("failed to persist activation: {}", e)))?;
+
+        // Resolve the EK public key in SPKI DER form for the TPM.
+        // Prefer the raw SPKI if provided; otherwise extract it from the EK certificate.
+        let ek_spki_der: Vec<u8> = if !req.ek_pub.is_empty() {
+            req.ek_pub.clone()
+        } else {
+            extract_spki_from_cert(&req.ek_cert_der)
+                .map_err(|e| Status::internal(format!("EK SPKI extraction failed: {}", e)))?
+        };
+
+        // TPM2_MakeCredential (Step 10). Feature-gated.
+        #[cfg(not(feature = "tpm"))]
+        {
+            let _ = ek_spki_der; // suppress unused variable warning when tpm is disabled
+            return Err(Status::unimplemented(
+                "TPM2_MakeCredential requires the `tpm` feature (tss-esapi).",
+            ));
+        }
+
+        #[cfg(feature = "tpm")]
+        {
+            let (credential_blob, enc_secret) = crate::attestation::tpm::make_credential(
+                &self.tpm_config,
+                &ek_spki_der,
+                &req.ak_pub,
+                &secret,
+            )
+            .map_err(|e| Status::internal(format!("TPM2_MakeCredential failed: {}", e)))?;
+
+            tracing::info!(
+                ek_fingerprint = %fp_hex,
+                "activation challenge issued (TPM2_MakeCredential)"
+            );
+
+            Ok(Response::new(ActivationChallenge {
+                credential_blob,
+                secret: enc_secret,
+                server_nonce,
+            }))
+        }
     }
 
     async fn submit_activation_proof(
@@ -568,6 +628,22 @@ impl AttestationService for AttestationServiceImpl {
             svid_version: 1,
         }))
     }
+}
+
+/// Extract the SubjectPublicKeyInfo DER from an X.509 certificate.
+/// Used to feed the EK public key to TPM2_MakeCredential.
+/// Uses `x509-cert` to guarantee byte-for-byte convergence with
+/// `fleetos_core::attestation::EkFingerprint::of_ek_cert`.
+fn extract_spki_from_cert(cert_der: &[u8]) -> Result<Vec<u8>, String> {
+    use x509_cert::Certificate;
+    use x509_cert::der::{Decode, Encode};
+
+    let cert = Certificate::from_der(cert_der).map_err(|e| format!("cert parse failed: {}", e))?;
+
+    cert.tbs_certificate()
+        .subject_public_key_info()
+        .to_der()
+        .map_err(|e| format!("SPKI re-encode failed: {}", e))
 }
 
 #[cfg(test)]
@@ -716,6 +792,7 @@ mod mode_enforcement_tests {
             Some(Arc::new(parking_lot::RwLock::new(bundle))),
             3600,
             mode,
+            crate::config::TpmConfig::default(),
         )
     }
 

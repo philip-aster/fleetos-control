@@ -505,6 +505,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ca_service.as_ref().map(|ca| ca.data_control.clone()),
             config.svid.node_ttl_secs,
             config.attestation.mode,
+            config.tpm.clone(),
         );
 
     // CaService is only available when the local CA is loaded.

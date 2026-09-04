@@ -41,6 +41,10 @@ pub struct ControlConfig {
     #[serde(default)]
     pub attestation: AttestationConfig,
 
+    /// TPM backend configuration.
+    #[serde(default)]
+    pub tpm: TpmConfig,
+
     /// gRPC listener addresses.
     pub listeners: ListenerConfig,
 
@@ -432,6 +436,60 @@ fn default_attestation_mode() -> AttestationMode {
 
 fn default_join_token_ttl_secs() -> u16 {
     3600
+}
+
+// ---------------------------------------------------------------------------
+// TPM backend (Step 10 / ATT-TSS) — hardware default, swtpm fallback
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Deserialize)]
+pub struct TpmConfig {
+    /// Backend: "device" (hardware, default), "swtpm", or "mssim".
+    #[serde(default = "default_tpm_backend")]
+    pub backend: TpmBackend,
+    /// Device path for the "device" backend.
+    #[serde(default = "default_tpm_device_path")]
+    pub device_path: String,
+    /// Host for the "swtpm"/"mssim" backends.
+    #[serde(default = "default_tpm_host")]
+    pub host: String,
+    /// Port for the "swtpm"/"mssim" backends.
+    #[serde(default = "default_tpm_port")]
+    pub port: u16,
+}
+
+impl Default for TpmConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_tpm_backend(),
+            device_path: default_tpm_device_path(),
+            host: default_tpm_host(),
+            port: default_tpm_port(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TpmBackend {
+    /// Hardware TPM via the kernel resource manager.
+    Device,
+    /// Software TPM (`swtpm`) over a TCP socket.
+    Swtpm,
+    /// Microsoft TPM simulator over a TCP socket.
+    Mssim,
+}
+
+fn default_tpm_backend() -> TpmBackend {
+    TpmBackend::Device
+}
+fn default_tpm_device_path() -> String {
+    "/dev/tpmrm0".to_owned()
+}
+fn default_tpm_host() -> String {
+    "localhost".to_owned()
+}
+fn default_tpm_port() -> u16 {
+    2321
 }
 
 // ---------------------------------------------------------------------------
