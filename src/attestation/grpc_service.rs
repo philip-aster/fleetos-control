@@ -517,13 +517,13 @@ impl AttestationService for AttestationServiceImpl {
             return Err(Status::invalid_argument("csr_der cannot be empty"));
         }
 
-        // Find the matching pending activation by trying HMAC verification
-        // against each stored record. The number of pending activations is
-        // small (bounded by the nonce cap).
+        // Find the matching pending activation by HMAC, sweeping expired
+        // records opportunistically. Pending activations are bounded by the
+        // nonce cap, so a full scan is cheap.
         let mut matched: Option<PendingActivationRecord> = None;
         let mut matched_nonce: Option<Vec<u8>> = None;
+        let mut expired_keys: Vec<Vec<u8>> = Vec::new();
         for guard in self.pending_activations.prefix(Vec::<u8>::new()) {
-            // FIX: use into_inner() to get both key and value without moving guard twice
             let (key, value) = match guard.into_inner() {
                 Ok(kv) => kv,
                 Err(e) => {
@@ -532,31 +532,58 @@ impl AttestationService for AttestationServiceImpl {
                 }
             };
             if let Ok(record) = postcard::from_bytes::<PendingActivationRecord>(value.as_ref()) {
-                // Check expiry.
                 let now = time::OffsetDateTime::now_utc().unix_timestamp();
                 if now > record.expires_at {
+                    expired_keys.push(key.to_vec());
                     continue;
                 }
-                // Verify HMAC(key=S, payload=server_nonce) using BLAKE3 keyed hash.
-                let expected = blake3::keyed_hash(
-                    record
-                        .secret
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| Status::internal("invalid secret length"))?,
-                    &record.server_nonce,
-                );
-                if expected.as_bytes() == req.hmac.as_slice() {
-                    matched = Some(record);
-                    matched_nonce = Some(key.to_vec());
-                    break;
+                // Compute HMAC only until a match is found.
+                if matched.is_none() {
+                    let expected = blake3::keyed_hash(
+                        record
+                            .secret
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| Status::internal("invalid secret length"))?,
+                        &record.server_nonce,
+                    );
+                    if expected.as_bytes() == req.hmac.as_slice() {
+                        matched = Some(record);
+                        matched_nonce = Some(key.to_vec());
+                    }
                 }
             }
+        }
+
+        // Sweep expired pending activations (bounded-leak guard).
+        for key in expired_keys {
+            let _ = self.pending_activations.remove(key.as_slice());
         }
 
         let record = matched.ok_or_else(|| {
             Status::permission_denied("no matching pending activation for this HMAC proof")
         })?;
+
+        // Re-check EK state before activation. The EK may have been revoked or
+        // expired between RequestActivation and SubmitActivationProof (TOCTOU).
+        let ek_bytes = self
+            .node_eks
+            .get(record.ek_fingerprint.as_bytes())
+            .map_err(|e| Status::internal(format!("EK re-check lookup failed: {}", e)))?
+            .ok_or_else(|| Status::permission_denied("EK not registered"))?;
+        let ek_record: crate::raft::records::NodeEkRecord = postcard::from_bytes(&ek_bytes)
+            .map_err(|e| Status::internal(format!("corrupt EK record: {}", e)))?;
+        if ek_record.state == crate::raft::records::EkRegistrationState::Revoked {
+            return Err(Status::permission_denied(
+                "EK registration has been revoked",
+            ));
+        }
+        if let Some(expires_at) = ek_record.expires_at {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            if now > expires_at {
+                return Err(Status::permission_denied("EK registration has expired"));
+            }
+        }
 
         // Consume the pending activation (single-use).
         if let Some(nonce_key) = matched_nonce {
@@ -715,8 +742,18 @@ mod mode_enforcement_tests {
         }
     }
 
-    /// Build a real AttestationServiceImpl backed by a single-node Raft, in the given mode.
+    /// Existing helper — returns only the service. All 8 current tests keep
+    /// calling this unchanged.
     async fn service_with_mode(name: &str, mode: AttestationMode) -> AttestationServiceImpl {
+        service_with_mode_full(name, mode).await.0
+    }
+
+    /// New helper — returns the service AND the keyspaces so Step 9 tests can
+    /// seed records directly.
+    async fn service_with_mode_full(
+        name: &str,
+        mode: AttestationMode,
+    ) -> (AttestationServiceImpl, crate::storage::Keyspaces) {
         let dir = std::env::temp_dir().join(format!(
             "fleetos-attest-mode-{}-{}",
             std::process::id(),
@@ -773,7 +810,7 @@ mod mode_enforcement_tests {
         let bundle =
             crate::ca::trust_bundle::TrustBundle::generate_root("test.example.internal").unwrap();
 
-        AttestationServiceImpl::new(
+        let service = AttestationServiceImpl::new(
             Arc::new(crate::attestation::nonce::NonceManager::new(
                 keyspaces.nonces.clone(),
             )),
@@ -793,7 +830,170 @@ mod mode_enforcement_tests {
             3600,
             mode,
             crate::config::TpmConfig::default(),
-        )
+        );
+        (service, keyspaces)
+    }
+
+    // --- Step 9 (ATT-ACTIVATE): submit_activation_proof hardening ---
+
+    fn seed_pending_activation(
+        keyspaces: &crate::storage::Keyspaces,
+        fingerprint: &str,
+        secret: [u8; 32],
+        nonce: Vec<u8>,
+        ttl_secs: i64,
+    ) {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let record = PendingActivationRecord {
+            ek_fingerprint: fingerprint.to_owned(),
+            ak_pub: vec![0x01, 0x02],
+            server_nonce: nonce.clone(),
+            secret: secret.to_vec(),
+            created_at: now,
+            expires_at: now + ttl_secs,
+        };
+        let bytes = postcard::to_allocvec(&record).unwrap();
+        keyspaces
+            .pending_activations
+            .insert(record.server_nonce.as_slice(), bytes.as_slice())
+            .unwrap();
+    }
+
+    fn seed_ek(
+        keyspaces: &crate::storage::Keyspaces,
+        fingerprint: &str,
+        state: crate::raft::records::EkRegistrationState,
+        expires_at: Option<i64>,
+    ) {
+        let record = crate::raft::records::NodeEkRecord {
+            ek_fingerprint: fingerprint.to_owned(),
+            ek_pub: vec![0x30, 0x01],
+            ek_cert_der: vec![],
+            node_id: String::new(),
+            registered_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            expires_at,
+            state,
+        };
+        let bytes = postcard::to_allocvec(&record).unwrap();
+        keyspaces
+            .node_eks
+            .insert(fingerprint.as_bytes(), bytes.as_slice())
+            .unwrap();
+    }
+
+    fn make_proof(secret: &[u8; 32], nonce: &[u8], csr_der: Vec<u8>) -> ActivationProof {
+        let hmac = blake3::keyed_hash(secret, nonce);
+        ActivationProof {
+            hmac: hmac.as_bytes().to_vec(),
+            quote: vec![0x01],
+            quote_signature: vec![0x02],
+            pcr_selection: vec![],
+            csr_der,
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_pending_activation_is_not_matched() {
+        let (svc, keyspaces) =
+            service_with_mode_full("act-expired-pending", AttestationMode::Secure).await;
+        let secret = [0x42u8; 32];
+        let nonce = vec![0xABu8; 16];
+        // ttl = -100 → already expired
+        seed_pending_activation(&keyspaces, "aabbccdd", secret, nonce.clone(), -100);
+        let proof = make_proof(&secret, &nonce, vec![0x30, 0x03]);
+        let err = svc
+            .submit_activation_proof(Request::new(proof))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(err.message().contains("no matching pending activation"));
+    }
+
+    #[tokio::test]
+    async fn revoked_ek_rejects_activation() {
+        let (svc, keyspaces) =
+            service_with_mode_full("act-revoked-ek", AttestationMode::Secure).await;
+        let secret = [0x42u8; 32];
+        let nonce = vec![0xABu8; 16];
+        let fp = "aabbccdd";
+        seed_pending_activation(&keyspaces, fp, secret, nonce.clone(), 300);
+        seed_ek(
+            &keyspaces,
+            fp,
+            crate::raft::records::EkRegistrationState::Revoked,
+            None,
+        );
+        let proof = make_proof(&secret, &nonce, vec![0x30, 0x03]);
+        let err = svc
+            .submit_activation_proof(Request::new(proof))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(err.message().contains("revoked"));
+    }
+
+    #[tokio::test]
+    async fn expired_ek_rejects_activation() {
+        let (svc, keyspaces) =
+            service_with_mode_full("act-expired-ek", AttestationMode::Secure).await;
+        let secret = [0x42u8; 32];
+        let nonce = vec![0xABu8; 16];
+        let fp = "aabbccdd";
+        seed_pending_activation(&keyspaces, fp, secret, nonce.clone(), 300);
+        let past = time::OffsetDateTime::now_utc().unix_timestamp() - 100;
+        seed_ek(
+            &keyspaces,
+            fp,
+            crate::raft::records::EkRegistrationState::Pending,
+            Some(past),
+        );
+        let proof = make_proof(&secret, &nonce, vec![0x30, 0x03]);
+        let err = svc
+            .submit_activation_proof(Request::new(proof))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(err.message().contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn valid_ek_activation_issues_svid_with_empty_keypair() {
+        let (svc, keyspaces) =
+            service_with_mode_full("act-valid-ek", AttestationMode::Secure).await;
+        let secret = [0x42u8; 32];
+        let nonce = vec![0xABu8; 16];
+        let fp = "aabbccdd";
+        seed_pending_activation(&keyspaces, fp, secret, nonce.clone(), 300);
+        seed_ek(
+            &keyspaces,
+            fp,
+            crate::raft::records::EkRegistrationState::Pending,
+            None,
+        );
+        // Build a real CSR with a SPIFFE SAN so extract + sign succeed.
+        let params = crate::ca::rcgen_impl::SvidParams {
+            spiffe_id: "spiffe://test.example.internal/ns/system/node/test-node".to_owned(),
+            kind: crate::ca::rcgen_impl::SvidKind::Node,
+            role: None,
+            ordinal: None,
+            degraded: false,
+            ttl_secs: 3600,
+        };
+        let csr = crate::ca::rcgen_impl::build_csr(&params).unwrap();
+        let proof = make_proof(&secret, &nonce, csr.csr_der);
+        let resp = svc
+            .submit_activation_proof(Request::new(proof))
+            .await
+            .expect("activation should succeed");
+        let svid = resp.into_inner();
+        assert!(
+            !svid.cert_chain_der.is_empty(),
+            "cert chain must be present"
+        );
+        assert!(
+            svid.keypair_der.is_empty(),
+            "keypair_der must be empty — the node holds its own private key (CR-10)"
+        );
     }
 
     fn is_mode_gate(err: &tonic::Status) -> bool {
