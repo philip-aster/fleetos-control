@@ -1,20 +1,12 @@
+use openraft::Raft;
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
-use openraft::{Raft, Vote};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use super::{
     FleetosRaftConfig, JoinRequestPayload, JoinResponsePayload, RaftRpc, RaftTransportService,
+    SnapshotWire,
 };
-
-/// Wire format for snapshot transmission.
-/// openraft::Snapshot contains Cursor<Vec<u8>> which doesn't implement Serialize,
-/// so we extract the bytes and send them with the metadata separately.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct SnapshotWire {
-    meta: openraft::SnapshotMeta<u64, openraft::BasicNode>,
-    data: Vec<u8>,
-}
 
 pub struct RaftTransportServerImpl {
     raft: Arc<Raft<FleetosRaftConfig>>,
@@ -88,16 +80,10 @@ impl RaftTransportService for RaftTransportServerImpl {
                 .map_err(|e| Status::invalid_argument(format!("deserialize failed: {}", e)))?;
 
             let req = InstallSnapshotRequest {
-                vote: Vote::new(
-                    wire.meta
-                        .last_log_id
-                        .map(|id| id.leader_id.term)
-                        .unwrap_or(0),
-                    rpc.sender_id,
-                ),
+                vote: wire.vote,
                 meta: wire.meta,
                 offset: 0,
-                data: wire.data, // InstallSnapshotRequest.data is Vec<u8>, not Cursor
+                data: wire.data,
                 done: true,
             };
             self.raft.install_snapshot(req).await

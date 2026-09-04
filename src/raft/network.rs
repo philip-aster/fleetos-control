@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use super::{FleetosRaftConfig, RaftRpc, RaftTransportClient};
+use super::{FleetosRaftConfig, RaftRpc, RaftTransportClient, SnapshotWire};
 
 fn der_to_pem(der: &[u8], label: &str) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -28,12 +28,6 @@ fn der_to_pem(der: &[u8], label: &str) -> String {
     }
     pem.push_str(&format!("-----END {}-----\n", label));
     pem
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct SnapshotWire {
-    meta: openraft::SnapshotMeta<u64, openraft::BasicNode>,
-    data: Vec<u8>,
 }
 
 /// Client TLS material for the Raft transport (Step 17 / S-2).
@@ -221,6 +215,7 @@ impl RaftNetwork<FleetosRaftConfig> for TonicRaftNetwork {
         let wire = SnapshotWire {
             meta: snapshot.meta,
             data,
+            vote,
         };
 
         let payload =

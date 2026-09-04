@@ -15,6 +15,7 @@ pub mod snapshot;
 pub mod state_machine;
 pub mod store;
 
+use openraft::Vote;
 use openraft::declare_raft_types;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -260,6 +261,19 @@ pub struct JoinResponsePayload {
     /// If the contacted node is not the leader, the leader's raft address
     /// so the joiner can retry against it.
     pub leader_address: Option<String>,
+}
+
+/// Wire format for snapshot transmission over the Raft transport.
+///
+/// Carries the leader's current `Vote` explicitly so the follower can verify
+/// the request comes from the current leader. Deriving the vote from
+/// `meta.last_log_id.leader_id.term` is incorrect — that term may lag the
+/// leader's current term after an election.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SnapshotWire {
+    pub meta: openraft::SnapshotMeta<u64, openraft::BasicNode>,
+    pub data: Vec<u8>,
+    pub vote: Vote<u64>,
 }
 
 /// Derive a deterministic Raft node ID from a stable string handle.
