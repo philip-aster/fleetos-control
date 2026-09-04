@@ -6,7 +6,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use fjall::Database;
+use fjall::{Database, Readable};
 use openraft::{
     BasicNode, LogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StoredMembership,
 };
@@ -53,12 +53,15 @@ impl FjallSnapshotBuilder {
     /// using a consistent snapshot view to prevent torn reads.
     fn collect_keyspaces_from_view(
         &self,
-        _snapshot_view: &fjall::Snapshot,
+        snapshot_view: &fjall::Snapshot,
     ) -> Result<Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)>, StorageError<u64>> {
         let mut result = Vec::new();
         for (name, ks) in self.keyspaces.snapshot_keyspaces() {
             let mut pairs = Vec::new();
-            for guard in ks.prefix(Vec::<u8>::new()) {
+            // Read through the snapshot view to guarantee a consistent
+            // point-in-time read across all keyspaces (prevents torn reads
+            // if concurrent writes happen during snapshot build).
+            for guard in snapshot_view.prefix(ks, Vec::<u8>::new()) {
                 let (key, value) = guard.into_inner().map_err(read_err)?;
                 pairs.push((key.to_vec(), value.to_vec()));
             }
