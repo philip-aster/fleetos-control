@@ -14,8 +14,6 @@
 
 pub mod id;
 pub mod revocation;
-pub mod ttl;
-
 use thiserror::Error;
 
 use fleetos_core::spiffe::SpiffeId;

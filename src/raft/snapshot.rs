@@ -38,7 +38,7 @@ fn read_err(e: fjall::Error) -> StorageError<u64> {
 }
 
 pub struct FjallSnapshotBuilder {
-    /// Will be used to create a cross-keyspace consistent snapshot via `db.snapshot()`
+    /// Used to create a cross-keyspace consistent snapshot via `db.snapshot()`
     /// before iterating, preventing torn reads if writes happen during snapshot build.
     db: Arc<Database>,
     keyspaces: Keyspaces,

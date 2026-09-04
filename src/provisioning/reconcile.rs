@@ -163,26 +163,9 @@ impl ProvisioningReconciler {
     }
 
     /// Load all node pool records from the `node_pools` keyspace.
-    ///
-    /// Each record is stored with `pool_id` as the key and postcard-serialized
-    /// `NodePoolRecord` as the value. A full prefix scan retrieves all pools.
     fn load_pools(&self) -> Result<Vec<NodePoolRecord>, ProvisioningError> {
-        let mut records = Vec::new();
-
-        // prefix() with empty prefix scans the entire keyspace.
-        // Guard::value() moves the guard, so access it once.
-        for guard in self.storage.node_pools.prefix(Vec::<u8>::new()) {
-            let value = guard.value().map_err(|e| {
-                ProvisioningError::Storage(crate::storage::StorageError::Storage(e))
-            })?;
-
-            if let Ok(record) = postcard::from_bytes::<NodePoolRecord>(value.as_ref()) {
-                records.push(record);
-            } else {
-                tracing::warn!("skipping malformed node pool record");
-            }
-        }
-
-        Ok(records)
+        self.storage
+            .list_node_pools()
+            .map_err(ProvisioningError::Storage)
     }
 }

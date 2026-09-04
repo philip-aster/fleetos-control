@@ -192,56 +192,6 @@ pub fn extract_all_spiffe_uri_sans(cert_der: &[u8]) -> Result<Vec<String>, TlsEr
     }
 }
 
-/// Extract the custom OID extensions from a certificate.
-///
-/// Returns (role, ordinal, is_degraded) if present.
-/// Uses the FleetOS OID arcs defined in `ca/oid.rs`.
-pub fn extract_fleetos_extensions(cert_der: &[u8]) -> Result<FleetosExtensions, TlsError> {
-    let (_, cert) = parse_x509_certificate(cert_der)
-        .map_err(|e| TlsError::Certificate(format!("failed to parse certificate: {}", e)))?;
-
-    let mut role: Option<String> = None;
-    let mut ordinal: Option<u32> = None;
-    let mut is_degraded: bool = false;
-
-    for ext in cert.extensions() {
-        let oid_str = ext.oid.to_string();
-
-        match oid_str.as_str() {
-            // FleetOS Role OID: 1.3.6.1.4.1.66561.1.1
-            "1.3.6.1.4.1.66561.1.1" => {
-                role = Some(String::from_utf8_lossy(ext.value).to_string());
-            }
-            // FleetOS Degraded marker OID: 1.3.6.1.4.1.66561.1.2
-            "1.3.6.1.4.1.66561.1.2" => {
-                // ASN.1 BOOLEAN: tag(0x01) length(0x01) value(0xFF or 0x00)
-                is_degraded = ext.value.len() >= 3 && ext.value[2] == 0xFF;
-            }
-            // FleetOS Ordinal OID: 1.3.6.1.4.1.66561.1.3
-            "1.3.6.1.4.1.66561.1.3" => {
-                if let Ok(s) = std::str::from_utf8(ext.value) {
-                    ordinal = s.parse::<u32>().ok();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(FleetosExtensions {
-        role,
-        ordinal,
-        is_degraded,
-    })
-}
-
-/// FleetOS-specific X.509 extensions extracted from a certificate.
-#[derive(Debug, Clone, Default)]
-pub struct FleetosExtensions {
-    pub role: Option<String>,
-    pub ordinal: Option<u32>,
-    pub is_degraded: bool,
-}
-
 /// Hot-swappable server certificate resolver for SVID renewal (G-5).
 #[derive(Debug)]
 pub struct DynamicCertResolver {

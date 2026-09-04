@@ -170,9 +170,6 @@ pub trait PlacementVerifier {
 
 /// Placement verifier backed by fjall storage.
 pub struct StoragePlacementVerifier {
-    /// Will be used when implementing actual placement lookup
-    /// (querying placements keyspace to verify node hosts the workload).
-    #[allow(dead_code)]
     placements_keyspace: Keyspace,
 }
 
