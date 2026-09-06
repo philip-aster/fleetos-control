@@ -218,6 +218,189 @@ pub async fn join_cluster(
     }
 }
 
+/// Execute the SECURE join flow against an existing control node.
+///
+/// Uses TPM 2.0 credential activation (CR-10) instead of a join token:
+///   1. RequestActivation   — server issues a TPM2_MakeCredential challenge
+///   2. ActivateCredential  — TPM recovers the secret S (proves EK possession)
+///   3. activation proof    — HMAC(server_nonce) keyed by S
+///   4. TPM2_Quote          — binds server_nonce + PCRs into a signed quote
+///   5. SubmitActivationProof — server verifies, signs the CSR, returns the SVID
+///   6. GetTrustBundle      — root bundle for subsequent mTLS
+///
+/// No join token is used. The node is authorized purely by its endorsement key.
+///
+/// The pending-activation record is node-local, so RequestActivation and
+/// SubmitActivationProof must hit the same node. SubmitActivationProof proposes
+/// ActivateNodeEk through Raft, which requires the leader; on a leader redirect
+/// we restart the full attestation against the leader.
+#[cfg(feature = "tpm")]
+pub async fn join_cluster_secure(
+    join_target: &str,
+    node_name: &str,
+    trust_domain: &str,
+    join_trust_bundle_pem: &str,
+    tpm_config: &crate::config::TpmConfig,
+) -> Result<JoinResult, JoinError> {
+    use fleetos_core::attestation::compute_activation_proof;
+    use fleetos_core::attestation::tpm::AttestationSession;
+    use fleetos_core::crypto::generate_sealing_keypair;
+    use fleetos_core::proto::identity::{ActivationProof, ActivationRequest};
+
+    tracing::info!(
+        join_target = %join_target,
+        node_name = %node_name,
+        "beginning secure join flow (TPM credential activation)"
+    );
+
+    // Build the CSR once — it does not depend on the attestation challenge.
+    let claimed_spiffe_id = format!("spiffe://{}/ns/system/control/{}", trust_domain, node_name);
+    let csr_params = crate::ca::rcgen_impl::SvidParams {
+        spiffe_id: claimed_spiffe_id.clone(),
+        kind: crate::ca::rcgen_impl::SvidKind::Control,
+        role: None,
+        ordinal: None,
+        degraded: false,
+        ttl_secs: 3600,
+    };
+    let csr_bundle =
+        crate::ca::rcgen_impl::build_csr(&csr_params).map_err(|e| JoinError::Csr(e.to_string()))?;
+
+    // X25519 sealing keypair. The public half rides in ActivationProof so
+    // control can persist it for secret delivery. Control nodes do not fetch
+    // secrets today, so the private half is not persisted; Zeroizing drops it.
+    let (_sealing_secret, sealing_pubkey) = generate_sealing_keypair();
+
+    // Create the TPM attestation session (ephemeral AK + EK).
+    let endpoint = fleetos_core::attestation::tpm::TpmEndpoint::from(tpm_config);
+    let mut session = AttestationSession::begin(&endpoint)
+        .map_err(|e| JoinError::Attestation(format!("TPM session begin failed: {}", e)))?;
+    let ak_pub = session
+        .ak_pub()
+        .map_err(|e| JoinError::Attestation(format!("failed to read AK public key: {}", e)))?;
+    let ek_cert_der = session
+        .read_ek_cert()
+        .map_err(|e| JoinError::Attestation(format!("failed to read EK certificate: {}", e)))?
+        .unwrap_or_default();
+    let ek_pub = session
+        .ek_pub()
+        .map_err(|e| JoinError::Attestation(format!("failed to read EK public key: {}", e)))?;
+
+    // PCR indices to quote: firmware (0), secure boot (7), kernel (9).
+    // These must match the PCR policy the operator registered for this node.
+    let pcr_indices: Vec<u8> = vec![0, 7, 9];
+
+    let mut target = channel_addr(join_target);
+    let mut redirects = 0usize;
+    const MAX_REDIRECTS: usize = 5;
+
+    loop {
+        // Server-trust TLS channel to the current target (pre-SVID).
+        let tls_config = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(
+                join_trust_bundle_pem,
+            ))
+            .domain_name(trust_domain);
+        let channel = tonic::transport::Channel::from_shared(target.clone())
+            .map_err(|e| JoinError::Connection(e.to_string()))?
+            .tls_config(tls_config)
+            .map_err(|e| JoinError::Connection(e.to_string()))?
+            .connect()
+            .await
+            .map_err(|e| JoinError::Connection(e.to_string()))?;
+
+        let mut attestation_client = AttestationServiceClient::new(channel.clone());
+
+        // Step 1: RequestActivation — obtain the MakeCredential challenge.
+        let challenge = attestation_client
+            .request_activation(ActivationRequest {
+                ak_pub: ak_pub.clone(),
+                ek_cert_der: ek_cert_der.clone(),
+                ek_pub: ek_pub.clone(),
+            })
+            .await
+            .map_err(|e| JoinError::Attestation(format!("RequestActivation failed: {}", e)))?
+            .into_inner();
+
+        // Step 2: ActivateCredential — recover the secret S inside the TPM.
+        let recovered_secret = session
+            .activate(&challenge.credential_blob, &challenge.secret)
+            .map_err(|e| JoinError::Attestation(format!("TPM ActivateCredential failed: {}", e)))?;
+        let secret_array: [u8; 32] = recovered_secret.as_slice().try_into().map_err(|_| {
+            JoinError::Attestation("recovered credential secret is not 32 bytes".to_owned())
+        })?;
+
+        // Step 3: activation proof = HMAC(server_nonce) keyed by S.
+        let hmac = compute_activation_proof(&secret_array, &challenge.server_nonce);
+
+        // Step 4: TPM2_Quote binding server_nonce and the selected PCRs.
+        let quote_output = session
+            .quote(&challenge.server_nonce, &pcr_indices)
+            .map_err(|e| JoinError::Attestation(format!("TPM Quote failed: {}", e)))?;
+        let pcr_selection = postcard::to_allocvec(&quote_output.pcr_values)?;
+
+        // Step 5: SubmitActivationProof — verify + sign CSR + issue SVID.
+        let proof = ActivationProof {
+            hmac: hmac.to_vec(),
+            quote: quote_output.quote,
+            quote_signature: quote_output.signature,
+            pcr_selection,
+            csr_der: csr_bundle.csr_der.clone(),
+            agent_x25519_pubkey: sealing_pubkey.0.to_vec(),
+        };
+
+        match attestation_client.submit_activation_proof(proof).await {
+            Ok(svid_response) => {
+                let svid = svid_response.into_inner();
+                tracing::info!(
+                    spiffe_id = %claimed_spiffe_id,
+                    cert_len = svid.cert_chain_der.len(),
+                    "secure attestation complete, SVID issued"
+                );
+
+                // Step 6: GetTrustBundle — root bundle for subsequent mTLS.
+                let mut ca_client = CaServiceClient::new(channel);
+                let trust_bundle_response = ca_client
+                    .get_trust_bundle(TrustBundleRequest {})
+                    .await
+                    .map_err(|e| JoinError::TrustBundle(e.to_string()))?
+                    .into_inner();
+                let mut trust_bundle_pem = String::new();
+                for root_der in &trust_bundle_response.roots_der {
+                    let pem =
+                        der_to_pem(root_der, "CERTIFICATE").map_err(JoinError::TrustBundle)?;
+                    trust_bundle_pem.push_str(&pem);
+                }
+
+                return Ok(JoinResult {
+                    svid_cert_der: svid.cert_chain_der,
+                    // The node keeps the private key it generated for the CSR.
+                    svid_key_der: csr_bundle.private_key.to_vec(),
+                    trust_bundle_pem,
+                    claimed_spiffe_id,
+                });
+            }
+            Err(status) => {
+                if let Some(leader) = leader_redirect(&status) {
+                    redirects += 1;
+                    if redirects > MAX_REDIRECTS {
+                        return Err(JoinError::Attestation(
+                            "too many leader redirects during secure join".to_owned(),
+                        ));
+                    }
+                    tracing::info!(leader = %leader, "redirecting secure attestation to leader");
+                    target = channel_addr(&leader);
+                    continue;
+                }
+                return Err(JoinError::Attestation(format!(
+                    "SubmitActivationProof failed: {}",
+                    status
+                )));
+            }
+        }
+    }
+}
+
 /// Request cluster membership: add as learner (blocking until caught up),
 /// then promote to voter. Follows leader redirects. Retries forever —
 /// this only runs on a first join boot and must eventually succeed or
