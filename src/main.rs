@@ -12,7 +12,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use fleetos_control::attestation::join_token::JoinTokenStore;
 use fleetos_control::ca::CaService;
-use fleetos_control::config::{ClusterMode, ControlConfig};
+use fleetos_control::config::{AttestationMode, ClusterMode, ControlConfig};
 use fleetos_control::controllers::leader::{ControllerFactory, LeaderGate};
 use fleetos_control::controllers::{
     CronController, WorkloadController, node_controller::NodeController,
@@ -1063,14 +1063,10 @@ async fn init_raft_cluster(
                     "cluster.join_raft_target is required when mode = \"join\"",
                 )
             })?;
-            if config.cluster.join_token.is_empty() {
-                return Err(Box::<dyn std::error::Error>::from(
-                    "cluster.join_token is required when mode = \"join\"",
-                ));
-            }
-
             let is_restart = keyspaces.raft_log.first_key_value().is_some();
             if is_restart {
+                // Restart: CA is already replicated and persisted; resume membership.
+                // No attestation (and no join token) is needed on restart.
                 tracing::info!("join mode: persisted raft state found, resuming membership");
                 let ca = ca_service.expect("CA service required for join restart");
                 let (cert_der, key_der, trust_pem) = {
@@ -1107,7 +1103,7 @@ async fn init_raft_cluster(
                     role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
                 }
             } else {
-                tracing::info!(join_target = %join_target, "join mode: attesting to existing cluster");
+                // First boot: attest to the existing cluster to obtain an SVID.
                 let join_trust_bundle_pem = config
                     .cluster
                     .join_trust_bundle_path
@@ -1125,43 +1121,108 @@ async fn init_raft_cluster(
                             "cluster.join_trust_bundle_path is required when mode = \"join\"",
                         )
                     })?;
-                let join_result = fleetos_control::join::join_cluster(
-                    join_target,
-                    &config.cluster.join_token,
-                    &config.node.name,
-                    &config.trust_domains.data_control,
-                    &join_trust_bundle_pem,
-                )
-                .await
-                .map_err(|e| {
-                    Box::<dyn std::error::Error>::from(format!("join flow failed: {}", e))
-                })?;
-
-                tracing::info!(
-                    spiffe_id = %join_result.claimed_spiffe_id,
-                    "join attestation complete, SVID acquired"
-                );
-
-                let mtls = fleetos_control::tls::mtls::MtlsConfig {
-                    cert_chain: vec![rustls::pki_types::CertificateDer::from(
-                        join_result.svid_cert_der.clone(),
-                    )],
-                    private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
-                        rustls::pki_types::PrivatePkcs8KeyDer::from(
-                            join_result.svid_key_der.clone(),
-                        ),
-                    ),
-                    trust_bundle_pem: join_result.trust_bundle_pem.clone(),
-                    role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
-                };
-
-                join_info = Some(JoinInfo {
-                    node_id,
-                    svid_cert_der: join_result.svid_cert_der.clone(),
-                    svid_key_der: join_result.svid_key_der.clone(),
-                    trust_bundle_pem: join_result.trust_bundle_pem.clone(),
-                });
-                mtls
+                // C-4: branch on attestation mode.
+                match config.attestation.mode {
+                    AttestationMode::Insecure => {
+                        if config.cluster.join_token.is_empty() {
+                            return Err(Box::<dyn std::error::Error>::from(
+                                "cluster.join_token is required when attestation.mode = \"insecure\"",
+                            ));
+                        }
+                        tracing::info!(
+                            join_target = %join_target,
+                            "join mode: insecure attestation (join token)"
+                        );
+                        let join_result = fleetos_control::join::join_cluster(
+                            join_target,
+                            &config.cluster.join_token,
+                            &config.node.name,
+                            &config.trust_domains.data_control,
+                            &join_trust_bundle_pem,
+                        )
+                        .await
+                        .map_err(|e| {
+                            Box::<dyn std::error::Error>::from(format!("join flow failed: {}", e))
+                        })?;
+                        tracing::info!(
+                            spiffe_id = %join_result.claimed_spiffe_id,
+                            "join attestation complete, SVID acquired"
+                        );
+                        let mtls = fleetos_control::tls::mtls::MtlsConfig {
+                            cert_chain: vec![rustls::pki_types::CertificateDer::from(
+                                join_result.svid_cert_der.clone(),
+                            )],
+                            private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
+                                rustls::pki_types::PrivatePkcs8KeyDer::from(
+                                    join_result.svid_key_der.clone(),
+                                ),
+                            ),
+                            trust_bundle_pem: join_result.trust_bundle_pem.clone(),
+                            role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
+                        };
+                        join_info = Some(JoinInfo {
+                            node_id,
+                            svid_cert_der: join_result.svid_cert_der.clone(),
+                            svid_key_der: join_result.svid_key_der.clone(),
+                            trust_bundle_pem: join_result.trust_bundle_pem.clone(),
+                        });
+                        mtls
+                    }
+                    AttestationMode::Secure => {
+                        #[cfg(not(feature = "tpm"))]
+                        {
+                            let _ = join_trust_bundle_pem;
+                            return Err(Box::<dyn std::error::Error>::from(
+                                "attestation.mode = \"secure\" requires the `tpm` feature \
+                                 (included in `production`)",
+                            ));
+                        }
+                        #[cfg(feature = "tpm")]
+                        {
+                            tracing::info!(
+                                join_target = %join_target,
+                                "join mode: secure attestation (TPM credential activation)"
+                            );
+                            let join_result = fleetos_control::join::join_cluster_secure(
+                                join_target,
+                                &config.node.name,
+                                &config.trust_domains.data_control,
+                                &join_trust_bundle_pem,
+                                &config.tpm,
+                            )
+                            .await
+                            .map_err(|e| {
+                                Box::<dyn std::error::Error>::from(format!(
+                                    "secure join flow failed: {}",
+                                    e
+                                ))
+                            })?;
+                            tracing::info!(
+                                spiffe_id = %join_result.claimed_spiffe_id,
+                                "secure join attestation complete, SVID acquired"
+                            );
+                            let mtls = fleetos_control::tls::mtls::MtlsConfig {
+                                cert_chain: vec![rustls::pki_types::CertificateDer::from(
+                                    join_result.svid_cert_der.clone(),
+                                )],
+                                private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
+                                    rustls::pki_types::PrivatePkcs8KeyDer::from(
+                                        join_result.svid_key_der.clone(),
+                                    ),
+                                ),
+                                trust_bundle_pem: join_result.trust_bundle_pem.clone(),
+                                role: fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
+                            };
+                            join_info = Some(JoinInfo {
+                                node_id,
+                                svid_cert_der: join_result.svid_cert_der.clone(),
+                                svid_key_der: join_result.svid_key_der.clone(),
+                                trust_bundle_pem: join_result.trust_bundle_pem.clone(),
+                            });
+                            mtls
+                        }
+                    }
+                }
             }
         }
     };
