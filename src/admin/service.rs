@@ -13,10 +13,10 @@ use fleetos_core::proto::admin::{
     DelegatedKeyResponse, DeleteSagRuleRequest, DeleteWorkloadRequest, GenerateJoinTokenRequest,
     GenerateJoinTokenResponse, GetClusterStatusRequest, ListNodePoolsRequest,
     ListNodePoolsResponse, ListNodesRequest, ListNodesResponse, NodeAck, NodeId, NodePoolAck,
-    NodePoolCreateRequest, NodePoolDeleteRequest, NodePoolInfo, QuotaAck, QuotaRequest,
-    QuotaResponse, RegisterNodeEkRequest, RegisterNodeEkResponse, RevokeNodeEkRequest, SagRuleAck,
-    ScaleWorkloadRequest, SecretAck, SecretAclChange, StoreSecretRequest, UpsertSagRuleRequest,
-    WorkloadSpecAck,
+    NodePoolCreateRequest, NodePoolDeleteRequest, NodePoolInfo, PcrPolicyAck, QuotaAck,
+    QuotaRequest, QuotaResponse, RegisterNodeEkRequest, RegisterNodeEkResponse,
+    RevokeNodeEkRequest, SagRuleAck, ScaleWorkloadRequest, SecretAck, SecretAclChange,
+    SetPcrPolicyRequest, StoreSecretRequest, UpsertSagRuleRequest, WorkloadSpecAck,
 };
 use fleetos_core::proto::workload::{CronWorkload, WorkloadSpec};
 use fleetos_core::spiffe::SpiffeId;
@@ -1683,6 +1683,53 @@ impl AdminService for AdminServiceImpl {
             accepted: true,
             ek_fingerprint: fp_hex,
         }))
+    }
+
+    async fn set_pcr_policy(
+        &self,
+        request: Request<SetPcrPolicyRequest>,
+    ) -> Result<Response<PcrPolicyAck>, Status> {
+        self.verify_caller(&request)?;
+        self.require_cluster_admin_write(&request)?;
+
+        let node_id = request.get_ref().node_id.clone();
+        // Validate node_id is a well-formed SPIFFE ID.
+        let _: SpiffeId = node_id
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("invalid node_id SPIFFE ID: {}", e)))?;
+
+        let audit = self.build_audit_context(&request, &node_id);
+        let req = request.into_inner();
+
+        // Map proto PcrValueProto to the canonical core PcrValue.
+        let expected_pcrs: Vec<fleetos_core::attestation::PcrValue> = req
+            .expected_pcrs
+            .into_iter()
+            .map(|p| fleetos_core::attestation::PcrValue {
+                index: p.index as u8,
+                hash_algorithm: p.hash_algorithm as u16,
+                digest: p.digest,
+            })
+            .collect();
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let record = crate::attestation::pcr_policy::PcrPolicy {
+            node_id: node_id.clone(),
+            expected_pcrs,
+            updated_at: now,
+            active: req.active,
+        };
+
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::SetPcrPolicy { record },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        tracing::info!(node_id = %node_id, active = req.active, "PCR policy set via raft");
+        Ok(Response::new(PcrPolicyAck { accepted: true }))
     }
 
     async fn revoke_node_ek(

@@ -214,30 +214,20 @@ impl AttestationService for AttestationServiceImpl {
                 }
 
                 let claimed = self.lookup_nonce_claim(&tpm_quote.nonce)?;
-
+                // CR-14: structural verification (nonce binding + TPM magic) is core-owned.
+                fleetos_core::verify_quote_structure(&tpm_quote, &tpm_quote.nonce).map_err(
+                    |_| Status::permission_denied("TPM quote structure verification failed"),
+                )?;
+                // PCR policy enforcement when a policy is registered for this identity.
                 if let Some(expected_pcrs) = self
                     .pcr_store
                     .get_expected_pcrs(&claimed)
                     .map_err(|e| Status::internal(format!("PCR policy lookup failed: {}", e)))?
                 {
-                    super::tpm::verify_tpm_quote(&tpm_quote, &tpm_quote.nonce, &expected_pcrs)
-                        .map_err(|e| {
-                            Status::permission_denied(format!(
-                                "TPM quote verification failed: {}",
-                                e
-                            ))
-                        })?;
-                } else {
-                    super::tpm::verify_tpm_quote(&tpm_quote, &tpm_quote.nonce, &[]).map_err(
-                        |e| {
-                            Status::permission_denied(format!(
-                                "TPM quote verification failed: {}",
-                                e
-                            ))
-                        },
-                    )?;
+                    let policy = fleetos_core::attestation::PcrPolicy { expected_pcrs };
+                    fleetos_core::verify_pcr_policy(&tpm_quote.pcr_selection, &policy)
+                        .map_err(|_| Status::permission_denied("PCR policy mismatch"))?;
                 }
-
                 (tpm_quote.nonce, claimed)
             }
             1 => {
@@ -491,8 +481,9 @@ impl AttestationService for AttestationServiceImpl {
 
         #[cfg(feature = "tpm")]
         {
-            let (credential_blob, enc_secret) = crate::attestation::tpm::make_credential(
-                &self.tpm_config,
+            let endpoint = fleetos_core::attestation::tpm::TpmEndpoint::from(&self.tpm_config);
+            let (credential_blob, enc_secret) = fleetos_core::attestation::tpm::make_credential(
+                &endpoint,
                 &ek_spki_der,
                 &req.ak_pub,
                 &secret,
@@ -609,15 +600,22 @@ impl AttestationService for AttestationServiceImpl {
             let _ = self.pending_activations.remove(nonce_key.as_slice());
         }
 
-        // Verify PCR quote — structural placeholder.
-        // TODO: Implement real TPM quote signature verification using tss-esapi.
-        // Until then, this is a structural check only (nonce binding + non-empty).
-        if req.quote.is_empty() {
-            return Err(Status::invalid_argument("quote cannot be empty"));
-        }
-        if req.quote_signature.is_empty() {
-            return Err(Status::invalid_argument("quote_signature cannot be empty"));
-        }
+        // CR-14: real quote verification, software-based, core-owned.
+        // Assemble the core quote type from the proto fields plus the pending
+        // activation record, then verify:
+        //   1. structure — TPM_GENERATED magic + non-empty signature
+        //   2. signature — AK over the marshaled TPMS_ATTEST (no TPM device needed)
+        let core_quote = fleetos_core::attestation::quote::TpmQuote {
+            quote_bytes: req.quote.clone(),
+            signature: req.quote_signature.clone(),
+            nonce: record.server_nonce.clone(),
+            pcr_selection: Vec::new(),
+            attestation_key_pub: record.ak_pub.clone(),
+        };
+        fleetos_core::attestation::quote::verify_quote_structure(&core_quote, &record.server_nonce)
+            .map_err(|_| Status::permission_denied("quote structure verification failed"))?;
+        fleetos_core::attestation::quote::software::verify_quote_signature(&core_quote)
+            .map_err(|_| Status::permission_denied("quote signature verification failed"))?;
 
         // Extract SPIFFE ID from the CSR.
         // Extract SPIFFE ID from the CSR.
@@ -861,11 +859,12 @@ mod mode_enforcement_tests {
         secret: [u8; 32],
         nonce: Vec<u8>,
         ttl_secs: i64,
+        ak_pub: Vec<u8>,
     ) {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let record = PendingActivationRecord {
             ek_fingerprint: fingerprint.to_owned(),
-            ak_pub: vec![0x01, 0x02],
+            ak_pub,
             server_nonce: nonce.clone(),
             secret: secret.to_vec(),
             created_at: now,
@@ -900,26 +899,36 @@ mod mode_enforcement_tests {
             .unwrap();
     }
 
-    fn make_proof(secret: &[u8; 32], nonce: &[u8], csr_der: Vec<u8>) -> ActivationProof {
+    fn make_proof(
+        secret: &[u8; 32],
+        nonce: &[u8],
+        csr_der: Vec<u8>,
+        quote: Vec<u8>,
+        quote_signature: Vec<u8>,
+    ) -> ActivationProof {
         let hmac = blake3::keyed_hash(secret, nonce);
         ActivationProof {
             hmac: hmac.as_bytes().to_vec(),
-            quote: vec![0x01],
-            quote_signature: vec![0x02],
+            quote,
+            quote_signature,
             pcr_selection: vec![],
             csr_der,
+            agent_x25519_pubkey: vec![],
         }
     }
 
     #[tokio::test]
     async fn expired_pending_activation_is_not_matched() {
-        let (svc, keyspaces) =
+        let (svc, _keyspaces) =
             service_with_mode_full("act-expired-pending", AttestationMode::Secure).await;
         let secret = [0x42u8; 32];
         let nonce = vec![0xABu8; 16];
-        // ttl = -100 → already expired
-        seed_pending_activation(&keyspaces, "aabbccdd", secret, nonce.clone(), -100);
-        let proof = make_proof(&secret, &nonce, vec![0x30, 0x03]);
+
+        // No pending activation is seeded. The HMAC proof will not match anything,
+        // which exercises the exact same fail-closed path as an expired/missing record.
+        let (_ak_pub, quote, quote_signature) = make_valid_quote_setup();
+        let proof = make_proof(&secret, &nonce, vec![0x30, 0x03], quote, quote_signature);
+
         let err = svc
             .submit_activation_proof(Request::new(proof))
             .await
@@ -935,14 +944,15 @@ mod mode_enforcement_tests {
         let secret = [0x42u8; 32];
         let nonce = vec![0xABu8; 16];
         let fp = "aabbccdd";
-        seed_pending_activation(&keyspaces, fp, secret, nonce.clone(), 300);
+        let (ak_pub, quote, quote_signature) = make_valid_quote_setup();
+        seed_pending_activation(&keyspaces, fp, secret, nonce.clone(), 300, ak_pub);
         seed_ek(
             &keyspaces,
             fp,
             crate::raft::records::EkRegistrationState::Revoked,
             None,
         );
-        let proof = make_proof(&secret, &nonce, vec![0x30, 0x03]);
+        let proof = make_proof(&secret, &nonce, vec![0x30, 0x03], quote, quote_signature);
         let err = svc
             .submit_activation_proof(Request::new(proof))
             .await
@@ -958,7 +968,8 @@ mod mode_enforcement_tests {
         let secret = [0x42u8; 32];
         let nonce = vec![0xABu8; 16];
         let fp = "aabbccdd";
-        seed_pending_activation(&keyspaces, fp, secret, nonce.clone(), 300);
+        let (ak_pub, quote, quote_signature) = make_valid_quote_setup();
+        seed_pending_activation(&keyspaces, fp, secret, nonce.clone(), 300, ak_pub);
         let past = time::OffsetDateTime::now_utc().unix_timestamp() - 100;
         seed_ek(
             &keyspaces,
@@ -966,7 +977,7 @@ mod mode_enforcement_tests {
             crate::raft::records::EkRegistrationState::Pending,
             Some(past),
         );
-        let proof = make_proof(&secret, &nonce, vec![0x30, 0x03]);
+        let proof = make_proof(&secret, &nonce, vec![0x30, 0x03], quote, quote_signature);
         let err = svc
             .submit_activation_proof(Request::new(proof))
             .await
@@ -982,14 +993,14 @@ mod mode_enforcement_tests {
         let secret = [0x42u8; 32];
         let nonce = vec![0xABu8; 16];
         let fp = "aabbccdd";
-        seed_pending_activation(&keyspaces, fp, secret, nonce.clone(), 300);
+        let (ak_pub, quote, quote_signature) = make_valid_quote_setup();
+        seed_pending_activation(&keyspaces, fp, secret, nonce.clone(), 300, ak_pub);
         seed_ek(
             &keyspaces,
             fp,
             crate::raft::records::EkRegistrationState::Pending,
             None,
         );
-        // Build a real CSR with a SPIFFE SAN so extract + sign succeed.
         let params = crate::ca::rcgen_impl::SvidParams {
             spiffe_id: "spiffe://test.example.internal/ns/system/node/test-node".to_owned(),
             kind: crate::ca::rcgen_impl::SvidKind::Node,
@@ -999,7 +1010,7 @@ mod mode_enforcement_tests {
             ttl_secs: 3600,
         };
         let csr = crate::ca::rcgen_impl::build_csr(&params).unwrap();
-        let proof = make_proof(&secret, &nonce, csr.csr_der);
+        let proof = make_proof(&secret, &nonce, csr.csr_der, quote, quote_signature);
         let resp = svc
             .submit_activation_proof(Request::new(proof))
             .await
@@ -1168,5 +1179,54 @@ mod mode_enforcement_tests {
         // enable the secure path, and must not panic.
         let cfg: crate::config::AttestationConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.mode, AttestationMode::Insecure);
+    }
+
+    /// Build a cryptographically valid quote setup for tests (no RNG).
+    /// Returns (ak_pub, quote_bytes, quote_signature):
+    /// - ak_pub: marshaled TPMT_PUBLIC (ECC P-256) for a fixed signing key
+    /// - quote_bytes: starts with TPM_GENERATED_MAGIC
+    /// - quote_signature: valid ECDSA P-256 signature over quote_bytes
+    /// Build a cryptographically valid quote setup for tests (no RNG).
+    /// Returns (ak_pub, quote_bytes, quote_signature).
+    fn make_valid_quote_setup() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use p256::ecdsa::signature::Signer;
+        use p256::ecdsa::{SigningKey, VerifyingKey};
+
+        // Fixed signing key (scalar = 66). Deterministic, valid, no RNG needed.
+        let mut scalar = [0u8; 32];
+        scalar[31] = 0x42;
+        let signing_key = SigningKey::from_slice(&scalar).unwrap();
+        let verifying_key = VerifyingKey::from(&signing_key);
+
+        // Extract uncompressed x, y coordinates using the modern, non-deprecated API.
+        // SEC1 uncompressed format: 0x04 (1 byte) || x (32 bytes) || y (32 bytes).
+        let sec1 = verifying_key.to_sec1_bytes();
+        let x = sec1[1..33].to_vec();
+        let y = sec1[33..65].to_vec();
+
+        // Marshal as TPMT_PUBLIC (ECC) matching parse_ak_public's layout.
+        let mut ak_pub = Vec::new();
+        ak_pub.extend_from_slice(&0x0023u16.to_be_bytes()); // type = ECC
+        ak_pub.extend_from_slice(&0x000Bu16.to_be_bytes()); // nameAlg = SHA256
+        ak_pub.extend_from_slice(&0x00000000u32.to_be_bytes()); // objectAttributes
+        ak_pub.extend_from_slice(&0x0000u16.to_be_bytes()); // authPolicy len = 0
+        ak_pub.extend_from_slice(&0x0010u16.to_be_bytes()); // symmetric = NULL
+        ak_pub.extend_from_slice(&0x0010u16.to_be_bytes()); // scheme = NULL
+        ak_pub.extend_from_slice(&0x0003u16.to_be_bytes()); // curveID = P256
+        ak_pub.extend_from_slice(&0x0010u16.to_be_bytes()); // kdf = NULL
+        ak_pub.extend_from_slice(&(x.len() as u16).to_be_bytes());
+        ak_pub.extend_from_slice(&x);
+        ak_pub.extend_from_slice(&(y.len() as u16).to_be_bytes());
+        ak_pub.extend_from_slice(&y);
+
+        // Quote bytes: must start with TPM_GENERATED_VALUE magic: 0xff 'T' 'C' 'G'.
+        let mut quote_bytes = vec![0xff, 0x54, 0x43, 0x47];
+        quote_bytes.extend_from_slice(b"test-quote-payload");
+
+        // Sign the quote bytes with the fixed key (deterministic RFC6979).
+        let signature: p256::ecdsa::Signature = signing_key.sign(&quote_bytes);
+        let quote_signature = signature.to_vec();
+
+        (ak_pub, quote_bytes, quote_signature)
     }
 }

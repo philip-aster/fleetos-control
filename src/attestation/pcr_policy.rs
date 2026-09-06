@@ -8,7 +8,7 @@
 use fjall::Keyspace;
 
 use super::AttestationError;
-use super::tpm::PcrValue;
+use fleetos_core::attestation::PcrValue;
 
 /// A PCR policy for a specific node.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

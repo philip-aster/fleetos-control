@@ -83,3 +83,6 @@ path = "src/lib.rs"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
+
+[dev-dependencies]
+p256 = { version = "0.14.0", features = ["ecdsa"] }
