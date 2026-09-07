@@ -215,9 +215,13 @@ impl AttestationService for AttestationServiceImpl {
 
                 let claimed = self.lookup_nonce_claim(&tpm_quote.nonce)?;
                 // CR-14: structural verification (nonce binding + TPM magic) is core-owned.
-                fleetos_core::verify_quote_structure(&tpm_quote, &tpm_quote.nonce).map_err(
-                    |_| Status::permission_denied("TPM quote structure verification failed"),
-                )?;
+                fleetos_core::attestation::quote::verify_quote_structure(
+                    &tpm_quote,
+                    &tpm_quote.nonce,
+                )
+                .map_err(|_| {
+                    Status::permission_denied("TPM quote structure verification failed")
+                })?;
                 // PCR policy enforcement when a policy is registered for this identity.
                 if let Some(expected_pcrs) = self
                     .pcr_store
