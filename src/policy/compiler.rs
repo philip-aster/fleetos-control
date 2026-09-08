@@ -10,7 +10,7 @@
 
 use fleetos_core::MonotonicVersion;
 use fleetos_core::hash::IdentityFingerprint;
-use fleetos_core::policy::{SagAction, SagRule, SagRuleId};
+use fleetos_core::policy::{SagAction, SagRule};
 use fleetos_core::spiffe::{IdKind, SpiffeId};
 use fleetos_ebpf_common::{
     DummyIpRouteValue, EbpfPolicyKey, EbpfPolicyValue, EbpfPolicyWildcardKey, HostOrderPort,
@@ -198,25 +198,6 @@ pub fn to_ebpf_value(entry: &CompiledPolicyEntry) -> EbpfPolicyValue {
         decision,
         _pad: [0u8; 7],
     }
-}
-
-/// Compute the `SagRuleId` for a rule.
-///
-/// `SagRuleId::of_rule` takes flat parameters, not `&SagRule`.
-pub fn rule_id(rule: &SagRule) -> SagRuleId {
-    SagRuleId::of_rule(
-        rule.from.service.tenant.as_str(),
-        rule.from.service.name.as_str(),
-        rule.from.role.as_ref(),
-        rule.from.port,
-        rule.to.service.name.as_str(),
-        rule.to.role.as_ref(),
-        rule.to.port,
-        match rule.action {
-            SagAction::Allow => "allow",
-            SagAction::Deny => "deny",
-        },
-    )
 }
 
 /// Convert route components into the `fleetos-ebpf-common` route map value struct.

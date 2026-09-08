@@ -504,6 +504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.svid.node_ttl_secs,
             config.attestation.mode,
             config.tpm.clone(),
+            keyspaces.svids.clone(),
         );
 
     // CaService is only available when the local CA is loaded.

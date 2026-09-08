@@ -32,6 +32,7 @@ pub struct AttestationServiceImpl {
     nonce_claims_keyspace: fjall::Keyspace,
     /// Single-use CSR issuance grants keyed by attested SPIFFE ID (M-3).
     svid_grants_keyspace: fjall::Keyspace,
+    svids_keyspace: fjall::Keyspace,
     raft: Arc<openraft::Raft<crate::raft::FleetosRaftConfig>>,
     control_addresses: fjall::Keyspace,
     node_eks: fjall::Keyspace,
@@ -58,6 +59,7 @@ impl AttestationServiceImpl {
         svid_ttl_secs: u64,
         attestation_mode: crate::config::AttestationMode,
         tpm_config: crate::config::TpmConfig,
+        svids_keyspace: fjall::Keyspace,
     ) -> Self {
         Self {
             nonce_manager,
@@ -73,6 +75,7 @@ impl AttestationServiceImpl {
             svid_ttl_secs,
             attestation_mode,
             tpm_config,
+            svids_keyspace,
         }
     }
 
@@ -690,6 +693,58 @@ impl AttestationService for AttestationServiceImpl {
             Err(e) => return Err(Status::internal(format!("node activation failed: {}", e))),
         }
 
+        // S-10: register the node's X25519 sealing pubkey and bump the SVID
+        // version via Raft (leader-only issuance, V-4c). Mirrors the insecure
+        // submit_csr path so fetch_secret resolves the sealing target identically.
+        let current_version = match self
+            .svids_keyspace
+            .get(spiffe_id.as_bytes())
+            .map_err(|e| Status::internal(format!("failed to read SVID record: {}", e)))?
+        {
+            Some(bytes) => {
+                let rec: crate::ca::SvidRecord = postcard::from_bytes(&bytes)
+                    .map_err(|e| Status::internal(format!("failed to parse SVID record: {}", e)))?;
+                rec.svid_version
+            }
+            None => 0,
+        };
+        let new_version = current_version + 1;
+        let svid_record = crate::ca::SvidRecord {
+            spiffe_id: spiffe_id.clone(),
+            svid_version: new_version,
+            issued_at_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+            agent_x25519_pubkey: req.agent_x25519_pubkey.clone(),
+        };
+
+        match self
+            .raft
+            .client_write(crate::raft::AuditedCommand::system(
+                crate::raft::FleetosCommand::UpsertSvidVersion {
+                    record: svid_record,
+                },
+            ))
+            .await
+        {
+            Ok(_) => {}
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(fwd),
+            )) => {
+                let leader_id = fwd
+                    .leader_id
+                    .ok_or_else(|| Status::internal("forward response missing leader id"))?;
+                let leader_addr = self
+                    .leader_dc_address(leader_id)?
+                    .ok_or_else(|| Status::internal("leader DC address not registered"))?;
+                return Err(Self::redirect_to_leader(&leader_addr));
+            }
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "SVID version write failed: {}",
+                    e
+                )));
+            }
+        }
+
         tracing::info!(
             ek_fingerprint = %record.ek_fingerprint,
             spiffe_id = %spiffe_id,
@@ -877,6 +932,7 @@ mod mode_enforcement_tests {
             3600,
             mode,
             crate::config::TpmConfig::default(),
+            keyspaces.svids.clone(),
         );
         (service, keyspaces)
     }

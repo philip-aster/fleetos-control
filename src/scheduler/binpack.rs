@@ -23,13 +23,6 @@ pub enum BinpackStrategy {
     LeastAllocated,
 }
 
-/// Check if a node has sufficient resources for a pod.
-///
-/// This is a hard filter — if resources don't fit, the node is eliminated.
-pub fn check_resource_fit(pod_resources: &ResourceSpec, node: &NodeInfo) -> bool {
-    pod_resources.fits_within(&node.available)
-}
-
 /// Score a node for bin-packing efficiency.
 ///
 /// Higher score = better fit according to the strategy.
@@ -113,8 +106,7 @@ mod tests {
             cpu_millicores: 500,
             memory_bytes: 512 * 1024 * 1024,
         };
-
-        assert!(check_resource_fit(&pod, &node));
+        assert!(pod.fits_within(&node.available));
     }
 
     #[test]
@@ -124,8 +116,7 @@ mod tests {
             cpu_millicores: 500,
             memory_bytes: 512 * 1024 * 1024,
         };
-
-        assert!(!check_resource_fit(&pod, &node));
+        assert!(!pod.fits_within(&node.available));
     }
 
     #[test]
@@ -135,8 +126,7 @@ mod tests {
             cpu_millicores: 500,
             memory_bytes: 2 * 1024 * 1024 * 1024,
         };
-
-        assert!(!check_resource_fit(&pod, &node));
+        assert!(!pod.fits_within(&node.available));
     }
 
     #[test]
