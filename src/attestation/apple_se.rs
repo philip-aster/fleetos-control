@@ -19,6 +19,7 @@
 //! nonce and prevents replay.
 
 use super::AttestationError;
+use super::decode_hex_32;
 use x509_parser::parse_x509_certificate;
 use x509_parser::prelude::X509Certificate;
 
@@ -32,6 +33,15 @@ const APPLE_ATTESTATION_EXT_OID: &str = "1.2.840.113635.100.8.2";
 pub fn bundled_apple_se_root() -> &'static [u8] {
     include_bytes!("./roots/apple_se_root_g3.der")
 }
+
+/// SHA-256 fingerprint of `roots/apple_se_root_g3.der`.
+///
+/// OUT-OF-BAND SOURCE: operator-verified via `sha256sum` + `openssl x509`
+/// against the bundled DER; cross-checked with Apple's published Root CA - G3.
+/// Subject/issuer: CN=Apple Root CA - G3, OU=Apple Certification Authority,
+/// O=Apple Inc., C=US
+pub const APPLE_SE_ROOT_SHA256: [u8; 32] =
+    decode_hex_32("63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179");
 
 /// An Apple Secure Enclave attestation submission.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -405,6 +415,22 @@ mod tests {
             cert.subject(),
             cert.issuer(),
             "Apple Root CA - G3 must be self-signed"
+        );
+    }
+
+    /// R-2 provenance pin: the bundled Apple Root CA - G3 must be
+    /// bit-identical to the out-of-band-verified Apple root. Swapping the
+    /// `.der` for any other certificate fails here.
+    #[test]
+    fn bundled_apple_root_g3_matches_pinned_sha256_fingerprint() {
+        let digest = ring::digest::digest(&ring::digest::SHA256, bundled_apple_se_root());
+        assert_eq!(
+            digest.as_ref(),
+            APPLE_SE_ROOT_SHA256.as_slice(),
+            "Apple Root CA - G3: SHA-256 fingerprint mismatch — bundled root \
+             was replaced without re-pinning. Verify the new certificate \
+             against Apple's published value, then update the pin and its \
+             recorded OUT-OF-BAND SOURCE.",
         );
     }
 }

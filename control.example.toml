@@ -92,10 +92,15 @@ master_key_path = "/var/lib/fleetos/master.key"
 # ---------------------------------------------------------------------------
 [attestation]
 # TTL for single-use join tokens (M-2 custody). Tokens are the sole gate to
-# cluster membership until hardware-quote verification lands, so they expire.
+# cluster membership, so they expire.
 join_token_ttl_secs = 3600
-# "insecure" = join-token only (testing). "secure" = TPM credential activation (production).
-mode = "insecure"
+# "secure"   = TPM credential activation (CR-10). Production.
+# "insecure" = join-token only, structural quote checks. TESTING ONLY.
+mode = "secure"
+# Production builds refuse to boot with mode = "insecure" unless this is
+# true. Exists for test harnesses that must run production binaries against
+# software-only nodes. Leave false everywhere else.
+allow_insecure_attestation = false
 
 # ---------------------------------------------------------------------------
 # TPM backend (secure attestation, Step 10)

@@ -12,14 +12,17 @@ use tonic::{Request, Response, Status};
 
 /// Node-local pending activation state for secure attestation (CR-10).
 /// Keyed by server_nonce. NOT replicated — transient, per-connection.
+///
+/// Public because the secure-join integration test seeds the software quote
+/// path directly (the hardware path writes this via `RequestActivation`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PendingActivationRecord {
-    ek_fingerprint: String,
-    ak_pub: Vec<u8>,
-    server_nonce: Vec<u8>,
-    secret: Vec<u8>,
-    created_at: i64,
-    expires_at: i64,
+pub struct PendingActivationRecord {
+    pub ek_fingerprint: String,
+    pub ak_pub: Vec<u8>,
+    pub server_nonce: Vec<u8>,
+    pub secret: Vec<u8>,
+    pub created_at: i64,
+    pub expires_at: i64,
 }
 
 /// The AttestationService gRPC implementation.
@@ -753,8 +756,8 @@ impl AttestationService for AttestationServiceImpl {
 
         Ok(Response::new(SvidResponse {
             cert_chain_der: cert_der,
-            keypair_der: Vec::new(), // Node holds its own private key (CR-10).
-            svid_version: 1,
+            keypair_der: Vec::new(),
+            svid_version: new_version,
         }))
     }
 }

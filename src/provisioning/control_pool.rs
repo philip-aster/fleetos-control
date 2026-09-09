@@ -146,15 +146,6 @@ impl ControlPoolManager {
             return Ok(());
         }
 
-        if !voters.contains(&node_id) && !learners.contains(&node_id) {
-            tracing::debug!(
-                provider_handle = %provider_handle,
-                node_id = %node_id,
-                "not a raft member, nothing to remove"
-            );
-            return Ok(());
-        }
-
         // G-15: quorum guard — never remove a voter if it would break the cluster.
         if voters.contains(&node_id) && !removal_preserves_quorum(voters.len()) {
             tracing::warn!(

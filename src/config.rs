@@ -419,6 +419,11 @@ pub struct AttestationConfig {
     /// Default `insecure` until the join client supports the secure leg.
     #[serde(default = "default_attestation_mode")]
     pub mode: AttestationMode,
+    /// R-1 explicit opt-in: production builds refuse to boot with
+    /// `mode = "insecure"` unless this is `true` (testing only — never a
+    /// real deployment).
+    #[serde(default)]
+    pub allow_insecure_attestation: bool,
 }
 
 impl Default for AttestationConfig {
@@ -426,6 +431,7 @@ impl Default for AttestationConfig {
         Self {
             join_token_ttl_secs: default_join_token_ttl_secs(),
             mode: default_attestation_mode(),
+            allow_insecure_attestation: false,
         }
     }
 }
@@ -436,6 +442,21 @@ fn default_attestation_mode() -> AttestationMode {
 
 fn default_join_token_ttl_secs() -> u16 {
     3600
+}
+
+/// R-1: production attestation policy, separated from the feature gate so it
+/// is unit-testable in every build. Returns a refusal reason when insecure
+/// attestation is requested without the explicit opt-in.
+pub fn production_attestation_policy_violation(cfg: &AttestationConfig) -> Option<&'static str> {
+    if cfg.mode == AttestationMode::Insecure && !cfg.allow_insecure_attestation {
+        Some(
+            "attestation.mode = \"insecure\" is forbidden in production builds; \
+             use mode = \"secure\", or set attestation.allow_insecure_attestation = true \
+             (testing only — never a real deployment)",
+        )
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +634,16 @@ impl ControlConfig {
         let config: ControlConfig =
             toml::from_str(&raw).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))?;
         config.validate()?;
+
+        // R-1 structural guard: a production binary never boots into insecure
+        // attestation silently. Refusal happens at config load, before any
+        // listener exists.
+        if cfg!(feature = "production") {
+            if let Some(reason) = production_attestation_policy_violation(&config.attestation) {
+                return Err(ConfigError::Validation(reason.to_owned()));
+            }
+        }
+
         Ok(config)
     }
 
@@ -667,4 +698,86 @@ pub enum ConfigError {
 
     #[error("config validation failed: {0}")]
     Validation(String),
+}
+
+#[cfg(test)]
+mod r1_tests {
+    use super::*;
+
+    #[test]
+    fn production_policy_rejects_insecure_without_opt_in() {
+        let mut att = AttestationConfig::default();
+        att.mode = AttestationMode::Insecure;
+        att.allow_insecure_attestation = false;
+        assert!(production_attestation_policy_violation(&att).is_some());
+
+        att.allow_insecure_attestation = true;
+        assert!(production_attestation_policy_violation(&att).is_none());
+
+        att.mode = AttestationMode::Secure;
+        att.allow_insecure_attestation = false;
+        assert!(production_attestation_policy_violation(&att).is_none());
+    }
+
+    /// Boot-refusal test: under `--features production`, loading a config
+    /// with insecure attestation and no opt-in MUST fail; the opt-in lifts it.
+    /// Dev builds never refuse, so the assertion flips honestly with the cfg.
+    #[test]
+    fn load_enforces_production_attestation_policy() {
+        let dir =
+            std::env::temp_dir().join(format!("fleetos-r1-boot-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control.toml");
+        let write_cfg = |extra: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[node]
+name = "control-1"
+[cluster]
+mode = "join"
+join_target = "10.0.0.1:9443"
+join_raft_target = "10.0.0.1:9445"
+[storage]
+fjall_path = "/tmp/fleetos-r1-db"
+[trust_domains]
+data_control = "fleet.example.internal"
+admin = "fleet-admin.example.internal"
+[secrets]
+master_key_path = "/tmp/fleetos-r1-master.key"
+[listeners]
+data_control = "127.0.0.1:9443"
+admin = "127.0.0.1:9444"
+raft = "127.0.0.1:9445"
+[provisioning]
+endpoint = ""
+[svid]
+[dummy_ip]
+[attestation]
+mode = "insecure"
+{}
+"#,
+                    extra
+                ),
+            )
+            .unwrap();
+        };
+
+        write_cfg("");
+        let result = ControlConfig::load(&path);
+        if cfg!(feature = "production") {
+            assert!(
+                matches!(result, Err(ConfigError::Validation(_))),
+                "production build must refuse insecure attestation without opt-in"
+            );
+            write_cfg("allow_insecure_attestation = true");
+            assert!(
+                ControlConfig::load(&path).is_ok(),
+                "explicit opt-in must permit loading (startup still warns loudly)"
+            );
+        } else {
+            assert!(result.is_ok(), "dev builds allow insecure mode");
+        }
+    }
 }

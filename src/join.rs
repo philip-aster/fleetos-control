@@ -1,18 +1,19 @@
 //! Join mode client.
 //!
 //! Two responsibilities:
-//! 1. `join_cluster` — attest to an existing control node over plaintext gRPC
-//!    (the joiner has no SVID yet), and come away with a signed SVID plus the
-//!    cluster trust bundle.
+//! 1. `join_cluster` — attest to an existing control node over server-trust
+//!    TLS (the joiner has no SVID yet), and come away with a signed SVID plus
+//!    the cluster trust bundle. TESTING ONLY — see the R-1 fence on that
+//!    function; production join is `join_cluster_secure`.
 //! 2. `request_membership` — ask the cluster to add us as a learner (blocking
 //!    until we catch up) and promote us to voter, via the internal
 //!    `RaftTransport.RequestJoin` RPC. Follows leader redirects automatically.
 use crate::raft::{JoinRequestPayload, JoinResponsePayload, RaftRpc};
 use fleetos_core::proto::fleetos::attestation_service_client::AttestationServiceClient;
 use fleetos_core::proto::fleetos::ca_service_client::CaServiceClient;
-use fleetos_core::proto::identity::{
-    AttestationQuote, CsrRequest, NonceRequest, TrustBundleRequest,
-};
+use fleetos_core::proto::identity::TrustBundleRequest;
+#[cfg(not(feature = "production"))]
+use fleetos_core::proto::identity::{AttestationQuote, CsrRequest, NonceRequest};
 use std::time::Duration;
 
 /// Errors from the join flow.
@@ -48,12 +49,16 @@ pub struct JoinResult {
     pub claimed_spiffe_id: String,
 }
 
-fn channel_addr(addr: &str) -> String {
-    if addr.starts_with("http") {
-        addr.to_owned()
-    } else {
-        format!("http://{}", addr)
-    }
+/// Normalize a bare `host:port` to an `https://` endpoint (R-4).
+///
+/// Mirrors `raft/network.rs::get_client`: both join legs speak TLS.
+/// Public so the join-flow integration test pins the exact scheme used on the wire.
+pub fn channel_addr(addr: &str) -> String {
+    format!(
+        "https://{}",
+        addr.trim_start_matches("http://")
+            .trim_start_matches("https://")
+    )
 }
 
 /// Extract a leader redirect address from a gRPC status, if present.
@@ -69,11 +74,15 @@ fn leader_redirect(status: &tonic::Status) -> Option<String> {
         .map(|s| s.to_owned())
 }
 
-/// Execute the full join flow against an existing control node.
+/// Execute the insecure (join-token-only) join flow against an existing
+/// control node.
 ///
-/// Follows leader redirects: if `submit_quote` lands on a follower, the
-/// follower returns the leader's Data/Control address and we restart the
-/// attestation against the leader (V-2 leader-directed attestation).
+/// R-1 FENCE: this path fabricates a zeroed TPM quote whose signature is
+/// never verified — join-token possession alone grants admission. It exists
+/// for testing only and is compiled OUT of production builds; under
+/// `--features production` it unconditionally refuses to execute.
+/// Production join is `join_cluster_secure`; full stop.
+#[cfg(not(feature = "production"))]
 pub async fn join_cluster(
     join_target: &str,
     join_token: &str,
@@ -216,6 +225,23 @@ pub async fn join_cluster(
             claimed_spiffe_id: attested_identity.claimed_spiffe_id,
         });
     }
+}
+
+/// R-1 fence: insecure join is not executable in production builds.
+#[cfg(feature = "production")]
+pub async fn join_cluster(
+    _join_target: &str,
+    _join_token: &str,
+    _node_name: &str,
+    _trust_domain: &str,
+    _join_trust_bundle_pem: &str,
+) -> Result<JoinResult, JoinError> {
+    Err(JoinError::Attestation(
+        "insecure join is disabled in production builds (fabricated quotes are \
+         not admissible); join via attestation.mode = \"secure\" \
+         (join_cluster_secure)"
+            .to_owned(),
+    ))
 }
 
 /// Execute the SECURE join flow against an existing control node.
@@ -487,4 +513,27 @@ fn der_to_pem(der: &[u8], label: &str) -> Result<String, String> {
     }
     pem.push_str(&format!("-----END {}-----\n", label));
     Ok(pem)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R-4: the join legs must never emit plaintext-http endpoints.
+    #[test]
+    fn channel_addr_always_https() {
+        assert_eq!(channel_addr("10.0.0.1:9443"), "https://10.0.0.1:9443");
+        assert_eq!(
+            channel_addr("http://10.0.0.1:9443"),
+            "https://10.0.0.1:9443"
+        );
+        assert_eq!(
+            channel_addr("https://10.0.0.1:9443"),
+            "https://10.0.0.1:9443"
+        );
+        assert_eq!(
+            channel_addr("control-1.fleet.internal:9443"),
+            "https://control-1.fleet.internal:9443"
+        );
+    }
 }

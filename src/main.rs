@@ -71,6 +71,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if config.attestation.mode == AttestationMode::Insecure {
+        tracing::warn!("====================================================================");
+        tracing::warn!(
+            "INSECURE ATTESTATION MODE ACTIVE: join-token possession is the only \
+             gate to cluster admission and quote signatures are NOT verified. \
+             TESTING ONLY — never use in a real deployment."
+        );
+        tracing::warn!("====================================================================");
+    }
+
     // OpenTelemetry providers (metrics + traces + logs), if enabled.
     let telemetry = fleetos_control::telemetry::init_providers(&config)?;
 

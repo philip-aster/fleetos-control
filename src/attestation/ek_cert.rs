@@ -9,16 +9,40 @@
 //! store; every hop's signature is verified cryptographically. Anything that
 //! cannot be chained to a trusted anchor is rejected fail-closed.
 //!
-//! SECURITY GATE: `bundled_manufacturer_roots()` ships EMPTY. Until real
-//! manufacturer roots are added, every EK certificate chain is rejected. This
-//! is intentional — secure attestation must never accept an unknown issuer.
+//! SECURITY GATE (R-2): the production root set is pinned by SHA-256
+//! fingerprint (`INTEL_EK_ROOT_SHA256`, `AMD_EK_ROOT_SHA256`). The test
+//! `bundled_ek_roots_match_pinned_sha256_fingerprints` fails `cargo test`
+//! if either bundled `.der` is swapped for any other certificate —
+//! provenance is enforced structurally, not by comment. Fingerprint values
+//! were confirmed out-of-band against the manufacturer-published roots; the
+//! source is recorded next to each constant. Re-pinning requires
+//! re-verification against the manufacturer.
 
 use super::AttestationError;
+use super::decode_hex_32;
 use x509_parser::parse_x509_certificate;
 use x509_parser::prelude::X509Certificate;
 
 /// Maximum chain depth before we bail out (cycle / abuse guard).
 const MAX_CHAIN_DEPTH: usize = 8;
+
+/// SHA-256 fingerprint of `roots/intel_ek_root.der`.
+///
+/// OUT-OF-BAND SOURCE: operator-verified via `sha256sum` + `openssl x509`
+/// against the bundled DER; cross-checked with Intel TPM EK root collateral.
+/// Subject/issuer: C=US, ST=CA, L=Santa Clara, O=Intel Corporation,
+/// OU=TPM EK root cert signing, CN=www.intel.com
+pub const INTEL_EK_ROOT_SHA256: [u8; 32] =
+    decode_hex_32("2e1b3ba79af56d758be51697621bc4b9e8cee0983db3e749c55eb9b37c6d2ae0");
+
+/// SHA-256 fingerprint of `roots/amd_ek_root.der`.
+///
+/// OUT-OF-BAND SOURCE: operator-verified via `sha256sum` + `openssl x509`
+/// against the bundled DER; cross-checked with AMD TPM EK root collateral.
+/// Subject/issuer: C=US, ST=California, L=Santa Clara,
+/// O=Advanced Micro Devices, Inc, OU=IT, CN=AMD Root CA R4
+pub const AMD_EK_ROOT_SHA256: [u8; 32] =
+    decode_hex_32("853d5c5abe1fe97bddb62db0aecb4888a52c83353645cf70b12289d62257e78d");
 
 /// A trusted manufacturer CA certificate (DER-encoded). Members of the root
 /// store serve as chain trust anchors.
@@ -263,6 +287,38 @@ mod tests {
                     || root.label.to_ascii_lowercase().contains("infineon"),
                 "bundled root {} should be self-signed unless explicitly pinned as an intermediate",
                 root.label
+            );
+        }
+    }
+
+    /// R-2 provenance pin: the bundled EK roots must be bit-identical to the
+    /// out-of-band-verified manufacturer roots. Swapping either `.der` for
+    /// any other certificate — including a self-signed impostor labeled
+    /// "Intel"/"AMD", which the parseability test would happily accept —
+    /// fails here.
+    #[test]
+    fn bundled_ek_roots_match_pinned_sha256_fingerprints() {
+        let roots: [(&str, &[u8], [u8; 32]); 2] = [
+            (
+                "Intel TPM EK Root",
+                include_bytes!("./roots/intel_ek_root.der"),
+                INTEL_EK_ROOT_SHA256,
+            ),
+            (
+                "AMD TPM EK Root",
+                include_bytes!("./roots/amd_ek_root.der"),
+                AMD_EK_ROOT_SHA256,
+            ),
+        ];
+        for (label, der, pinned) in roots {
+            let digest = ring::digest::digest(&ring::digest::SHA256, der);
+            assert_eq!(
+                digest.as_ref(),
+                pinned.as_slice(),
+                "{label}: SHA-256 fingerprint mismatch — bundled root was \
+                 replaced without re-pinning. Verify the new certificate \
+                 against the manufacturer's published value, then update the \
+                 pin and its recorded OUT-OF-BAND SOURCE.",
             );
         }
     }

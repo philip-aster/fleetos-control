@@ -502,3 +502,703 @@ async fn snapshot_transfer_over_real_tls_transport() {
 
     let _ = shutdown_tx.send(true);
 }
+
+// ---------------------------------------------------------------------------
+// R-3: secure join over the REAL transport — attestation → membership
+// ---------------------------------------------------------------------------
+
+use fleetos_control::attestation::grpc_service::{AttestationServiceImpl, PendingActivationRecord};
+use fleetos_control::attestation::join_token::JoinTokenStore;
+use fleetos_control::attestation::nonce::NonceManager;
+use fleetos_control::attestation::pcr_policy::{PcrPolicy, PcrPolicyStore};
+use fleetos_control::ca::grpc_service::CaServiceImpl;
+use fleetos_core::proto::fleetos::attestation_service_client::AttestationServiceClient;
+use fleetos_core::proto::fleetos::attestation_service_server::AttestationServiceServer;
+use fleetos_core::proto::fleetos::ca_service_client::CaServiceClient;
+use fleetos_core::proto::fleetos::ca_service_server::CaServiceServer;
+use fleetos_core::proto::identity::{
+    ActivationProof, AttestationQuote, CsrRequest, TrustBundleRequest,
+};
+
+const SECURE_TRUST_DOMAIN: &str = "fleet.r3.test.internal";
+const SECURE_DONOR_ID: u64 = 1;
+const SECURE_JOINER_ID: u64 = 2;
+
+fn secure_control_svid(ca: &TrustBundle, name: &str) -> rcgen_impl::SignedSvid {
+    let params = SvidParams {
+        spiffe_id: format!(
+            "spiffe://{}/ns/system/control/{}",
+            SECURE_TRUST_DOMAIN, name
+        ),
+        kind: SvidKind::Control,
+        role: None,
+        ordinal: None,
+        degraded: false,
+        ttl_secs: 3600,
+    };
+    rcgen_impl::sign_svid(&params, &ca.current_key, &ca.current_cert_der).unwrap()
+}
+
+fn secure_mtls(svid: &rcgen_impl::SignedSvid, ca: &TrustBundle) -> MtlsConfig {
+    MtlsConfig {
+        cert_chain: vec![rustls::pki_types::CertificateDer::from(
+            svid.cert_der.clone(),
+        )],
+        private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(svid.private_key_der.to_vec()),
+        ),
+        trust_bundle_pem: ca.trust_bundle_pem(),
+        role: TrustDomainRole::DataControl,
+    }
+}
+
+struct SoftwareQuote {
+    ak_pub: Vec<u8>,
+    quote: Vec<u8>,
+    signature: Vec<u8>,
+    pcr_values: Vec<fleetos_core::attestation::PcrValue>,
+}
+
+fn build_software_quote(nonce: &[u8], pcr0_digest: &[u8; 32]) -> SoftwareQuote {
+    use p256::ecdsa::signature::Signer;
+    let mut scalar = [0u8; 32];
+    scalar[31] = 0x42; // fixed key
+    let signing_key = p256::ecdsa::SigningKey::from_slice(&scalar).unwrap();
+    let verifying_key = p256::ecdsa::VerifyingKey::from(&signing_key);
+    let sec1 = verifying_key.to_sec1_bytes();
+    let (x, y) = (&sec1[1..33], &sec1[33..65]);
+
+    let mut ak_pub = Vec::new();
+    ak_pub.extend_from_slice(&0x0023u16.to_be_bytes()); // type = ECC
+    ak_pub.extend_from_slice(&0x000Bu16.to_be_bytes()); // nameAlg = SHA256
+    ak_pub.extend_from_slice(&0x00000000u32.to_be_bytes()); // objectAttributes
+    ak_pub.extend_from_slice(&0x0000u16.to_be_bytes()); // authPolicy len = 0
+    ak_pub.extend_from_slice(&0x0010u16.to_be_bytes()); // symmetric = NULL
+    ak_pub.extend_from_slice(&0x0010u16.to_be_bytes()); // scheme = NULL
+    ak_pub.extend_from_slice(&0x0003u16.to_be_bytes()); // curve = P256
+    ak_pub.extend_from_slice(&0x0010u16.to_be_bytes()); // kdf = NULL
+    ak_pub.extend_from_slice(&(x.len() as u16).to_be_bytes());
+    ak_pub.extend_from_slice(x);
+    ak_pub.extend_from_slice(&(y.len() as u16).to_be_bytes());
+    ak_pub.extend_from_slice(y);
+
+    let pcr_digest = ring::digest::digest(&ring::digest::SHA256, pcr0_digest);
+    let mut quote = Vec::new();
+    quote.extend_from_slice(&[0xff, 0x54, 0x43, 0x47]); // TPM_GENERATED
+    quote.extend_from_slice(&0x8018u16.to_be_bytes()); // TPM_ST_ATTEST_QUOTE
+    quote.extend_from_slice(&0x0000u16.to_be_bytes()); // qualifiedSigner len
+    quote.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
+    quote.extend_from_slice(nonce);
+    quote.extend_from_slice(&[0u8; 17]); // clockInfo
+    quote.extend_from_slice(&[0u8; 8]); // firmwareVersion
+    quote.extend_from_slice(&1u32.to_be_bytes()); // one PCR bank
+    quote.extend_from_slice(&0x000Bu16.to_be_bytes()); // SHA-256
+    quote.push(3); // sizeofSelect
+    quote.extend_from_slice(&[0x01, 0x00, 0x00]); // PCR0
+    quote.extend_from_slice(&(pcr_digest.as_ref().len() as u16).to_be_bytes());
+    quote.extend_from_slice(pcr_digest.as_ref());
+
+    let signature: p256::ecdsa::Signature = signing_key.sign(&quote);
+    SoftwareQuote {
+        ak_pub,
+        quote,
+        signature: signature.to_vec(),
+        pcr_values: vec![fleetos_core::attestation::PcrValue {
+            index: 0,
+            hash_algorithm: 0x000B,
+            digest: pcr0_digest.to_vec(),
+        }],
+    }
+}
+
+async fn spawn_dc_server(
+    attestation: AttestationServiceImpl,
+    ca_service: CaServiceImpl,
+    mtls: &MtlsConfig,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let mut server_config = mtls::build_server_config_optional_auth(mtls).unwrap();
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(async move {
+        let incoming = async_stream::stream! {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer_addr)) => {
+                        let acceptor = acceptor.clone();
+                        yield async move {
+                            let tls = acceptor
+                                .accept(stream)
+                                .await
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                            Ok::<TlsConn, std::io::Error>(TlsConn { inner: tls, peer_addr })
+                        }
+                        .await;
+                    }
+                    Err(e) => eprintln!("dc test listener accept failed: {}", e),
+                }
+            }
+        };
+        let shutdown_fut = async move {
+            loop {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                if shutdown_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        let _ = tonic::transport::Server::builder()
+            .add_service(AttestationServiceServer::new(attestation))
+            .add_service(CaServiceServer::new(ca_service))
+            .serve_with_incoming_shutdown(incoming, shutdown_fut)
+            .await;
+    });
+    (addr, handle, shutdown_tx)
+}
+
+async fn wait_for_key(keyspace: &fjall::Keyspace, key: &[u8]) -> Vec<u8> {
+    for _ in 0..200 {
+        if let Some(v) = keyspace.get(key).unwrap() {
+            return v.to_vec();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("key never appeared in keyspace");
+}
+
+#[tokio::test]
+async fn secure_join_attestation_to_membership_over_real_tls() {
+    install_crypto_provider();
+
+    let ca = TrustBundle::generate_root(SECURE_TRUST_DOMAIN).unwrap();
+    let donor_svid = secure_control_svid(&ca, "donor");
+    let trust_bundle_pem = ca.trust_bundle_pem();
+    let dc_bundle = Arc::new(parking_lot::RwLock::new(ca));
+
+    let dc_read = dc_bundle.read();
+    let donor_factory = TonicRaftNetworkFactory::new(
+        HashMap::new(),
+        RaftClientTls {
+            cert_der: donor_svid.cert_der.clone(),
+            key_der: donor_svid.private_key_der.to_vec(),
+            trust_bundle_pem: dc_read.trust_bundle_pem(),
+            domain: SECURE_TRUST_DOMAIN.to_owned(),
+        },
+    );
+    let donor_config = Config {
+        heartbeat_interval: 100,
+        election_timeout_min: 300,
+        election_timeout_max: 600,
+        ..Default::default()
+    };
+    let donor = create_node(SECURE_DONOR_ID, donor_factory, donor_config, true).await;
+    wait_for_leader(&donor.raft).await;
+
+    propose_tenant(&donor, "tenant-r3", 0xF100_0000).await;
+    wait_for_tenant(&donor.keyspaces, "tenant-r3").await;
+
+    let pcr_store = Arc::new(PcrPolicyStore::new(donor.keyspaces.pcr_policies.clone()));
+    let attestation_service = AttestationServiceImpl::new(
+        Arc::new(NonceManager::new(donor.keyspaces.nonces.clone())),
+        Arc::new(JoinTokenStore::new(donor.keyspaces.join_tokens.clone())),
+        pcr_store.clone(),
+        donor.keyspaces.nonce_claims.clone(),
+        donor.keyspaces.svid_grants.clone(),
+        donor.raft.clone(),
+        donor.keyspaces.control_addresses.clone(),
+        donor.keyspaces.node_eks.clone(),
+        donor.keyspaces.pending_activations.clone(),
+        Some(dc_bundle.clone()),
+        3600,
+        fleetos_control::config::AttestationMode::Secure,
+        fleetos_control::config::TpmConfig::default(),
+        donor.keyspaces.svids.clone(),
+    );
+    let ca_service = CaServiceImpl::new(
+        dc_bundle.clone(),
+        3600,
+        donor.keyspaces.svids.clone(),
+        donor.keyspaces.svid_grants.clone(),
+        donor.keyspaces.placements.clone(),
+        donor.keyspaces.control_addresses.clone(),
+        donor.raft.clone(),
+    );
+    let dc_read2 = dc_bundle.read();
+    let (dc_addr, _dc_handle, dc_shutdown) = spawn_dc_server(
+        attestation_service,
+        ca_service,
+        &secure_mtls(&donor_svid, &dc_read2),
+    )
+    .await;
+
+    let joiner_spiffe = format!("spiffe://{}/ns/system/control/joiner", SECURE_TRUST_DOMAIN);
+    let server_nonce = [0xABu8; 32];
+    let secret = [0x5Au8; 32];
+    let sw_quote = build_software_quote(&server_nonce, &[0x42u8; 32]);
+
+    let ek_pub_bytes = vec![0x30u8, 0x82, 0x01, 0x00];
+    let fingerprint = fleetos_core::attestation::EkFingerprint::of_ek_pub(&ek_pub_bytes);
+    donor
+        .raft
+        .client_write(AuditedCommand::system(FleetosCommand::RegisterNodeEk {
+            record: fleetos_control::raft::records::NodeEkRecord {
+                ek_fingerprint: fingerprint.to_hex(),
+                ek_pub: ek_pub_bytes,
+                ek_cert_der: vec![],
+                node_id: String::new(),
+                registered_at: 1_700_000_000,
+                expires_at: None,
+                state: fleetos_control::raft::records::EkRegistrationState::Pending,
+            },
+        }))
+        .await
+        .unwrap();
+    wait_for_key(&donor.keyspaces.node_eks, fingerprint.to_hex().as_bytes()).await;
+
+    pcr_store
+        .set_policy(&PcrPolicy {
+            node_id: joiner_spiffe.clone(),
+            expected_pcrs: sw_quote.pcr_values.clone(),
+            updated_at: 1_700_000_000,
+            active: true,
+        })
+        .unwrap();
+
+    // Wall-clock expiry: the server sweeps records whose expires_at is in
+    // the past, so these MUST be real timestamps — fixed test epochs are
+    // expired on sight.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let pending = PendingActivationRecord {
+        ek_fingerprint: fingerprint.to_hex(),
+        ak_pub: sw_quote.ak_pub.clone(),
+        server_nonce: server_nonce.to_vec(),
+        secret: secret.to_vec(),
+        created_at: now_unix,
+        expires_at: now_unix + 300,
+    };
+    donor
+        .keyspaces
+        .pending_activations
+        .insert(
+            server_nonce.as_slice(),
+            postcard::to_allocvec(&pending).unwrap().as_slice(),
+        )
+        .unwrap();
+
+    let channel = tonic::transport::Channel::from_shared(fleetos_control::join::channel_addr(
+        &dc_addr.to_string(),
+    ))
+    .expect("valid endpoint")
+    .tls_config(
+        tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&trust_bundle_pem))
+            .domain_name(SECURE_TRUST_DOMAIN),
+    )
+    .expect("valid TLS config")
+    .connect()
+    .await
+    .expect("attestation-leg TLS handshake must succeed");
+    let mut att_client = AttestationServiceClient::new(channel.clone());
+
+    let gated = att_client
+        .submit_quote(AttestationQuote {
+            join_token: "x".to_owned(),
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(gated.unwrap_err().code(), tonic::Code::PermissionDenied);
+
+    let csr_bundle = rcgen_impl::build_csr(&SvidParams {
+        spiffe_id: joiner_spiffe.clone(),
+        kind: SvidKind::Control,
+        role: None,
+        ordinal: None,
+        degraded: false,
+        ttl_secs: 3600,
+    })
+    .unwrap();
+    let proof = ActivationProof {
+        hmac: fleetos_core::attestation::compute_activation_proof(&secret, &server_nonce).to_vec(),
+        quote: sw_quote.quote.clone(),
+        quote_signature: sw_quote.signature.clone(),
+        pcr_selection: postcard::to_allocvec(&sw_quote.pcr_values).unwrap(),
+        csr_der: csr_bundle.csr_der.clone(),
+        agent_x25519_pubkey: vec![0x11u8; 32],
+    };
+    let svid_resp = att_client
+        .submit_activation_proof(proof)
+        .await
+        .expect("secure attestation must succeed over real TLS")
+        .into_inner();
+    assert!(!svid_resp.cert_chain_der.is_empty());
+    assert!(
+        svid_resp.keypair_der.is_empty(),
+        "CR-10: node keeps its own key"
+    );
+    assert_eq!(
+        svid_resp.svid_version, 1,
+        "R-5: real version, not hardcoded"
+    );
+
+    let ek_bytes = wait_for_key(&donor.keyspaces.node_eks, fingerprint.to_hex().as_bytes()).await;
+    let ek_rec: fleetos_control::raft::records::NodeEkRecord =
+        postcard::from_bytes(&ek_bytes).unwrap();
+    assert_eq!(
+        ek_rec.state,
+        fleetos_control::raft::records::EkRegistrationState::Joined
+    );
+    assert_eq!(ek_rec.node_id, joiner_spiffe);
+    let svid_bytes = wait_for_key(&donor.keyspaces.svids, joiner_spiffe.as_bytes()).await;
+    let svid_rec: fleetos_control::ca::SvidRecord = postcard::from_bytes(&svid_bytes).unwrap();
+    assert_eq!(svid_rec.svid_version, 1);
+    assert_eq!(svid_rec.agent_x25519_pubkey, vec![0x11u8; 32]);
+
+    let grantee = format!("spiffe://{}/ns/system/control/grantee", SECURE_TRUST_DOMAIN);
+    let grant = fleetos_control::ca::SvidGrantRecord {
+        spiffe_id: grantee.clone(),
+        node_kind: 0,
+        granted_at: now_unix,
+        expires_at: now_unix + 300,
+        agent_x25519_pubkey: vec![0x22; 32],
+    };
+    donor
+        .keyspaces
+        .svid_grants
+        .insert(
+            grantee.as_bytes(),
+            postcard::to_allocvec(&grant).unwrap().as_slice(),
+        )
+        .unwrap();
+    let grantee_csr = rcgen_impl::build_csr(&SvidParams {
+        spiffe_id: grantee.clone(),
+        kind: SvidKind::Control,
+        role: None,
+        ordinal: None,
+        degraded: false,
+        ttl_secs: 3600,
+    })
+    .unwrap();
+    let mut ca_client = CaServiceClient::new(channel.clone());
+    assert!(
+        ca_client
+            .submit_csr(CsrRequest {
+                csr_der: grantee_csr.csr_der.clone(),
+            })
+            .await
+            .is_ok(),
+        "grant-backed CSR must be signed over the real transport"
+    );
+    assert!(
+        donor
+            .keyspaces
+            .svid_grants
+            .get(grantee.as_bytes())
+            .unwrap()
+            .is_none(),
+        "grant must be consumed exactly once"
+    );
+    assert_eq!(
+        ca_client
+            .submit_csr(CsrRequest {
+                csr_der: grantee_csr.csr_der,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied,
+        "second use of the grant must be rejected"
+    );
+
+    let bundle_resp = ca_client
+        .get_trust_bundle(TrustBundleRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let mut join_pem = String::new();
+    for root in &bundle_resp.roots_der {
+        join_pem.push_str(&der_to_pem(root, "CERTIFICATE"));
+    }
+
+    let joiner_client_tls = RaftClientTls {
+        cert_der: svid_resp.cert_chain_der.clone(),
+        key_der: csr_bundle.private_key.to_vec(),
+        trust_bundle_pem: join_pem.clone(),
+        domain: SECURE_TRUST_DOMAIN.to_owned(),
+    };
+
+    // The shutdown sender must live for the whole membership phase:
+    // spawn_raft_server's shutdown future exits as soon as every sender is
+    // dropped, which would tear the listener down mid-test.
+    let dc_read3 = dc_bundle.read();
+    let (donor_raft_addr, _donor_raft_handle, _donor_raft_shutdown) =
+        spawn_raft_server(donor.raft.clone(), &secure_mtls(&donor_svid, &dc_read3)).await;
+    let donor_raft_addr_str = donor_raft_addr.to_string();
+
+    let mut peers = HashMap::new();
+    peers.insert(SECURE_DONOR_ID, donor_raft_addr_str.clone());
+    let joiner_factory = TonicRaftNetworkFactory::new(peers, joiner_client_tls);
+    let joiner_config = Config {
+        heartbeat_interval: 100,
+        election_timeout_min: 300,
+        election_timeout_max: 600,
+        ..Default::default()
+    };
+    let joiner = create_node(SECURE_JOINER_ID, joiner_factory, joiner_config, false).await;
+    let joiner_mtls = MtlsConfig {
+        cert_chain: vec![rustls::pki_types::CertificateDer::from(
+            svid_resp.cert_chain_der.clone(),
+        )],
+        private_key: rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(csr_bundle.private_key.to_vec()),
+        ),
+        trust_bundle_pem: join_pem.clone(),
+        role: TrustDomainRole::DataControl,
+    };
+    let (joiner_raft_addr, _joiner_handle, _joiner_shutdown) =
+        spawn_raft_server(joiner.raft.clone(), &joiner_mtls).await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        fleetos_control::join::request_membership(
+            &donor_raft_addr_str,
+            SECURE_JOINER_ID,
+            &joiner_raft_addr.to_string(),
+            &joiner_raft_addr.to_string(),
+            &svid_resp.cert_chain_der,
+            &csr_bundle.private_key.to_vec(),
+            &join_pem,
+            SECURE_TRUST_DOMAIN,
+        ),
+    )
+    .await
+    .expect("membership must complete in time")
+    .expect("membership request must succeed over real mTLS");
+
+    let mut joined = false;
+    for _ in 0..200 {
+        let voters: Vec<u64> = donor
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect();
+        if voters.contains(&SECURE_JOINER_ID) {
+            joined = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(joined, "joiner must be promoted to voter");
+
+    wait_for_tenant(&joiner.keyspaces, "tenant-r3").await;
+
+    let _ = dc_shutdown.send(true);
+}
+
+#[tokio::test]
+async fn secure_join_request_activation_with_swtpm() {
+    if std::env::var("FLEETOS_TPM_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping hardware join leg: set FLEETOS_TPM_TESTS=1 with swtpm running");
+        return;
+    }
+    install_crypto_provider();
+
+    let tpm = fleetos_control::config::TpmConfig {
+        backend: fleetos_control::config::TpmBackend::Swtpm,
+        host: std::env::var("FLEETOS_TPM_HOST").unwrap_or_else(|_| "localhost".into()),
+        port: std::env::var("FLEETOS_TPM_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(2321),
+        ..Default::default()
+    };
+
+    let ca = TrustBundle::generate_root(SECURE_TRUST_DOMAIN).unwrap();
+    let donor_svid = secure_control_svid(&ca, "donor");
+    let trust_bundle_pem = ca.trust_bundle_pem();
+    let dc_bundle = Arc::new(parking_lot::RwLock::new(ca));
+
+    let dc_read = dc_bundle.read();
+    // The donor's raft client verifies the joiner's SVID against
+    // SECURE_TRUST_DOMAIN (its DNS SAN). raft_client_tls hardcodes the E14
+    // TRUST_DOMAIN constant, which would fail hostname verification on the
+    // donor -> joiner replication handshake that blocking add_learner needs.
+    let donor_factory = TonicRaftNetworkFactory::new(
+        HashMap::new(),
+        RaftClientTls {
+            cert_der: donor_svid.cert_der.clone(),
+            key_der: donor_svid.private_key_der.to_vec(),
+            trust_bundle_pem: dc_read.trust_bundle_pem(),
+            domain: SECURE_TRUST_DOMAIN.to_owned(),
+        },
+    );
+    let donor = create_node(
+        SECURE_DONOR_ID,
+        donor_factory,
+        Config {
+            heartbeat_interval: 100,
+            election_timeout_min: 300,
+            election_timeout_max: 600,
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    wait_for_leader(&donor.raft).await;
+
+    let pcr_store = Arc::new(PcrPolicyStore::new(donor.keyspaces.pcr_policies.clone()));
+    let attestation_service = AttestationServiceImpl::new(
+        Arc::new(NonceManager::new(donor.keyspaces.nonces.clone())),
+        Arc::new(JoinTokenStore::new(donor.keyspaces.join_tokens.clone())),
+        pcr_store.clone(),
+        donor.keyspaces.nonce_claims.clone(),
+        donor.keyspaces.svid_grants.clone(),
+        donor.raft.clone(),
+        donor.keyspaces.control_addresses.clone(),
+        donor.keyspaces.node_eks.clone(),
+        donor.keyspaces.pending_activations.clone(),
+        Some(dc_bundle.clone()),
+        3600,
+        fleetos_control::config::AttestationMode::Secure,
+        tpm.clone(),
+        donor.keyspaces.svids.clone(),
+    );
+    let ca_service = CaServiceImpl::new(
+        dc_bundle.clone(),
+        3600,
+        donor.keyspaces.svids.clone(),
+        donor.keyspaces.svid_grants.clone(),
+        donor.keyspaces.placements.clone(),
+        donor.keyspaces.control_addresses.clone(),
+        donor.raft.clone(),
+    );
+    let dc_read2 = dc_bundle.read();
+    let (dc_addr, _h, sd) = spawn_dc_server(
+        attestation_service,
+        ca_service,
+        &secure_mtls(&donor_svid, &dc_read2),
+    )
+    .await;
+
+    let endpoint = fleetos_core::attestation::tpm::TpmEndpoint::Swtpm {
+        host: tpm.host.clone(),
+        port: tpm.port,
+    };
+    let mut session = fleetos_core::attestation::tpm::AttestationSession::begin(&endpoint)
+        .expect("TPM session begin failed");
+    let ak_pub = session.ak_pub().unwrap();
+    let ek_pub = session.ek_pub().unwrap();
+    let fingerprint = fleetos_core::attestation::EkFingerprint::of_ek_pub(&ek_pub);
+
+    donor
+        .raft
+        .client_write(AuditedCommand::system(FleetosCommand::RegisterNodeEk {
+            record: fleetos_control::raft::records::NodeEkRecord {
+                ek_fingerprint: fingerprint.to_hex(),
+                ek_pub,
+                ek_cert_der: vec![],
+                node_id: String::new(),
+                registered_at: 1_700_000_000,
+                expires_at: None,
+                state: fleetos_control::raft::records::EkRegistrationState::Pending,
+            },
+        }))
+        .await
+        .unwrap();
+    wait_for_key(&donor.keyspaces.node_eks, fingerprint.to_hex().as_bytes()).await;
+
+    let channel = tonic::transport::Channel::from_shared(fleetos_control::join::channel_addr(
+        &dc_addr.to_string(),
+    ))
+    .unwrap()
+    .tls_config(
+        tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&trust_bundle_pem))
+            .domain_name(SECURE_TRUST_DOMAIN),
+    )
+    .unwrap()
+    .connect()
+    .await
+    .unwrap();
+    let mut att_client = AttestationServiceClient::new(channel);
+
+    let challenge = att_client
+        .request_activation(fleetos_core::proto::identity::ActivationRequest {
+            ak_pub: ak_pub.clone(),
+            ek_cert_der: vec![],
+            ek_pub: vec![],
+        })
+        .await
+        .expect("RequestActivation must succeed against swtpm")
+        .into_inner();
+
+    let recovered = session
+        .activate(&challenge.credential_blob, &challenge.secret)
+        .expect("TPM ActivateCredential failed");
+    let secret: [u8; 32] = recovered.as_slice().try_into().unwrap();
+    let pcr_indices: Vec<u8> = vec![0, 7, 9];
+    let quote_out = session
+        .quote(&challenge.server_nonce, &pcr_indices)
+        .unwrap();
+
+    let joiner_spiffe = format!(
+        "spiffe://{}/ns/system/control/joiner-hw",
+        SECURE_TRUST_DOMAIN
+    );
+    pcr_store
+        .set_policy(&PcrPolicy {
+            node_id: joiner_spiffe.clone(),
+            expected_pcrs: quote_out.pcr_values.clone(),
+            updated_at: 1_700_000_000,
+            active: true,
+        })
+        .unwrap();
+
+    let csr_bundle = rcgen_impl::build_csr(&SvidParams {
+        spiffe_id: joiner_spiffe.clone(),
+        kind: SvidKind::Control,
+        role: None,
+        ordinal: None,
+        degraded: false,
+        ttl_secs: 3600,
+    })
+    .unwrap();
+    let proof = ActivationProof {
+        hmac: fleetos_core::attestation::compute_activation_proof(&secret, &challenge.server_nonce)
+            .to_vec(),
+        quote: quote_out.quote,
+        quote_signature: quote_out.signature,
+        pcr_selection: postcard::to_allocvec(&quote_out.pcr_values).unwrap(),
+        csr_der: csr_bundle.csr_der,
+        agent_x25519_pubkey: vec![0x33u8; 32],
+    };
+    let resp = att_client
+        .submit_activation_proof(proof)
+        .await
+        .expect("hardware attestation must succeed over real TLS")
+        .into_inner();
+    assert!(!resp.cert_chain_der.is_empty());
+    assert_eq!(resp.svid_version, 1);
+
+    let ek_bytes = wait_for_key(&donor.keyspaces.node_eks, fingerprint.to_hex().as_bytes()).await;
+    let ek_rec: fleetos_control::raft::records::NodeEkRecord =
+        postcard::from_bytes(&ek_bytes).unwrap();
+    assert_eq!(
+        ek_rec.state,
+        fleetos_control::raft::records::EkRegistrationState::Joined
+    );
+    let _ = sd.send(true);
+}
