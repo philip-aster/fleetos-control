@@ -547,6 +547,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let ca_data_control = ca_service.as_ref().map(|ca| ca.data_control.clone());
+    // CR-16: node-callable delegated key acquisition (Data/Control listener).
+    let delegation_service = fleetos_control::watch::delegation_service::DelegationServiceImpl::new(
+        raft_handle.raft.clone(),
+        ca_data_control.clone(),
+        keyspaces.placements.clone(),
+        config.svid.delegated_key_ttl_secs,
+        config.svid.refresh_fraction,
+        keyspaces.control_addresses.clone(),
+    );
     let admin_service = fleetos_control::admin::service::AdminServiceImpl::new(
         storage_engine.clone(),
         join_token_store.clone(),
@@ -649,9 +658,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .add_service(fleetos_core::proto::fleetos::router_assignment_service_server::RouterAssignmentServiceServer::new(router_service))
             .add_service(fleetos_core::proto::fleetos::secret_service_server::SecretServiceServer::new(secret_service))
             .add_service(fleetos_core::proto::fleetos::attestation_service_server::AttestationServiceServer::new(attestation_service))
-            .add_service(
-                fleetos_core::proto::fleetos::policy_service_server::PolicyServiceServer::new(policy_service),
-            );
+            .add_service(fleetos_core::proto::fleetos::policy_service_server::PolicyServiceServer::new(policy_service))
+            .add_service(fleetos_core::proto::fleetos::delegation_service_server::DelegationServiceServer::new(delegation_service));
 
         if let Some(ca_svc) = ca_grpc_service {
             server = server.add_service(

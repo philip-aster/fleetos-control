@@ -44,9 +44,6 @@ pub enum SchedulerError {
     #[error("node {0} is not schedulable")]
     NodeNotSchedulable(String),
 
-    #[error("ordinal conflict: {0}")]
-    OrdinalConflict(String),
-
     #[error("storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),
 

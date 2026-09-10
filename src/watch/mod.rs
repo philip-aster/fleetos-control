@@ -8,8 +8,10 @@
 //! - `SecretService` (agents): pull-based FetchSecret (unary)
 //! - `SchedulerService` (agents): WatchSchedule streaming WorkloadAssignments
 //! - `RouterAssignmentService` (routers): WatchRoutes streaming RouteEntries
+//! - `DelegationService` (nodes): delegated signing key acquisition (CR-16, unary)
 
 pub mod broadcast;
+pub mod delegation_service;
 pub mod policy_service;
 pub mod router_assignment;
 pub mod scheduler_stream;

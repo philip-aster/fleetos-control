@@ -718,6 +718,7 @@ impl FjallStateMachine {
                 }
                 if let Some(mut placement) = found {
                     let old_pod_id = placement.pod_id.clone();
+                    let node_id_str = placement.node_id.to_string();
                     placement.pod_id = new_pod_id.clone();
                     let serialized = postcard::to_allocvec(&placement).map_err(ser_err)?;
                     batch.remove(&self.keyspaces.placements, old_pod_id.as_bytes());
@@ -725,6 +726,26 @@ impl FjallStateMachine {
                         &self.keyspaces.placements,
                         new_pod_id.as_bytes(),
                         serialized.as_slice(),
+                    );
+                    // Keep the ordinal slot record consistent with the placement it
+                    // now holds. Without this, a later scale-down would propose
+                    // RemovePlacement for a stale pod_id and leak the live placement.
+                    // Same batch = atomic with the swap; the read-modify-write only
+                    // reads committed state, so it is deterministic across nodes.
+                    let assignment = crate::scheduler::ordinal::OrdinalAssignment {
+                        tenant_id: tenant_id.clone(),
+                        service: service.clone(),
+                        role: role.clone(),
+                        ordinal: *ordinal,
+                        current_pod_id: Some(new_pod_id.clone()),
+                        current_node_id: Some(node_id_str),
+                    };
+                    let ordinal_key = format!("{}:{}:{}:{}", tenant_id, service, role, ordinal);
+                    let assignment_bytes = postcard::to_allocvec(&assignment).map_err(ser_err)?;
+                    batch.insert(
+                        &self.keyspaces.ordinals,
+                        ordinal_key.as_bytes(),
+                        assignment_bytes.as_slice(),
                     );
                 }
                 Ok(ChangeKind::SchedulingUpdate)

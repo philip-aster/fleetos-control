@@ -4,12 +4,17 @@
 //! gRPC server defined in `admin.proto`.
 //!
 //! **Authorization constraint (critical):**
-//! - Reject any caller whose SVID `kind` is not `ctrl` (i.e., `fleetctl-proxy`'s identity kind).
+//! - Reject any caller whose SVID `kind` is not `ctrl` (fleetctl-proxy) or
+//!   `operator` (CR-8 JIT access). The application layer enforces this on top
+//!   of the Admin-domain mTLS boundary.
 //! - A valid `sa` or `node` SVID hitting this endpoint must be rejected at the
 //!   TLS/mTLS layer, not just at the application layer.
 //! - This enforces the trust-domain boundary between the admin overlay and the
 //!   data/control overlay. The two overlays are separated by trust domain for
 //!   blast-radius isolation.
+//! - CR-16: the node-callable delegated-key path lives on the Data/Control
+//!   listener (`DelegationService`). This surface's `RequestDelegatedKey` is
+//!   the cluster-admin/operator override only.
 //!
 //! **Trust domain routing:**
 //! AdminService always validates against the Admin-domain trust bundle.

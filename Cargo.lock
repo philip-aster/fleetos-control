@@ -1111,7 +1111,7 @@ checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 
 [[package]]
 name = "fleetos-control"
-version = "0.1.0"
+version = "0.1.1-rc-1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "fleetos-core"
-version = "0.1.5-rc-6"
+version = "0.1.5-rc-7"
 dependencies = [
  "async-trait",
  "blake3",

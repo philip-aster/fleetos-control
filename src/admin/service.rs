@@ -939,12 +939,10 @@ impl AdminService for AdminServiceImpl {
         let node_svid_str = req.node_svid.clone();
         let target_spiffe_str = req.target_spiffe_id.clone();
 
-        // Authorization: caller must be the node itself, or a cluster admin.
-        let caller = self.caller_spiffe_id(&request)?;
-        let is_self = caller == node_svid_str;
-        if !is_self {
-            self.require_cluster_admin(&request)?;
-        }
+        // CR-16: the node-callable path lives on the Data/Control listener
+        // (DelegationServiceImpl). This RPC is the cluster-admin/operator
+        // override only — `verify_caller` above already rejects node kinds.
+        self.require_cluster_admin(&request)?;
 
         let node_spiffe: SpiffeId = node_svid_str
             .parse()
@@ -1794,5 +1792,281 @@ mod tests {
         assert!(validate_identifier("trailing-", "x").is_err());
         assert!(validate_identifier("has space", "x").is_err());
         assert!(validate_identifier(&"a".repeat(64), "x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod delegated_key_authz_tests {
+    use super::*;
+
+    const NODE_ID: &str = "spiffe://fleet.example.internal/ns/system/node/agent-1";
+    const TARGET_ID: &str = "spiffe://fleet.example.internal/ns/tenant-1/sa/db";
+    const CTRL_ID: &str = "spiffe://fleet-admin.example.internal/ns/system/ctrl/fleetctl-proxy";
+    const OPERATOR_ID: &str = "spiffe://fleet-admin.example.internal/ns/system/operator/alice";
+
+    struct NoOpNetworkFactory;
+    impl openraft::network::RaftNetworkFactory<crate::raft::FleetosRaftConfig> for NoOpNetworkFactory {
+        type Network = NoOpNetwork;
+        async fn new_client(&mut self, _target: u64, _node: &openraft::BasicNode) -> Self::Network {
+            NoOpNetwork
+        }
+    }
+    struct NoOpNetwork;
+    impl openraft::network::RaftNetwork<crate::raft::FleetosRaftConfig> for NoOpNetwork {
+        async fn append_entries(
+            &mut self,
+            _req: openraft::raft::AppendEntriesRequest<crate::raft::FleetosRaftConfig>,
+            _option: openraft::network::RPCOption,
+        ) -> Result<
+            openraft::raft::AppendEntriesResponse<u64>,
+            openraft::error::RPCError<u64, openraft::BasicNode, openraft::error::RaftError<u64>>,
+        > {
+            Err(openraft::error::RPCError::Network(
+                openraft::error::NetworkError::new(&std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "test",
+                )),
+            ))
+        }
+        async fn vote(
+            &mut self,
+            _req: openraft::raft::VoteRequest<u64>,
+            _option: openraft::network::RPCOption,
+        ) -> Result<
+            openraft::raft::VoteResponse<u64>,
+            openraft::error::RPCError<u64, openraft::BasicNode, openraft::error::RaftError<u64>>,
+        > {
+            Err(openraft::error::RPCError::Network(
+                openraft::error::NetworkError::new(&std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "test",
+                )),
+            ))
+        }
+        async fn install_snapshot(
+            &mut self,
+            _req: openraft::raft::InstallSnapshotRequest<crate::raft::FleetosRaftConfig>,
+            _option: openraft::network::RPCOption,
+        ) -> Result<
+            openraft::raft::InstallSnapshotResponse<u64>,
+            openraft::error::RPCError<
+                u64,
+                openraft::BasicNode,
+                openraft::error::RaftError<u64, openraft::error::InstallSnapshotError>,
+            >,
+        > {
+            Err(openraft::error::RPCError::Network(
+                openraft::error::NetworkError::new(&std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "test",
+                )),
+            ))
+        }
+    }
+
+    /// MasterKeyProvider stub — secret crypto is never touched by these tests.
+    struct DummyMasterKey;
+    impl crate::secrets::crypto::MasterKeyProvider for DummyMasterKey {
+        fn wrap_dek(
+            &self,
+            _dek: &crate::secrets::crypto::Dek,
+        ) -> Result<crate::secrets::crypto::WrappedDek, crate::secrets::SecretError> {
+            Err(crate::secrets::SecretError::Encryption(
+                "unused in test".to_owned(),
+            ))
+        }
+        fn unwrap_dek(
+            &self,
+            _wrapped: &crate::secrets::crypto::WrappedDek,
+        ) -> Result<crate::secrets::crypto::Dek, crate::secrets::SecretError> {
+            Err(crate::secrets::SecretError::Decryption(
+                "unused in test".to_owned(),
+            ))
+        }
+    }
+
+    async fn admin_test_service(name: &str, bootstrap_admins: Vec<String>) -> AdminServiceImpl {
+        let dir = std::env::temp_dir().join(format!(
+            "fleetos-admin-delegation-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = crate::storage::open_database(&dir).unwrap();
+        let keyspaces = crate::storage::init_keyspaces(&db).unwrap();
+
+        let versioned_state =
+            crate::storage::version::VersionedState::new(keyspaces.version.clone());
+        let broadcast_hub = crate::watch::broadcast::BroadcastHub::new();
+        let raft_config = Arc::new(
+            openraft::Config {
+                heartbeat_interval: 50,
+                election_timeout_min: 150,
+                election_timeout_max: 300,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        );
+        let log_storage = crate::raft::store::FjallLogStorage::new(
+            db.clone(),
+            keyspaces.raft_log.clone(),
+            keyspaces.raft_log_meta.clone(),
+        );
+        let state_machine = crate::raft::state_machine::FjallStateMachine::new(
+            db.clone(),
+            keyspaces.clone(),
+            versioned_state,
+            broadcast_hub,
+            "fleet.example.internal".to_owned(),
+        );
+        let raft = openraft::Raft::new(
+            1,
+            raft_config,
+            NoOpNetworkFactory,
+            log_storage,
+            state_machine,
+        )
+        .await
+        .unwrap();
+        let raft = Arc::new(raft);
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(
+            1,
+            openraft::BasicNode {
+                addr: String::new(),
+            },
+        );
+        raft.initialize(members).await.unwrap();
+
+        // Seed a placement: agent-1 hosts tenant-1/db ordinal 0.
+        let placement = crate::scheduler::Placement {
+            pod_id: "db-replica-0".to_owned(),
+            tenant_id: "tenant-1".to_owned(),
+            service: "db".to_owned(),
+            role: "replica".to_owned(),
+            ordinal: 0,
+            node_id: NODE_ID.parse().unwrap(),
+            resources: crate::scheduler::ResourceSpec {
+                cpu_millicores: 500,
+                memory_bytes: 512 * 1024 * 1024,
+            },
+        };
+        let serialized = postcard::to_allocvec(&placement).unwrap();
+        keyspaces
+            .placements
+            .insert(placement.pod_id.as_bytes(), serialized.as_slice())
+            .unwrap();
+
+        let storage = Arc::new(crate::storage::StorageEngine::new(
+            keyspaces.version.clone(),
+            keyspaces.raft_log.clone(),
+            keyspaces.raft_log_meta.clone(),
+            keyspaces.raft_state.clone(),
+            keyspaces.raft_snapshot.clone(),
+            keyspaces.nodes.clone(),
+            keyspaces.svids.clone(),
+            keyspaces.placements.clone(),
+            keyspaces.tenants.clone(),
+            keyspaces.ordinals.clone(),
+            keyspaces.workloads.clone(),
+            keyspaces.router_assignments.clone(),
+            keyspaces.active_delegations.clone(),
+            keyspaces.revoked_delegations.clone(),
+            keyspaces.join_tokens.clone(),
+            keyspaces.pcr_policies.clone(),
+            keyspaces.dummy_ips.clone(),
+            keyspaces.secrets.clone(),
+            keyspaces.sag_rules.clone(),
+            keyspaces.node_pools.clone(),
+            keyspaces.audit_log.clone(),
+            keyspaces.operator_grants.clone(),
+            keyspaces.workload_status.clone(),
+            keyspaces.tenant_quotas.clone(),
+        ));
+        let bundle =
+            crate::ca::trust_bundle::TrustBundle::generate_root("fleet.example.internal").unwrap();
+        let operators_config = crate::config::OperatorsConfig {
+            bootstrap_admins,
+            ..Default::default()
+        };
+        AdminServiceImpl::new(
+            storage,
+            Arc::new(crate::attestation::join_token::JoinTokenStore::new(
+                keyspaces.join_tokens.clone(),
+            )),
+            Arc::new(
+                crate::dummy_ip::allocator::DummyIpAllocator::new(keyspaces.dummy_ips.clone(), 16)
+                    .unwrap(),
+            ),
+            raft,
+            operators_config,
+            3600,
+            Arc::new(crate::secrets::SecretStore::new(
+                keyspaces.secrets.clone(),
+                Box::new(DummyMasterKey),
+            )),
+            Some(Arc::new(parking_lot::RwLock::new(bundle))),
+            14400,
+            keyspaces.node_eks.clone(),
+            0.75,
+        )
+    }
+
+    fn delegated_request() -> DelegatedKeyRequest {
+        DelegatedKeyRequest {
+            node_svid: NODE_ID.to_owned(),
+            target_spiffe_id: TARGET_ID.to_owned(),
+            target_ordinal: Some(0),
+            requested_ttl_secs: 3600,
+        }
+    }
+
+    fn request_as(caller: &str) -> Request<DelegatedKeyRequest> {
+        let mut request = Request::new(delegated_request());
+        request
+            .extensions_mut()
+            .insert(crate::tls::PeerConnectInfo {
+                spiffe_id: Some(caller.parse().unwrap()),
+            });
+        request
+    }
+
+    // (g) Regression: node-kind caller on AdminService.RequestDelegatedKey
+    // is rejected now that the is_self branch is gone.
+    #[tokio::test]
+    async fn node_caller_rejected_on_admin_delegated_key_path() {
+        let svc = admin_test_service("admin-node-reject", vec![]).await;
+        let err = svc
+            .request_delegated_key(request_as(NODE_ID))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    // (h) The operator override path demonstrably survives: ctrl-kind caller
+    // and bootstrap-admin operator caller are both still issued.
+    #[tokio::test]
+    async fn ctrl_caller_still_issued_on_admin_delegated_key_path() {
+        let svc = admin_test_service("admin-ctrl-issue", vec![]).await;
+        let resp = svc
+            .request_delegated_key(request_as(CTRL_ID))
+            .await
+            .expect("admin override issuance should succeed");
+        let inner = resp.into_inner();
+        assert!(!inner.delegation_id.is_empty());
+        assert!(!inner.key_material.is_empty());
+    }
+
+    #[tokio::test]
+    async fn operator_bootstrap_admin_still_issued_on_admin_delegated_key_path() {
+        let svc = admin_test_service("admin-operator-issue", vec![OPERATOR_ID.to_owned()]).await;
+        let resp = svc
+            .request_delegated_key(request_as(OPERATOR_ID))
+            .await
+            .expect("bootstrap-admin operator issuance should succeed");
+        let inner = resp.into_inner();
+        assert!(!inner.delegation_id.is_empty());
+        assert!(!inner.key_material.is_empty());
     }
 }
