@@ -1,6 +1,6 @@
 # fleetos-control
 
-https://img.shields.io/badge/license-Apache--2.0-blue.svg
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 `fleetos-control` is the control-plane brain of FleetOS, a Rust-based
 container and MicroVM orchestrator designed to replace Kubernetes. A single
@@ -256,4 +256,4 @@ Invariants are locked by dedicated tests in `tests/`:
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See the `LICENSE` file.
+Licensed under the Apache License, Version 2.0. You may obtain a copy of the License in the [LICENSE](LICENSE) file.
