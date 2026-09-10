@@ -3,10 +3,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 `fleetos-control` is the control-plane brain of FleetOS, a Rust-based
-container and MicroVM orchestrator designed to replace Kubernetes. A single
-binary consolidates what Kubernetes splits across `kube-apiserver`, `etcd`,
-`scheduler`, and `controller-manager`, replicated by Raft across a small
-(3–5 node) control cluster.
+container and MicroVM orchestrator designed to replace other orchestrators.
 
 FleetOS is a **dark overlay**: control nodes never expose inbound scrape or
 management endpoints. Every listener is mTLS-only with SPIFFE identity,
