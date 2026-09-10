@@ -420,8 +420,16 @@ pub struct AttestationConfig {
     #[serde(default = "default_attestation_mode")]
     pub mode: AttestationMode,
     /// R-1 explicit opt-in: production builds refuse to boot with
-    /// `mode = "insecure"` unless this is `true` (testing only — never a
-    /// real deployment).
+    /// `mode = "insecure"` unless this is `true`.
+    ///
+    /// RESIDUAL RISK (documented, accepted for the "fenced" posture): setting
+    /// this to `true` under a production build makes the insecure `submit_quote`
+    /// path callable directly. That path performs structural-only quote
+    /// verification (no signature check), so join-token possession alone again
+    /// grants cluster admission — reintroducing Master finding M-2 for anyone
+    /// holding a valid join token. Acceptable only because it is an explicit,
+    /// logged, documented opt-in for test harnesses that must run production
+    /// binaries against software-only nodes. Never set it in a real deployment.
     #[serde(default)]
     pub allow_insecure_attestation: bool,
 }

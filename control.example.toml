@@ -97,9 +97,11 @@ join_token_ttl_secs = 3600
 # "secure"   = TPM credential activation (CR-10). Production.
 # "insecure" = join-token only, structural quote checks. TESTING ONLY.
 mode = "secure"
-# Production builds refuse to boot with mode = "insecure" unless this is
-# true. Exists for test harnesses that must run production binaries against
-# software-only nodes. Leave false everywhere else.
+# Production builds refuse to boot with mode = "insecure" unless this is true.
+# WARNING (residual M-2): setting this to true in a production build re-enables
+# the insecure submit_quote path (structural-only verification), so join-token
+# possession alone grants admission. Exists ONLY for test harnesses that must run
+# production binaries against software-only nodes. Leave false in any real deployment.
 allow_insecure_attestation = false
 
 # ---------------------------------------------------------------------------

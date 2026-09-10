@@ -73,11 +73,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if config.attestation.mode == AttestationMode::Insecure {
         tracing::warn!("====================================================================");
-        tracing::warn!(
-            "INSECURE ATTESTATION MODE ACTIVE: join-token possession is the only \
-             gate to cluster admission and quote signatures are NOT verified. \
-             TESTING ONLY — never use in a real deployment."
-        );
+        if cfg!(feature = "production") {
+            tracing::warn!(
+                "INSECURE ATTESTATION ENABLED IN A PRODUCTION BUILD via \
+                 attestation.allow_insecure_attestation = true."
+            );
+            tracing::warn!(
+                "RESIDUAL RISK (M-2): the insecure submit_quote path is now callable \
+                 and performs structural-only quote verification — join-token \
+                 possession alone grants cluster admission. Testing only; never a \
+                 real deployment."
+            );
+        } else {
+            tracing::warn!(
+                "INSECURE ATTESTATION MODE ACTIVE: join-token possession is the only \
+                 gate to cluster admission and quote signatures are NOT verified. \
+                 TESTING ONLY — never use in a real deployment."
+            );
+        }
         tracing::warn!("====================================================================");
     }
 
@@ -490,6 +503,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             broadcast_hub.clone(),
         );
 
+    let policy_service =
+        fleetos_control::watch::policy_service::PolicyServiceImpl::new(broadcast_hub.clone());
+
     // Attestation and CA services (Data/Control listener)
     let nonce_manager = Arc::new(fleetos_control::attestation::nonce::NonceManager::new(
         keyspaces.nonces.clone(),
@@ -632,7 +648,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .add_service(fleetos_core::proto::fleetos::scheduler_service_server::SchedulerServiceServer::new(scheduler_service))
             .add_service(fleetos_core::proto::fleetos::router_assignment_service_server::RouterAssignmentServiceServer::new(router_service))
             .add_service(fleetos_core::proto::fleetos::secret_service_server::SecretServiceServer::new(secret_service))
-            .add_service(fleetos_core::proto::fleetos::attestation_service_server::AttestationServiceServer::new(attestation_service));
+            .add_service(fleetos_core::proto::fleetos::attestation_service_server::AttestationServiceServer::new(attestation_service))
+            .add_service(
+                fleetos_core::proto::fleetos::policy_service_server::PolicyServiceServer::new(policy_service),
+            );
 
         if let Some(ca_svc) = ca_grpc_service {
             server = server.add_service(

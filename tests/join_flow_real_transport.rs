@@ -864,6 +864,50 @@ async fn secure_join_attestation_to_membership_over_real_tls() {
     assert_eq!(svid_rec.svid_version, 1);
     assert_eq!(svid_rec.agent_x25519_pubkey, vec![0x11u8; 32]);
 
+    // R-5 regression hardening: a re-attestation must bump the version to 2.
+    // Asserting only `== 1` on first issuance cannot distinguish a computed
+    // version from a hardcoded `1`; the increment proves it is real state.
+    let server_nonce_2 = [0xCDu8; 32];
+    let secret_2 = [0x77u8; 32];
+    let sw_quote_2 = build_software_quote(&server_nonce_2, &[0x42u8; 32]);
+    let pending_2 = PendingActivationRecord {
+        ek_fingerprint: fingerprint.to_hex(),
+        ak_pub: sw_quote_2.ak_pub.clone(),
+        server_nonce: server_nonce_2.to_vec(),
+        secret: secret_2.to_vec(),
+        created_at: now_unix,
+        expires_at: now_unix + 300,
+    };
+    donor
+        .keyspaces
+        .pending_activations
+        .insert(
+            server_nonce_2.as_slice(),
+            postcard::to_allocvec(&pending_2).unwrap().as_slice(),
+        )
+        .unwrap();
+    let proof_2 = ActivationProof {
+        hmac: fleetos_core::attestation::compute_activation_proof(&secret_2, &server_nonce_2)
+            .to_vec(),
+        quote: sw_quote_2.quote.clone(),
+        quote_signature: sw_quote_2.signature.clone(),
+        pcr_selection: postcard::to_allocvec(&sw_quote_2.pcr_values).unwrap(),
+        csr_der: csr_bundle.csr_der.clone(),
+        agent_x25519_pubkey: vec![0x11u8; 32],
+    };
+    let resp_2 = att_client
+        .submit_activation_proof(proof_2)
+        .await
+        .expect("re-attestation must succeed over real TLS")
+        .into_inner();
+    assert_eq!(
+        resp_2.svid_version, 2,
+        "R-5: re-attestation must increment the SVID version, not return a constant"
+    );
+    let svid_bytes_2 = wait_for_key(&donor.keyspaces.svids, joiner_spiffe.as_bytes()).await;
+    let svid_rec_2: fleetos_control::ca::SvidRecord = postcard::from_bytes(&svid_bytes_2).unwrap();
+    assert_eq!(svid_rec_2.svid_version, 2);
+
     let grantee = format!("spiffe://{}/ns/system/control/grantee", SECURE_TRUST_DOMAIN);
     let grant = fleetos_control::ca::SvidGrantRecord {
         spiffe_id: grantee.clone(),
@@ -1108,7 +1152,7 @@ async fn secure_join_request_activation_with_swtpm() {
         .client_write(AuditedCommand::system(FleetosCommand::RegisterNodeEk {
             record: fleetos_control::raft::records::NodeEkRecord {
                 ek_fingerprint: fingerprint.to_hex(),
-                ek_pub,
+                ek_pub: ek_pub.clone(),
                 ek_cert_der: vec![],
                 node_id: String::new(),
                 registered_at: 1_700_000_000,
@@ -1139,7 +1183,7 @@ async fn secure_join_request_activation_with_swtpm() {
         .request_activation(fleetos_core::proto::identity::ActivationRequest {
             ak_pub: ak_pub.clone(),
             ek_cert_der: vec![],
-            ek_pub: vec![],
+            ek_pub: ek_pub.clone(),
         })
         .await
         .expect("RequestActivation must succeed against swtpm")
