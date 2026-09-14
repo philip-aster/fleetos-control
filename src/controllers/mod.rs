@@ -12,6 +12,7 @@
 //! When leadership is lost, all controller tasks are cancelled.
 
 pub mod cron_controller;
+pub mod hpa_controller;
 pub mod leader;
 pub mod node_controller;
 pub mod pod_controller;
@@ -38,7 +39,7 @@ pub enum ControllerError {
     Delegation(#[from] crate::delegation::DelegationError),
 
     #[error("policy error: {0}")]
-    Policy(#[from] crate::policy::PolicyError),
+    Policy(#[from] fleetos_policy_compiler::PolicyError),
 
     #[error("raft error: {0}")]
     Raft(String),

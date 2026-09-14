@@ -259,6 +259,51 @@ impl FjallStateMachine {
                 Ok(ChangeKind::ClusterMembership)
             }
 
+            // --- CR-CTRL-9: node taints ---
+            FleetosCommand::SetNodeTaints { node_id, taints } => {
+                if taints.is_empty() {
+                    batch.remove(&self.keyspaces.node_taints, node_id.as_bytes());
+                } else {
+                    let value = postcard::to_allocvec(taints).map_err(ser_err)?;
+                    batch.insert(
+                        &self.keyspaces.node_taints,
+                        node_id.as_bytes(),
+                        value.as_slice(),
+                    );
+                }
+                Ok(ChangeKind::SchedulingUpdate)
+            }
+            FleetosCommand::RemoveNodeTaint {
+                node_id,
+                key,
+                effect,
+            } => {
+                if let Some(bytes) = self
+                    .keyspaces
+                    .node_taints
+                    .get(node_id.as_bytes())
+                    .map_err(read_err)?
+                {
+                    let mut taints: Vec<records::NodeTaint> =
+                        postcard::from_bytes(&bytes).map_err(ser_err)?;
+                    let before = taints.len();
+                    taints.retain(|t| !(t.key == *key && t.effect == *effect));
+                    if taints.len() != before {
+                        if taints.is_empty() {
+                            batch.remove(&self.keyspaces.node_taints, node_id.as_bytes());
+                        } else {
+                            let value = postcard::to_allocvec(&taints).map_err(ser_err)?;
+                            batch.insert(
+                                &self.keyspaces.node_taints,
+                                node_id.as_bytes(),
+                                value.as_slice(),
+                            );
+                        }
+                    }
+                }
+                Ok(ChangeKind::SchedulingUpdate)
+            }
+
             FleetosCommand::RevokeNodeEk { ek_fingerprint } => {
                 if let Some(bytes) = self
                     .keyspaces
@@ -317,7 +362,28 @@ impl FjallStateMachine {
             }
 
             FleetosCommand::UpsertWorkloadStatus { record } => {
-                let value = postcard::to_allocvec(record).map_err(ser_err)?;
+                // CR-CTRL-3 readiness gate: track a sustained "started but policy not
+                // enforced" violation. Read-modify-write over committed state is
+                // deterministic; timestamps come from the report, never the wall clock.
+                let prev: Option<records::WorkloadStatusRecord> = self
+                    .keyspaces
+                    .workload_status
+                    .get(record.pod_id.as_bytes())
+                    .map_err(read_err)?
+                    .and_then(|bytes| postcard::from_bytes(bytes.as_ref()).ok());
+                let mut record = record.clone();
+                // CR-CTRL-3: readiness gate requires started + policy_enforced + router_connected.
+                let in_violation =
+                    record.started && (!record.policy_enforced || !record.router_connected);
+                record.gate_violation_since_unix = if in_violation {
+                    match prev {
+                        Some(p) if p.gate_violation_since_unix > 0 => p.gate_violation_since_unix,
+                        _ => record.observed_at_unix,
+                    }
+                } else {
+                    0
+                };
+                let value = postcard::to_allocvec(&record).map_err(ser_err)?;
                 batch.insert(
                     &self.keyspaces.workload_status,
                     record.pod_id.as_bytes(),
@@ -825,77 +891,26 @@ impl FjallStateMachine {
     /// Read all SAG rules and revoked delegation IDs from keyspaces,
     /// then publish a SagUpdateEvent to the BroadcastHub.
     fn publish_sag_update(&self, version: fleetos_core::MonotonicVersion) {
-        // Read all SAG rules from the sag_rules keyspace.
-        // Each value is a stored rule_bytes from SagRuleRecord.
-        // We construct the length-prefixed proto format expected by decode_rules().
-        let mut rules_bytes = Vec::new();
-        for guard in self.keyspaces.sag_rules.prefix(Vec::<u8>::new()) {
-            let value = match guard.value() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let rule_bytes = value.as_ref();
-            rules_bytes.extend_from_slice(&(rule_bytes.len() as u32).to_le_bytes());
-            rules_bytes.extend_from_slice(rule_bytes);
-        }
-
-        // Read all revoked delegation IDs.
-        let mut revoked_ids: Vec<Vec<u8>> = Vec::new();
-        for guard in self.keyspaces.revoked_delegations.prefix(Vec::<u8>::new()) {
-            let value = match guard.value() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Ok(record) = postcard::from_bytes::<DelegationRecord>(value.as_ref()) {
-                revoked_ids.push(record.delegation_id.into_bytes());
-            }
-        }
-
-        // Collect revoked node SVIDs (G-4 / CR-5).
-        let mut revoked_spiffe_ids: Vec<String> = Vec::new();
-        for guard in self.keyspaces.revoked_svids.prefix(Vec::<u8>::new()) {
-            let value = match guard.value() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Ok(record) = postcard::from_bytes::<records::RevokedSvidRecord>(value.as_ref()) {
-                revoked_spiffe_ids.push(record.spiffe_id);
-            }
-        }
-
+        let snap = crate::watch::snapshot::build_sag_snapshot(
+            &self.keyspaces.sag_rules,
+            &self.keyspaces.revoked_delegations,
+            &self.keyspaces.revoked_svids,
+        );
         self.broadcast_hub.publish_sag_update(SagUpdateEvent {
             version,
-            rules_bytes,
-            revoked_delegation_ids: revoked_ids,
-            revoked_spiffe_ids,
+            rules_bytes: snap.rules_bytes,
+            revoked_delegation_ids: snap.revoked_delegation_ids,
+            revoked_spiffe_ids: snap.revoked_spiffe_ids,
         });
     }
 
     /// Read all placements from keyspaces and publish a ScheduleUpdateEvent.
     fn publish_schedule_update(&self, version: fleetos_core::MonotonicVersion) {
-        let mut records: Vec<crate::watch::scheduler_stream::WorkloadAssignmentRecord> = Vec::new();
-        for guard in self.keyspaces.placements.prefix(Vec::<u8>::new()) {
-            let value = match guard.value() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Ok(placement) =
-                postcard::from_bytes::<crate::scheduler::Placement>(value.as_ref())
-            {
-                let (runtime, image) =
-                    self.lookup_workload_metadata(&placement.tenant_id, &placement.service);
-                records.push(crate::watch::scheduler_stream::WorkloadAssignmentRecord {
-                    workload_id: placement.service.clone(),
-                    runtime,
-                    image,
-                    role: placement.role.clone(),
-                });
-            }
-        }
-        let assignments_bytes = match postcard::to_allocvec(&records) {
-            Ok(bytes) => bytes,
-            Err(_) => return,
-        };
+        let assignments_bytes = crate::watch::snapshot::build_schedule_snapshot(
+            &self.keyspaces.placements,
+            &self.keyspaces.workloads,
+            &self.data_trust_domain,
+        );
         self.broadcast_hub
             .publish_schedule_update(crate::watch::broadcast::ScheduleUpdateEvent {
                 version,
@@ -905,72 +920,16 @@ impl FjallStateMachine {
 
     /// Read all placements + dummy IPs and publish a RouteUpdateEvent (S-8).
     fn publish_route_update(&self, version: fleetos_core::MonotonicVersion) {
-        let mut records: Vec<crate::watch::router_assignment::RouteEntryRecord> = Vec::new();
-        for guard in self.keyspaces.placements.prefix(Vec::<u8>::new()) {
-            let value = match guard.value() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Ok(placement) =
-                postcard::from_bytes::<crate::scheduler::Placement>(value.as_ref())
-            {
-                // Look up the dummy IP for this (tenant, service, role).
-                let service_key = format!(
-                    "service:{}:{}:{}",
-                    placement.tenant_id, placement.service, placement.role
-                );
-                let dummy_ip = match self.keyspaces.dummy_ips.get(service_key.as_bytes()) {
-                    Ok(Some(bytes)) => postcard::from_bytes::<
-                        crate::dummy_ip::allocator::ServiceAddress,
-                    >(bytes.as_ref())
-                    .map(|sa| sa.address)
-                    .unwrap_or(0),
-                    _ => 0,
-                };
-                let destination_svid = format!(
-                    "spiffe://{}/ns/{}/sa/{}",
-                    self.data_trust_domain, placement.tenant_id, placement.service
-                );
-                records.push(crate::watch::router_assignment::RouteEntryRecord {
-                    destination_svid,
-                    destination_role: placement.role.clone(),
-                    target_agent_svid: placement.node_id.to_string(),
-                    dummy_ip,
-                });
-            }
-        }
-        let routes_bytes = match postcard::to_allocvec(&records) {
-            Ok(bytes) => bytes,
-            Err(_) => return,
-        };
+        let routes_bytes = crate::watch::snapshot::build_routes_snapshot(
+            &self.keyspaces.placements,
+            &self.keyspaces.dummy_ips,
+            &self.data_trust_domain,
+        );
         self.broadcast_hub
             .publish_route_update(crate::watch::broadcast::RouteUpdateEvent {
                 version,
                 routes_bytes,
             });
-    }
-
-    fn lookup_workload_metadata(&self, tenant_id: &str, workload_id: &str) -> (String, String) {
-        let key = format!("{}:{}", tenant_id, workload_id);
-        let Ok(Some(value)) = self.keyspaces.workloads.get(key.as_bytes()) else {
-            return (String::new(), String::new());
-        };
-        let Ok(record) =
-            postcard::from_bytes::<crate::raft::records::WorkloadSpecRecord>(value.as_ref())
-        else {
-            return (String::new(), String::new());
-        };
-        let Ok(spec) =
-            fleetos_core::proto::workload::WorkloadSpec::decode(record.spec_bytes.as_slice())
-        else {
-            return (String::new(), String::new());
-        };
-        let runtime = spec
-            .pod_spec
-            .as_ref()
-            .map(|p| p.runtime.clone())
-            .unwrap_or_default();
-        (runtime, spec.image)
     }
 }
 
@@ -1052,6 +1011,8 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::UpsertSvidVersion { .. } => "UpsertSvidVersion",
         FleetosCommand::RegisterNodeEk { .. } => "RegisterNodeEk",
         FleetosCommand::ActivateNodeEk { .. } => "ActivateNodeEk",
+        FleetosCommand::SetNodeTaints { .. } => "SetNodeTaints",
+        FleetosCommand::RemoveNodeTaint { .. } => "RemoveNodeTaint",
         FleetosCommand::RevokeNodeEk { .. } => "RevokeNodeEk",
     }
 }

@@ -20,6 +20,7 @@ der = "0.8.1"
 fjall = "3.1.9"
 fleetos-core = { path = "../fleetos-core", features = ["production"] }
 fleetos-ebpf-common = { path = "../fleetos-ebpf/fleetos-ebpf-common" }
+fleetos-policy-compiler = { path = "../fleetos-policy-compiler" }
 futures = "0.3.34"
 ipnet = "2.12.1"
 openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }

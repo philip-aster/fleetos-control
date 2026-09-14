@@ -15,7 +15,9 @@
 pub mod anti_affinity;
 pub mod binpack;
 pub mod engine;
+pub mod expansion;
 pub mod ordinal;
+pub mod taints;
 pub mod topology;
 
 pub use ordinal::OrdinalTracker;
@@ -109,10 +111,13 @@ pub struct NodeInfo {
 
     /// Number of pods currently scheduled on this node.
     pub pod_count: u32,
+
+    /// Operator taints (CR-CTRL-9), replicated via SetNodeTaints.
+    pub taints: Vec<crate::raft::records::NodeTaint>,
 }
 
 /// A current placement: which pod is on which node.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Placement {
     /// The pod's unique ID.
     pub pod_id: String,
@@ -159,6 +164,7 @@ impl ClusterState {
     pub fn build(
         node_records: &[crate::raft::records::NodeRecord],
         placements: Vec<Placement>,
+        node_taints: &std::collections::HashMap<String, Vec<crate::raft::records::NodeTaint>>,
     ) -> Self {
         let mut nodes = Vec::new();
         for record in node_records {
@@ -186,6 +192,10 @@ impl ClusterState {
                 schedulable: record.schedulable
                     && record.status == crate::raft::records::NodeStatus::Active,
                 pod_count,
+                taints: node_taints
+                    .get(&record.node_id)
+                    .cloned()
+                    .unwrap_or_default(),
             });
         }
         Self { nodes, placements }
@@ -234,6 +244,13 @@ impl ClusterState {
     }
 }
 
+/// CR-CTRL-9: a preemption decision — evict `victims`, then place the pod.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreemptionPlan {
+    pub node_id: SpiffeId,
+    pub victims: Vec<Placement>,
+}
+
 /// A scheduling decision: which node a pod should be placed on.
 #[derive(Debug, Clone)]
 pub struct ScheduleDecision {
@@ -261,6 +278,9 @@ pub struct ScoreBreakdown {
 
     /// Resource fit (true = sufficient capacity).
     pub resource_fit: bool,
+
+    /// CR-CTRL-9: score penalty for untolerated PreferNoSchedule taints.
+    pub taint_penalty: f64,
 }
 
 /// The scheduler trait.
@@ -306,4 +326,11 @@ pub struct PendingPod {
     /// If this is a reschedule (pod died, needs replacement),
     /// the node it was previously on (for anti-affinity awareness).
     pub previous_node: Option<SpiffeId>,
+
+    /// CR-CTRL-9: PodSpec.priority — higher schedules first, may preempt.
+    pub priority: i32,
+
+    /// CR-CTRL-9: PodSpec.tolerations for the taint filter.
+    #[serde(skip)]
+    pub tolerations: Vec<fleetos_core::proto::fleetos::Toleration>,
 }

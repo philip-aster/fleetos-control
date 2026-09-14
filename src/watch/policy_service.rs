@@ -14,11 +14,27 @@ use tonic::{Request, Response, Status};
 
 pub struct PolicyServiceImpl {
     hub: Arc<BroadcastHub>,
+    sag_rules: fjall::Keyspace,
+    versioned_state: crate::storage::version::VersionedState,
+    revoked_delegations: fjall::Keyspace,
+    revoked_svids: fjall::Keyspace,
 }
 
 impl PolicyServiceImpl {
-    pub fn new(hub: Arc<BroadcastHub>) -> Self {
-        Self { hub }
+    pub fn new(
+        hub: Arc<BroadcastHub>,
+        sag_rules: fjall::Keyspace,
+        versioned_state: crate::storage::version::VersionedState,
+        revoked_delegations: fjall::Keyspace,
+        revoked_svids: fjall::Keyspace,
+    ) -> Self {
+        Self {
+            hub,
+            sag_rules,
+            versioned_state,
+            revoked_delegations,
+            revoked_svids,
+        }
     }
 }
 
@@ -30,8 +46,30 @@ impl PolicyService for PolicyServiceImpl {
         &self,
         _request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchSagStream>, Status> {
+        // Ruling B ordering: subscribe FIRST, then read committed state, then
+        // yield frame one, then stream deltas. Deltas published during the
+        // snapshot build buffer in `rx` and drain after frame one — never dropped.
         let mut rx = self.hub.subscribe_sag();
+        let snap = super::snapshot::build_sag_snapshot(
+            &self.sag_rules,
+            &self.revoked_delegations,
+            &self.revoked_svids,
+        );
+        let frame_one_rules = match decode_rules(&snap.rules_bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build initial SAG frame");
+                return Err(Status::internal("failed to build initial SAG frame"));
+            }
+        };
+        let frame_one = SagUpdate {
+            version: self.versioned_state.current_version().get(),
+            rules: frame_one_rules,
+            revoked_delegation_ids: snap.revoked_delegation_ids,
+            revoked_spiffe_ids: snap.revoked_spiffe_ids,
+        };
         let stream = async_stream::stream! {
+            yield Ok(frame_one);
             loop {
                 match rx.recv().await {
                     Ok(update) => {

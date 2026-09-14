@@ -15,8 +15,9 @@ use fleetos_core::proto::admin::{
     ListNodePoolsResponse, ListNodesRequest, ListNodesResponse, NodeAck, NodeId, NodePoolAck,
     NodePoolCreateRequest, NodePoolDeleteRequest, NodePoolInfo, PcrPolicyAck, QuotaAck,
     QuotaRequest, QuotaResponse, RegisterNodeEkRequest, RegisterNodeEkResponse,
-    RevokeNodeEkRequest, SagRuleAck, ScaleWorkloadRequest, SecretAck, SecretAclChange,
-    SetPcrPolicyRequest, StoreSecretRequest, UpsertSagRuleRequest, WorkloadSpecAck,
+    RemoveNodeTaintRequest, RevokeNodeEkRequest, SagRuleAck, ScaleWorkloadRequest, SecretAck,
+    SecretAclChange, SetNodeTaintsRequest, SetPcrPolicyRequest, StoreSecretRequest,
+    UpsertSagRuleRequest, WorkloadSpecAck,
 };
 use fleetos_core::proto::workload::{CronWorkload, WorkloadSpec};
 use fleetos_core::spiffe::SpiffeId;
@@ -66,6 +67,48 @@ fn validate_identifier(value: &str, field: &str) -> Result<(), Status> {
 const MAX_REPLICAS_PER_ROLE: u32 = 1024;
 const MAX_ROLES_PER_WORKLOAD: usize = 16;
 const MAX_SPEC_BYTES: usize = 1024 * 1024;
+/// CR-CTRL-9: bound on operator taints per node.
+const MAX_TAINTS_PER_NODE: usize = 100;
+
+/// CR-CTRL-9: init containers flow to the agent unchanged — the agent runs
+/// them to completion, in order, before main containers; control never
+/// executes them. Shape is validated at the admin boundary, fail-closed.
+fn validate_init_containers(
+    pod_spec: &fleetos_core::proto::workload::PodSpec,
+) -> Result<(), Status> {
+    let mut seen = std::collections::HashSet::new();
+    for (i, c) in pod_spec.init_containers.iter().enumerate() {
+        if c.name.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "init_containers[{i}].name cannot be empty"
+            )));
+        }
+        if !seen.insert(c.name.clone()) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate init container name '{}'",
+                c.name
+            )));
+        }
+        if c.image.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "init container '{}' has an empty image",
+                c.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// CR-CTRL-9 taint effect vocabulary (mirrors Toleration.effect).
+fn validate_taint_effect(effect: &str) -> Result<(), Status> {
+    match effect {
+        "NoSchedule" | "PreferNoSchedule" | "NoExecute" => Ok(()),
+        other => Err(Status::invalid_argument(format!(
+            "invalid taint effect '{}'",
+            other
+        ))),
+    }
+}
 
 impl AdminServiceImpl {
     pub fn new(
@@ -477,7 +520,10 @@ impl AdminService for AdminServiceImpl {
         if prost::Message::encoded_len(&spec) > MAX_SPEC_BYTES {
             return Err(Status::invalid_argument("workload spec exceeds 1 MiB"));
         }
-
+        // CR-CTRL-9: validate init-container shape at the boundary.
+        if let Some(pod_spec) = spec.pod_spec.as_ref() {
+            validate_init_containers(pod_spec)?;
+        }
         // CR-7: enforce tenant quota before storing the workload.
         self.check_tenant_quota(&spec.tenant_id, &spec)?;
 
@@ -672,9 +718,9 @@ impl AdminService for AdminServiceImpl {
         validate_identifier(&to.service_name, "to.service_name")?;
 
         // Validate ports (reject > 65535, don't truncate).
-        let from_port = crate::policy::port_validation::validate_optional_port(from.port)
+        let from_port = fleetos_policy_compiler::port_validation::validate_optional_port(from.port)
             .map_err(|e| Status::invalid_argument(format!("invalid from.port: {}", e)))?;
-        let to_port = crate::policy::port_validation::validate_optional_port(to.port)
+        let to_port = fleetos_policy_compiler::port_validation::validate_optional_port(to.port)
             .map_err(|e| Status::invalid_argument(format!("invalid to.port: {}", e)))?;
 
         // Parse roles (empty string = wildcard).
@@ -1773,6 +1819,129 @@ impl AdminService for AdminServiceImpl {
             .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
 
         tracing::info!(ek_fingerprint = %req.ek_fingerprint, "EK revoked via raft");
+        Ok(Response::new(NodeAck { accepted: true }))
+    }
+
+    // --- CR-CTRL-9: node taint administration ---
+    async fn set_node_taints(
+        &self,
+        request: Request<SetNodeTaintsRequest>,
+    ) -> Result<Response<NodeAck>, Status> {
+        self.verify_caller(&request)?;
+        self.require_cluster_admin_write(&request)?;
+        let node_id = request.get_ref().node_id.clone();
+        let audit = self.build_audit_context(&request, &node_id);
+        let req = request.into_inner();
+        if req.node_id.is_empty() {
+            return Err(Status::invalid_argument("node_id cannot be empty"));
+        }
+        if req.taints.len() > MAX_TAINTS_PER_NODE {
+            return Err(Status::invalid_argument(format!(
+                "too many taints: max {} per node",
+                MAX_TAINTS_PER_NODE
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for t in &req.taints {
+            if t.key.is_empty() {
+                return Err(Status::invalid_argument("taint key cannot be empty"));
+            }
+            validate_taint_effect(&t.effect)?;
+            if !seen.insert((t.key.clone(), t.effect.clone())) {
+                return Err(Status::invalid_argument(format!(
+                    "duplicate taint (key='{}', effect='{}')",
+                    t.key, t.effect
+                )));
+            }
+        }
+        // Node must be registered.
+        match self
+            .storage
+            .nodes
+            .get(req.node_id.as_bytes())
+            .map_err(|e| Status::internal(format!("storage error: {}", e)))?
+        {
+            Some(_) => {}
+            None => {
+                return Err(Status::not_found(format!(
+                    "node '{}' is not registered",
+                    req.node_id
+                )));
+            }
+        }
+        // Leader-computed timestamp when the operator leaves it unset (0);
+        // operator-supplied values pass through (backfill use case).
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let taints: Vec<crate::raft::records::NodeTaint> = req
+            .taints
+            .into_iter()
+            .map(|t| crate::raft::records::NodeTaint {
+                key: t.key,
+                value: t.value,
+                effect: t.effect,
+                time_added_unix: if t.time_added_unix == 0 {
+                    now
+                } else {
+                    t.time_added_unix
+                },
+            })
+            .collect();
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::SetNodeTaints {
+                    node_id: req.node_id.clone(),
+                    taints,
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+        tracing::info!(node_id = %req.node_id, "node taints set via raft");
+        Ok(Response::new(NodeAck { accepted: true }))
+    }
+
+    async fn remove_node_taint(
+        &self,
+        request: Request<RemoveNodeTaintRequest>,
+    ) -> Result<Response<NodeAck>, Status> {
+        self.verify_caller(&request)?;
+        self.require_cluster_admin_write(&request)?;
+        let node_id = request.get_ref().node_id.clone();
+        let audit = self.build_audit_context(&request, &node_id);
+        let req = request.into_inner();
+        if req.node_id.is_empty() {
+            return Err(Status::invalid_argument("node_id cannot be empty"));
+        }
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("taint key cannot be empty"));
+        }
+        validate_taint_effect(&req.effect)?;
+        match self
+            .storage
+            .nodes
+            .get(req.node_id.as_bytes())
+            .map_err(|e| Status::internal(format!("storage error: {}", e)))?
+        {
+            Some(_) => {}
+            None => {
+                return Err(Status::not_found(format!(
+                    "node '{}' is not registered",
+                    req.node_id
+                )));
+            }
+        }
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::RemoveNodeTaint {
+                    node_id: req.node_id.clone(),
+                    key: req.key.clone(),
+                    effect: req.effect.clone(),
+                },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+        tracing::info!(node_id = %req.node_id, key = %req.key, "node taint removed via raft");
         Ok(Response::new(NodeAck { accepted: true }))
     }
 }

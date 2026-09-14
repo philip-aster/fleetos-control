@@ -158,7 +158,21 @@ pub struct WorkloadStatusRecord {
     pub tenant_id: String,
     pub ready: bool,
     pub live: bool,
+    /// CR-CORE-3: startup probe completed.
+    pub started: bool,
+    /// CR-CORE-3: eBPF policy live for this pod (Ruling D gate input).
+    pub policy_enforced: bool,
+    /// CR-CORE-3: container restart count.
+    pub restart_count: u32,
     pub observed_at_unix: i64,
+    /// CR-CTRL-3(b): node-level router connectivity (Directive A.1). The agent
+    /// reports it on each pod's status; control treats it as applying to every
+    /// pod on that node.
+    pub router_connected: bool,
+    /// CR-CTRL-3: unix time a sustained "started but not enforced" violation
+    /// began; 0 = no active violation. Maintained by the state machine
+    /// (read-modify-write) so it is deterministic across replicas.
+    pub gate_violation_since_unix: i64,
 }
 
 /// A tenant resource quota (CR-7). Replicated via Raft so any leader can
@@ -210,4 +224,18 @@ pub struct NodeEkRecord {
     /// Optional expiry (unix seconds). None = no expiry.
     pub expires_at: Option<i64>,
     pub state: EkRegistrationState,
+}
+
+/// A taint applied to a node by an operator (CR-CTRL-9).
+///
+/// Stored in the `node_taints` keyspace keyed by node_id as `Vec<NodeTaint>`
+/// (full-set replace semantics). Effect vocabulary is enforced at the admin
+/// boundary: `NoSchedule` | `PreferNoSchedule` | `NoExecute` (mirrors
+/// `Toleration.effect` in workload.proto).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeTaint {
+    pub key: String,
+    pub value: String,
+    pub effect: String,
+    pub time_added_unix: i64,
 }

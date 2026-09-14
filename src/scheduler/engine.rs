@@ -19,7 +19,7 @@
 
 use super::{
     ClusterState, PendingPod, ScheduleDecision, Scheduler, SchedulerError, ScoreBreakdown,
-    anti_affinity, binpack, topology,
+    anti_affinity, binpack, taints, topology,
 };
 
 /// The default scheduler engine.
@@ -63,6 +63,10 @@ impl DefaultScheduler {
             if !anti_affinity::check_anti_affinity(pod, node, state, &self.anti_affinity_config) {
                 continue;
             }
+            // Filter 3: Taints / tolerations (CR-CTRL-9).
+            if !taints::passes_taint_filter(&pod.tolerations, &node.taints) {
+                continue;
+            }
 
             candidates.push(node);
         }
@@ -93,15 +97,18 @@ impl DefaultScheduler {
             // Score 2: Bin-packing efficiency
             breakdown.binpack_score =
                 binpack::score_binpack(&pod.resources, node, self.binpack_strategy);
-
+            // Score 3: CR-CTRL-9 PreferNoSchedule penalty (never a hard filter).
+            breakdown.taint_penalty =
+                taints::prefer_no_schedule_penalties(&pod.tolerations, &node.taints) as f64
+                    * taints::PREFER_NO_SCHEDULE_PENALTY;
             scored.push((breakdown, node));
         }
 
         // Sort by combined score (topology first, then binpack as tiebreaker).
         // Deterministic ordering is critical for Raft consistency.
         scored.sort_by(|a, b| {
-            let a_total = a.0.topology_score * 1000.0 + a.0.binpack_score;
-            let b_total = b.0.topology_score * 1000.0 + b.0.binpack_score;
+            let a_total = (a.0.topology_score - a.0.taint_penalty) * 1000.0 + a.0.binpack_score;
+            let b_total = (b.0.topology_score - b.0.taint_penalty) * 1000.0 + b.0.binpack_score;
 
             b_total
                 .partial_cmp(&a_total)
@@ -170,6 +177,7 @@ mod tests {
             failure_domain: "zone-a".to_owned(),
             schedulable: true,
             pod_count: 0,
+            taints: vec![],
         }
     }
 
@@ -185,6 +193,8 @@ mod tests {
                 memory_bytes: 512 * 1024 * 1024,
             },
             previous_node: None,
+            priority: 0,
+            tolerations: vec![],
         }
     }
 
@@ -224,6 +234,7 @@ mod tests {
                 failure_domain: "zone-a".to_owned(),
                 schedulable: true,
                 pod_count: 0,
+                taints: vec![],
             }],
             placements: vec![],
         };
@@ -253,6 +264,7 @@ mod tests {
                 failure_domain: "zone-a".to_owned(),
                 schedulable: false, // Cordoned
                 pod_count: 0,
+                taints: vec![],
             }],
             placements: vec![],
         };
@@ -261,5 +273,91 @@ mod tests {
         let result = scheduler.schedule(&pod, &state);
 
         assert!(matches!(result, Err(SchedulerError::NoSuitableNode { .. })));
+    }
+
+    fn make_node_tainted(
+        id: &str,
+        taints: Vec<crate::raft::records::NodeTaint>,
+    ) -> super::super::NodeInfo {
+        super::super::NodeInfo {
+            node_id: format!("spiffe://test.internal/ns/system/node/{}", id)
+                .parse()
+                .unwrap(),
+            capacity: ResourceSpec {
+                cpu_millicores: 4000,
+                memory_bytes: 8 * 1024 * 1024 * 1024,
+            },
+            available: ResourceSpec {
+                cpu_millicores: 4000,
+                memory_bytes: 8 * 1024 * 1024 * 1024,
+            },
+            failure_domain: "zone-a".to_owned(),
+            schedulable: true,
+            pod_count: 0,
+            taints,
+        }
+    }
+
+    #[test]
+    fn taint_filter_excludes_untolerated_pod() {
+        use crate::raft::records::NodeTaint;
+        let scheduler = DefaultScheduler::new();
+        let state = ClusterState {
+            nodes: vec![make_node_tainted(
+                "node-1",
+                vec![NodeTaint {
+                    key: "maint".to_owned(),
+                    value: String::new(),
+                    effect: "NoSchedule".to_owned(),
+                    time_added_unix: 0,
+                }],
+            )],
+            placements: vec![],
+        };
+        let mut pod = make_pod("pod-1", "web", "primary", 0);
+        assert!(matches!(
+            scheduler.schedule(&pod, &state),
+            Err(SchedulerError::NoSuitableNode { .. })
+        ));
+        pod.tolerations = vec![fleetos_core::proto::fleetos::Toleration {
+            key: "maint".to_owned(),
+            operator: "Exists".to_owned(),
+            value: String::new(),
+            effect: "NoSchedule".to_owned(),
+            toleration_seconds: 0,
+        }];
+        assert!(scheduler.schedule(&pod, &state).is_ok());
+    }
+
+    #[test]
+    fn schedule_decision_is_deterministic_100x() {
+        use crate::raft::records::NodeTaint;
+        let scheduler = DefaultScheduler::new();
+        let state = ClusterState {
+            nodes: vec![
+                make_node_tainted(
+                    "node-1",
+                    vec![NodeTaint {
+                        key: "soft".to_owned(),
+                        value: String::new(),
+                        effect: "PreferNoSchedule".to_owned(),
+                        time_added_unix: 0,
+                    }],
+                ),
+                make_node("node-2", 4000, 8 * 1024 * 1024 * 1024),
+            ],
+            placements: vec![],
+        };
+        let pod = make_pod("pod-1", "web", "primary", 0);
+        let first = scheduler.schedule(&pod, &state).unwrap();
+        // PreferNoSchedule demotes node-1, so node-2 must win — every time.
+        assert_eq!(
+            first.node_id.to_string(),
+            "spiffe://test.internal/ns/system/node/node-2"
+        );
+        for _ in 0..100 {
+            let d = scheduler.schedule(&pod, &state).unwrap();
+            assert_eq!(d.node_id, first.node_id);
+        }
     }
 }

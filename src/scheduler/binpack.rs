@@ -96,6 +96,7 @@ mod tests {
             failure_domain: "zone-a".to_owned(),
             schedulable: true,
             pod_count: 0,
+            taints: vec![],
         }
     }
 

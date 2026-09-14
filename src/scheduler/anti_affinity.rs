@@ -90,6 +90,7 @@ mod tests {
             failure_domain: zone.to_owned(),
             schedulable: true,
             pod_count: 1,
+            taints: vec![],
         }
     }
 
@@ -131,6 +132,8 @@ mod tests {
                 memory_bytes: 512 * 1024 * 1024,
             },
             previous_node: None,
+            priority: 0,
+            tolerations: vec![],
         };
 
         assert!(!check_anti_affinity(&pod, &node, &state, &config));
@@ -157,6 +160,8 @@ mod tests {
                 memory_bytes: 512 * 1024 * 1024,
             },
             previous_node: None,
+            priority: 0,
+            tolerations: vec![],
         };
 
         // "primary" is not in enforced_roles, so anti-affinity doesn't apply
@@ -187,6 +192,8 @@ mod tests {
                 memory_bytes: 512 * 1024 * 1024,
             },
             previous_node: None,
+            priority: 0,
+            tolerations: vec![],
         };
 
         assert!(!check_anti_affinity(&pod, &node, &state, &config));

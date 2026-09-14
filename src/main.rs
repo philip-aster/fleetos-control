@@ -15,7 +15,9 @@ use fleetos_control::ca::CaService;
 use fleetos_control::config::{AttestationMode, ClusterMode, ControlConfig};
 use fleetos_control::controllers::leader::{ControllerFactory, LeaderGate};
 use fleetos_control::controllers::{
-    CronController, WorkloadController, node_controller::NodeController,
+    CronController, WorkloadController,
+    hpa_controller::{HpaController, PermissiveDisruptionGuard},
+    node_controller::NodeController,
     pod_controller::PodController,
 };
 use fleetos_control::dummy_ip::allocator::DummyIpAllocator;
@@ -140,6 +142,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broadcast_hub = BroadcastHub::new();
     tracing::info!("broadcast hub initialized");
 
+    // --- Phase 2b: pod event store (leader-local, NEVER Raft-replicated) ---
+    let pod_event_store = fleetos_control::watch::pod_event_store::PodEventStore::new();
+    let pod_event_emitter = Arc::new(
+        fleetos_control::watch::pod_event_store::PodEventEmitter::new(
+            pod_event_store.clone(),
+            broadcast_hub.clone(),
+        ),
+    );
+
     // --- Phase 3: Load master key (secrets + CA encryption at rest) ---
     let master_key = if config.secrets.master_key_path.exists() {
         FileMasterKey::load(&config.secrets.master_key_path)?
@@ -259,6 +270,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ordinal_tracker.clone(),
         raft_handle.raft.clone(),
         dummy_ip_allocator.clone(),
+        pod_event_emitter.clone(),
+        keyspaces.node_taints.clone(),
     ));
     let pod_controller = Arc::new(PodController::new(
         ordinal_tracker.clone(),
@@ -267,6 +280,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_controller = Arc::new(NodeController::new(
         raft_handle.raft.clone(),
         config.svid.node_ttl_secs,
+        keyspaces.node_taints.clone(),
+        keyspaces.placements.clone(),
+        keyspaces.workloads.clone(),
+        pod_event_emitter.clone(),
     ));
     let cron_controller = Arc::new(CronController::new(
         workload_controller.clone(),
@@ -414,12 +431,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let metrics_store =
+        fleetos_control::watch::metrics_store::MetricsStore::new(keyspaces.placements.clone());
+
+    // Spawn a background task to sweep expired metrics (1-hour TTL)
+    let metrics_sweeper_store = metrics_store.clone();
+    let mut metrics_sweeper_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    metrics_sweeper_store.sweep_expired();
+                }
+                _ = metrics_sweeper_shutdown_rx.changed() => {
+                    if *metrics_sweeper_shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    // --- CR-CTRL-8: HPA controller (leader-gated; consumes MetricsStore) ---
+    let hpa_controller = Arc::new(HpaController::new(
+        storage_engine.clone(),
+        metrics_store.clone(),
+        raft_handle.raft.clone(),
+        Arc::new(PermissiveDisruptionGuard),
+    ));
+
     // --- Phase 8: Controller factory and leader gate ---
     let controller_factory = Arc::new(FleetosControllerFactory {
         workload_controller: workload_controller.clone(),
         pod_controller: pod_controller.clone(),
         node_controller: node_controller.clone(),
         cron_controller: cron_controller.clone(),
+        hpa_controller: hpa_controller.clone(),
         storage_engine: storage_engine.clone(),
         node_lease_timeout_secs: config.health.node_lease_timeout_secs,
         node_check_interval_secs: config.health.node_check_interval_secs,
@@ -472,6 +520,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("provisioning disabled (no endpoint configured)");
     }
 
+    // Sweep expired pod events (1-hour TTL).
+    let pod_event_sweep_store = pod_event_store.clone();
+    let mut pod_event_sweep_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    pod_event_sweep_store.sweep_expired();
+                }
+                _ = pod_event_sweep_shutdown_rx.changed() => {
+                    if *pod_event_sweep_shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
     // --- Phase 11: gRPC Servers ---
 
     // Optional client auth on Data/Control: attestation is inherently pre-SVID.
@@ -489,22 +556,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize gRPC services
     let status_service = fleetos_control::watch::status_service::WorkloadStatusServiceImpl::new(
         raft_handle.raft.clone(),
+        metrics_store,
     );
     let watch_service =
         fleetos_control::watch::watch_service::WatchServiceImpl::new(broadcast_hub.clone());
-    let scheduler_service =
-        fleetos_control::watch::scheduler_stream::SchedulerServiceImpl::new(broadcast_hub.clone());
-    let secret_service = fleetos_control::watch::secret_service::SecretServiceImpl::new(
-        secret_store.clone(),
-        keyspaces.svids.clone(),
+    let scheduler_service = fleetos_control::watch::scheduler_stream::SchedulerServiceImpl::new(
+        broadcast_hub.clone(),
+        keyspaces.placements.clone(),
+        keyspaces.workloads.clone(),
+        versioned_state.clone(),
+        config.trust_domains.data_control.clone(),
     );
     let router_service =
         fleetos_control::watch::router_assignment::RouterAssignmentServiceImpl::new(
             broadcast_hub.clone(),
+            keyspaces.placements.clone(),
+            keyspaces.dummy_ips.clone(),
+            versioned_state.clone(),
+            config.trust_domains.data_control.clone(),
         );
-
-    let policy_service =
-        fleetos_control::watch::policy_service::PolicyServiceImpl::new(broadcast_hub.clone());
+    let policy_service = fleetos_control::watch::policy_service::PolicyServiceImpl::new(
+        broadcast_hub.clone(),
+        keyspaces.sag_rules.clone(),
+        versioned_state.clone(),
+        keyspaces.revoked_delegations.clone(),
+        keyspaces.revoked_svids.clone(),
+    );
+    let secret_service = fleetos_control::watch::secret_service::SecretServiceImpl::new(
+        secret_store.clone(),
+        keyspaces.svids.clone(),
+    );
+    let pod_event_service = fleetos_control::watch::pod_event_service::PodEventServiceImpl::new(
+        pod_event_emitter.clone(),
+        broadcast_hub.clone(),
+        keyspaces.placements.clone(),
+    );
 
     // Attestation and CA services (Data/Control listener)
     let nonce_manager = Arc::new(fleetos_control::attestation::nonce::NonceManager::new(
@@ -580,7 +666,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Subscribe BEFORE the spawn (in main)
     let dc_shutdown_rx = shutdown_tx.subscribe();
-
+    let pod_event_service_dc = pod_event_service.clone();
     // 2. Spawn the task (ONLY ONE SPAWN)
     let dc_server_handle = tokio::spawn(async move {
         tracing::info!(addr = %dc_addr, "starting Data/Control gRPC listener");
@@ -659,7 +745,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .add_service(fleetos_core::proto::fleetos::secret_service_server::SecretServiceServer::new(secret_service))
             .add_service(fleetos_core::proto::fleetos::attestation_service_server::AttestationServiceServer::new(attestation_service))
             .add_service(fleetos_core::proto::fleetos::policy_service_server::PolicyServiceServer::new(policy_service))
-            .add_service(fleetos_core::proto::fleetos::delegation_service_server::DelegationServiceServer::new(delegation_service));
+            .add_service(fleetos_core::proto::fleetos::delegation_service_server::DelegationServiceServer::new(delegation_service))
+            .add_service(fleetos_core::proto::fleetos::pod_event_service_server::PodEventServiceServer::new(pod_event_service_dc));
 
         if let Some(ca_svc) = ca_grpc_service {
             server = server.add_service(
@@ -804,11 +891,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let server = tonic::transport::Server::builder().add_service(
-                fleetos_core::proto::fleetos::admin_service_server::AdminServiceServer::new(
-                    admin_service,
-                ),
-            );
+            let server = tonic::transport::Server::builder()
+                .add_service(
+                    fleetos_core::proto::fleetos::admin_service_server::AdminServiceServer::new(
+                        admin_service,
+                    ),
+                )
+                .add_service(
+                    fleetos_core::proto::fleetos::pod_event_service_server::PodEventServiceServer::new(
+                        pod_event_service.clone(),
+                    ),
+                );
 
             if let Err(e) = server
                 .serve_with_incoming_shutdown(incoming, wait_for_shutdown_flag(admin_shutdown_rx))
@@ -1379,6 +1472,7 @@ struct FleetosControllerFactory {
     pod_controller: Arc<PodController>,
     node_controller: Arc<NodeController>,
     cron_controller: Arc<CronController>,
+    hpa_controller: Arc<HpaController>,
     storage_engine: Arc<fleetos_control::storage::StorageEngine>,
     node_lease_timeout_secs: i64,
     node_check_interval_secs: u64,
@@ -1400,17 +1494,12 @@ impl ControllerFactory for FleetosControllerFactory {
                 interval.tick().await;
                 match se.list_workloads() {
                     Ok(workloads) => {
+                        // CR-CTRL-9: decode all specs first, then reconcile as one
+                        // batch so priority ordering spans the whole cluster.
+                        let mut specs = Vec::new();
                         for record in workloads {
                             match prost::Message::decode(record.spec_bytes.as_slice()) {
-                                Ok(spec) => {
-                                    if let Err(e) = wc.reconcile(&spec).await {
-                                        tracing::warn!(
-                                            workload_id = %record.workload_id,
-                                            error = %e,
-                                            "workload re-reconciliation failed"
-                                        );
-                                    }
-                                }
+                                Ok(spec) => specs.push(spec),
                                 Err(e) => {
                                     tracing::warn!(
                                         workload_id = %record.workload_id,
@@ -1419,6 +1508,9 @@ impl ControllerFactory for FleetosControllerFactory {
                                     );
                                 }
                             }
+                        }
+                        if let Err(e) = wc.reconcile_all(&specs).await {
+                            tracing::warn!(error = %e, "workload re-reconciliation failed");
                         }
                     }
                     Err(e) => {
@@ -1468,13 +1560,24 @@ impl ControllerFactory for FleetosControllerFactory {
                                         None => true,
                                         Some(p) => match se_pod.get_workload_status(&p.pod_id) {
                                             Ok(Some(status)) => {
-                                                let now = time::OffsetDateTime::now_utc()
-                                                    .unix_timestamp();
-                                                let stale = (now - status.observed_at_unix)
-                                                    > staleness_secs;
-                                                !status.live || stale
+                                                let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                                                let stale = (now - status.observed_at_unix) > staleness_secs;
+                                                // CR-CTRL-3: escalate a sustained readiness-gate violation
+                                                // (started but policy not enforced) to the death/replace path.
+                                                let gate_violation =
+                                                    fleetos_control::controllers::pod_controller::readiness_gate_violation_sustained(
+                                                        &status,
+                                                        fleetos_control::controllers::pod_controller::READINESS_GATE_GRACE_SECS,
+                                                        now,
+                                                    );
+                                                if gate_violation {
+                                                    tracing::warn!(
+                                                        pod_id = %p.pod_id,
+                                                        "readiness gate violation sustained (started, policy not enforced); replacing pod"
+                                                    );
+                                                }
+                                                !status.live || stale || gate_violation
                                             }
-                                            // No status reported yet — assume alive.
                                             _ => false,
                                         },
                                     };
@@ -1572,6 +1675,10 @@ impl ControllerFactory for FleetosControllerFactory {
                         tracing::warn!(error = %e, "failed to list node records");
                     }
                 }
+                // CR-CTRL-9: evict pods that violate NoExecute taints.
+                if let Err(e) = nc.enforce_no_execute_taints().await {
+                    tracing::warn!(error = %e, "NoExecute taint enforcement failed");
+                }
             }
         });
 
@@ -1609,6 +1716,19 @@ impl ControllerFactory for FleetosControllerFactory {
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to list cron workloads");
                     }
+                }
+            }
+        });
+
+        // HPA controller (CR-CTRL-8): evaluate autoscaling policies every 15s.
+        let hpa = self.hpa_controller.clone();
+        join_set.spawn(async move {
+            tracing::info!("HPA controller started");
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                if let Err(e) = hpa.evaluate().await {
+                    tracing::warn!(error = %e, "HPA evaluation cycle failed");
                 }
             }
         });

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use fleetos_core::MonotonicVersion;
+use fleetos_core::proto::state::PodEvent;
 
 /// Capacity for broadcast channels.
 const CHANNEL_CAPACITY: usize = 4096;
@@ -87,6 +88,7 @@ pub struct BroadcastHub {
     sag_tx: broadcast::Sender<SagUpdateEvent>,
     schedule_tx: broadcast::Sender<ScheduleUpdateEvent>,
     route_tx: broadcast::Sender<RouteUpdateEvent>,
+    pod_events_tx: broadcast::Sender<PodEvent>,
 }
 
 impl BroadcastHub {
@@ -95,12 +97,14 @@ impl BroadcastHub {
         let (sag_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (schedule_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (route_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (pod_events_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
 
         Arc::new(Self {
             watch_tx,
             sag_tx,
             schedule_tx,
             route_tx,
+            pod_events_tx,
         })
     }
 
@@ -122,6 +126,12 @@ impl BroadcastHub {
         let _ = self.route_tx.send(update);
     }
 
+    /// Pod lifecycle events (CR-CORE-8): leader-local telemetry fan-out.
+    /// Never originates from the Raft state machine — events are not replicated.
+    pub fn publish_pod_event(&self, event: PodEvent) {
+        let _ = self.pod_events_tx.send(event);
+    }
+
     // --- Subscribe methods ---
 
     pub fn subscribe_watch(&self) -> broadcast::Receiver<WatchEvent> {
@@ -140,14 +150,19 @@ impl BroadcastHub {
         self.route_tx.subscribe()
     }
 
+    pub fn subscribe_pod_events(&self) -> broadcast::Receiver<PodEvent> {
+        self.pod_events_tx.subscribe()
+    }
+
     /// Subscriber counts per channel, for telemetry (G-1).
-    /// Order: (watch, sag, schedule, routes).
-    pub fn subscriber_counts(&self) -> (usize, usize, usize, usize) {
+    /// Order: (watch, sag, schedule, routes, pod_events).
+    pub fn subscriber_counts(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.watch_tx.receiver_count(),
             self.sag_tx.receiver_count(),
             self.schedule_tx.receiver_count(),
             self.route_tx.receiver_count(),
+            self.pod_events_tx.receiver_count(),
         )
     }
 }

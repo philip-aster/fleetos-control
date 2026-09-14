@@ -1,6 +1,6 @@
 //! Wire constraint: uint32 port > 65535 must be rejected, not truncated.
 
-use fleetos_control::policy::port_validation;
+use fleetos_policy_compiler::port_validation;
 
 #[test]
 fn port_above_65535_is_rejected() {

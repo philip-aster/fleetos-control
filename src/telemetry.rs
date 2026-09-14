@@ -181,11 +181,12 @@ pub fn register_metrics(
         .f64_observable_gauge("fleetos.watch.subscribers")
         .with_description("Subscribers per watch stream")
         .with_callback(move |observer| {
-            let (watch, sag, schedule, routes) = broadcast_hub.subscriber_counts();
+            let (watch, sag, schedule, routes, pod_events) = broadcast_hub.subscriber_counts();
             observer.observe(watch as f64, &[KeyValue::new("stream", "watch")]);
             observer.observe(sag as f64, &[KeyValue::new("stream", "sag")]);
             observer.observe(schedule as f64, &[KeyValue::new("stream", "schedule")]);
             observer.observe(routes as f64, &[KeyValue::new("stream", "routes")]);
+            observer.observe(pod_events as f64, &[KeyValue::new("stream", "pod_events")]);
         })
         .build();
 

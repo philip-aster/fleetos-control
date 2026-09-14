@@ -92,6 +92,9 @@ pub fn init_keyspaces(db: &Database) -> Result<Keyspaces, StorageError> {
         node_pools: db
             .keyspace(tables::NODE_POOL_KEYSPACE, opts)
             .map_err(StorageError::Open)?,
+        node_taints: db
+            .keyspace(tables::NODE_TAINTS_KEYSPACE, opts)
+            .map_err(StorageError::Open)?,
         trust_bundles: db
             .keyspace(tables::TRUST_BUNDLE_KEYSPACE, opts)
             .map_err(StorageError::Open)?,
@@ -157,6 +160,7 @@ pub struct Keyspaces {
     pub pcr_policies: fjall::Keyspace,
     pub router_assignments: fjall::Keyspace,
     pub node_pools: fjall::Keyspace,
+    pub node_taints: fjall::Keyspace,
     pub trust_bundles: fjall::Keyspace,
     pub nonces: fjall::Keyspace,
     pub nonce_claims: fjall::Keyspace,
@@ -199,6 +203,7 @@ impl Keyspaces {
             (tables::PCR_POLICY_KEYSPACE, &self.pcr_policies),
             (tables::ROUTER_ASSIGNMENT_KEYSPACE, &self.router_assignments),
             (tables::NODE_POOL_KEYSPACE, &self.node_pools),
+            (tables::NODE_TAINTS_KEYSPACE, &self.node_taints),
             (tables::RAFT_STATE_KEYSPACE, &self.raft_state),
             (tables::TRUST_BUNDLE_KEYSPACE, &self.trust_bundles),
             (tables::REVOKED_SVID_KEYSPACE, &self.revoked_svids),

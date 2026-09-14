@@ -1,13 +1,18 @@
-//! RouterAssignmentService implementation — WatchRoutes stream for routers.
+//! RouterAssignmentService — WatchRoutes stream.
 //!
-//! Streams routing table updates to routers. Each RouteEntry maps a
-//! destination (SVID + role) to the agent node hosting it.
+//! CR-CTRL-5 CONTRACT: agents are sanctioned consumers of `WatchRoutes` in
+//! addition to routers. An agent subscribes here to populate its dummy-IP
+//! route maps (DUMMY_IP_ROUTE_MAP / SRC_IDENTITY_MAP / LOCAL_WORKLOADS) and
+//! `/etc/hosts`; it then reports router connectivity via the CR-CTRL-3
+//! readiness gate. This service performs no caller filtering beyond listener
+//! mTLS, so any authenticated Data/Control peer may subscribe. Do NOT add a
+//! separate agent-facing route stream — this is the single consumption path.
 //!
-//! Routers use this to build their user-space `dashmap` routing table,
-//! mapping destination identities to the agent nodes that host them.
+//! `RouteEntry.dummy_ip` is emitted as the canonical u32 value; the
+//! big-endian eBPF-map conversion is agent-side (`HostOrderIpv4::from_network`).
+
 use super::broadcast::BroadcastHub;
-use fleetos_core::proto::state::RouterAssignmentService;
-use fleetos_core::proto::state::{RouteEntry, RouteUpdate, WatchRequest};
+use fleetos_core::proto::state::{RouteEntry, RouteUpdate, RouterAssignmentService, WatchRequest};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;
@@ -17,24 +22,36 @@ use tonic::{Request, Response, Status};
 /// `RouteUpdateEvent.routes_bytes` by the state machine.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RouteEntryRecord {
-    /// The destination workload's SPIFFE ID.
     pub destination_svid: String,
-    /// The destination workload's role (e.g., "primary", "replica").
     pub destination_role: String,
-    /// The agent node hosting this destination (SPIFFE ID of the agent).
     pub target_agent_svid: String,
-    /// The allocated dummy service address in canonical IPv4 value form.
     pub dummy_ip: u32,
 }
 
 /// The RouterAssignmentService gRPC implementation.
 pub struct RouterAssignmentServiceImpl {
     hub: Arc<BroadcastHub>,
+    placements: fjall::Keyspace,
+    dummy_ips: fjall::Keyspace,
+    versioned_state: crate::storage::version::VersionedState,
+    data_trust_domain: String,
 }
 
 impl RouterAssignmentServiceImpl {
-    pub fn new(hub: Arc<BroadcastHub>) -> Self {
-        Self { hub }
+    pub fn new(
+        hub: Arc<BroadcastHub>,
+        placements: fjall::Keyspace,
+        dummy_ips: fjall::Keyspace,
+        versioned_state: crate::storage::version::VersionedState,
+        data_trust_domain: String,
+    ) -> Self {
+        Self {
+            hub,
+            placements,
+            dummy_ips,
+            versioned_state,
+            data_trust_domain,
+        }
     }
 }
 
@@ -47,8 +64,29 @@ impl RouterAssignmentService for RouterAssignmentServiceImpl {
         &self,
         _request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchRoutesStream>, Status> {
+        // ORDERING (adjudication Q6): subscribe FIRST, then read committed
+        // state, then yield frame one, then stream deltas.
         let mut rx = self.hub.subscribe_routes();
+
+        let routes_bytes = super::snapshot::build_routes_snapshot(
+            &self.placements,
+            &self.dummy_ips,
+            &self.data_trust_domain,
+        );
+
+        let frame_one = match deserialize_routes(&routes_bytes) {
+            Ok(routes) => RouteUpdate {
+                version: self.versioned_state.current_version().get(),
+                routes,
+            },
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build initial routes frame");
+                return Err(Status::internal("failed to build initial routes frame"));
+            }
+        };
+
         let stream = async_stream::stream! {
+            yield Ok(frame_one);
             loop {
                 match rx.recv().await {
                     Ok(update) => {
@@ -59,15 +97,12 @@ impl RouterAssignmentService for RouterAssignmentServiceImpl {
                                 continue;
                             }
                         };
-                        let route_update = RouteUpdate {
+                        yield Ok(RouteUpdate {
                             version: update.version.get(),
                             routes,
-                        };
-                        yield Ok(route_update);
+                        });
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(lagged = n, "routes subscriber lagged");
                         continue;

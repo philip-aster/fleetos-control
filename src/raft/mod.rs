@@ -204,6 +204,19 @@ pub enum FleetosCommand {
     RevokeNodeEk {
         ek_fingerprint: String,
     },
+
+    // --- CR-CTRL-9: node taints ---
+    /// Full-set replace of a node's operator taints. Empty set = clear.
+    SetNodeTaints {
+        node_id: String,
+        taints: Vec<records::NodeTaint>,
+    },
+    /// Remove the taint matching (key, effect). No-op if absent.
+    RemoveNodeTaint {
+        node_id: String,
+        key: String,
+        effect: String,
+    },
 }
 
 /// Wraps a `FleetosCommand` with optional audit context so the audit record

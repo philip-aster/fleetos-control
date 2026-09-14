@@ -12,10 +12,14 @@
 
 pub mod broadcast;
 pub mod delegation_service;
+pub mod metrics_store;
+pub mod pod_event_service;
+pub mod pod_event_store;
 pub mod policy_service;
 pub mod router_assignment;
 pub mod scheduler_stream;
 pub mod secret_service;
+pub mod snapshot;
 pub mod status_service;
 pub mod watch_service;
 

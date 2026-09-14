@@ -106,6 +106,7 @@ mod tests {
             failure_domain: "zone-a".to_owned(),
             schedulable: true,
             pod_count,
+            taints: vec![],
         }
     }
 
@@ -128,6 +129,8 @@ mod tests {
             ordinal: 0,
             resources: ResourceSpec::zero(),
             previous_node: None,
+            priority: 0,
+            tolerations: vec![],
         };
 
         let empty_score = score_topology_spread(&pod, &empty_node, &state, &config);
@@ -177,6 +180,8 @@ mod tests {
             ordinal: 1,
             resources: ResourceSpec::zero(),
             previous_node: None,
+            priority: 0,
+            tolerations: vec![],
         };
 
         let score_a = score_topology_spread(&pod, &node_a, &state, &config);
