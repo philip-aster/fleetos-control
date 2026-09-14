@@ -28,6 +28,7 @@
 //! boundary, not in the state machine; HPA is bounded by the operator-set
 //! `max_replicas` instead.
 use super::ControllerError;
+use crate::disruption::{DisruptionGuard, DisruptionTarget};
 use crate::raft::records::{AuditContext, WorkloadSpecRecord};
 use crate::raft::{AuditedCommand, FleetosCommand, FleetosRaftConfig};
 use crate::scheduler::Placement;
@@ -35,6 +36,8 @@ use crate::storage::StorageEngine;
 use crate::watch::metrics_store::MetricsStore;
 use fleetos_core::proto::state::PodMetrics;
 use fleetos_core::proto::workload::WorkloadSpec;
+use fleetos_core::spiffe::WorkloadRole;
+use fleetos_core::tenant::TenantId;
 use openraft::Raft;
 use prost::Message;
 use std::collections::{BTreeMap, HashMap};
@@ -46,33 +49,6 @@ pub const MIN_WINDOWS: usize = 3;
 /// Deadband: no action while |desired - current| is within this percentage
 /// of current (anti-thrash).
 const DEADBAND_PERCENT: u64 = 10;
-
-/// CR-CTRL-6 seam: consulted before any HPA-initiated scale-down.
-///
-/// K8s parity note: HPA scale-down there does not consult PDBs (eviction
-/// does), so shipping permissive is belt-and-braces and correct. When
-/// disruption budgets land, a budget-aware implementation plugs in here
-/// without touching HPA logic.
-pub trait DisruptionGuard: Send + Sync {
-    fn allow_scale_down(&self, tenant: &str, service: &str, role: &str, from: u32, to: u32)
-    -> bool;
-}
-
-/// Default guard: no budgets exist yet, so scale-down is always allowed.
-pub struct PermissiveDisruptionGuard;
-
-impl DisruptionGuard for PermissiveDisruptionGuard {
-    fn allow_scale_down(
-        &self,
-        _tenant: &str,
-        _service: &str,
-        _role: &str,
-        _from: u32,
-        _to: u32,
-    ) -> bool {
-        true
-    }
-}
 
 /// Rolling-average CPU over a pod's metric windows.
 pub fn pod_average_cpu(windows: &[PodMetrics]) -> u64 {
@@ -327,22 +303,32 @@ impl HpaController {
             // CR-CTRL-6 seam: every role being scaled down must be allowed.
             for (role, &to) in new_replicas.iter() {
                 let from = current.get(role).copied().unwrap_or(0);
-                if to < from
-                    && !self.guard.allow_scale_down(
-                        &spec.tenant_id,
-                        &spec.workload_id,
-                        role,
-                        from,
-                        to,
-                    )
-                {
-                    tracing::info!(
-                        tenant = %spec.tenant_id,
-                        workload = %spec.workload_id,
-                        role = %role,
-                        "HPA scale-down blocked by disruption guard"
-                    );
-                    return Ok(false);
+                if to < from {
+                    let count = from - to;
+                    // Fail-closed: if tenant/role can't be typed, block.
+                    let allowed = (|| {
+                        let tenant = TenantId::new(spec.tenant_id.clone()).ok()?;
+                        let role_typed = WorkloadRole::try_from(role.as_str()).ok()?;
+                        self.guard
+                            .allow_disruption(
+                                &tenant,
+                                &spec.workload_id,
+                                &role_typed,
+                                count,
+                                DisruptionTarget::ScaleDown,
+                            )
+                            .ok()
+                    })()
+                    .is_some();
+                    if !allowed {
+                        tracing::info!(
+                            tenant = %spec.tenant_id,
+                            workload = %spec.workload_id,
+                            role = %role,
+                            "HPA scale-down blocked by disruption guard"
+                        );
+                        return Ok(false);
+                    }
                 }
             }
             self.propose_scale(record, &spec, &new_replicas).await?;
@@ -789,7 +775,7 @@ mod tests {
             storage.clone(),
             metrics,
             raft.clone(),
-            Arc::new(PermissiveDisruptionGuard),
+            Arc::new(crate::disruption::NoopDisruptionGuard),
         );
         eval(&hpa, 10_000).await;
         assert!(wait_for_total(&storage, 2).await, "HPA must scale 1 → 2");
@@ -806,7 +792,7 @@ mod tests {
             storage.clone(),
             metrics,
             raft.clone(),
-            Arc::new(PermissiveDisruptionGuard),
+            Arc::new(crate::disruption::NoopDisruptionGuard),
         );
         eval(&hpa, 10_000).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -823,7 +809,7 @@ mod tests {
             storage.clone(),
             metrics,
             raft.clone(),
-            Arc::new(PermissiveDisruptionGuard),
+            Arc::new(crate::disruption::NoopDisruptionGuard),
         );
         eval(&hpa, 10_000).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -848,7 +834,7 @@ mod tests {
             storage.clone(),
             metrics,
             raft.clone(),
-            Arc::new(PermissiveDisruptionGuard),
+            Arc::new(crate::disruption::NoopDisruptionGuard),
         );
 
         eval(&hpa, 10_000).await;
@@ -878,7 +864,7 @@ mod tests {
             storage.clone(),
             metrics,
             raft.clone(),
-            Arc::new(PermissiveDisruptionGuard),
+            Arc::new(crate::disruption::NoopDisruptionGuard),
         );
 
         // t0: first observation — window starts, no action.
@@ -899,8 +885,20 @@ mod tests {
     async fn denying_guard_blocks_scale_down() {
         struct DenyGuard;
         impl DisruptionGuard for DenyGuard {
-            fn allow_scale_down(&self, _: &str, _: &str, _: &str, _: u32, _: u32) -> bool {
-                false
+            fn allow_disruption(
+                &self,
+                _: &TenantId,
+                _: &str,
+                _: &WorkloadRole,
+                _: u32,
+                _: DisruptionTarget,
+            ) -> Result<(), crate::disruption::DisruptionDenied> {
+                Err(crate::disruption::DisruptionDenied {
+                    min_available: 0,
+                    current_healthy: 0,
+                    requested: 0,
+                    forced: false,
+                })
             }
         }
         let (raft, keyspaces, storage, metrics) = setup("deny-guard").await;

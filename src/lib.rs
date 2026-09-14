@@ -6,6 +6,7 @@ pub mod ca;
 pub mod config;
 pub mod controllers;
 pub mod delegation;
+pub mod disruption;
 pub mod dummy_ip;
 pub mod join;
 pub mod proto;

@@ -5,23 +5,28 @@
 
 use crate::attestation::join_token::{JoinTokenStore, NodeKind};
 use crate::controllers::cron_controller::CronController;
+use crate::disruption::{DisruptionGuard, DisruptionTarget};
 use crate::dummy_ip::allocator::DummyIpAllocator;
 use crate::raft::FleetosRaftConfig;
+use crate::scheduler::Placement;
 use crate::storage::StorageEngine;
 use fleetos_core::proto::admin::{
     AdminService, ClusterStatus, CreateTenantRequest, CreateTenantResponse, DelegatedKeyRequest,
-    DelegatedKeyResponse, DeleteSagRuleRequest, DeleteWorkloadRequest, GenerateJoinTokenRequest,
-    GenerateJoinTokenResponse, GetClusterStatusRequest, ListNodePoolsRequest,
-    ListNodePoolsResponse, ListNodesRequest, ListNodesResponse, NodeAck, NodeId, NodePoolAck,
-    NodePoolCreateRequest, NodePoolDeleteRequest, NodePoolInfo, PcrPolicyAck, QuotaAck,
-    QuotaRequest, QuotaResponse, RegisterNodeEkRequest, RegisterNodeEkResponse,
+    DelegatedKeyResponse, DeleteSagRuleRequest, DeleteWorkloadRequest, EvictNodeRequest,
+    GenerateJoinTokenRequest, GenerateJoinTokenResponse, GetClusterStatusRequest,
+    ListNodePoolsRequest, ListNodePoolsResponse, ListNodesRequest, ListNodesResponse, NodeAck,
+    NodeId, NodePoolAck, NodePoolCreateRequest, NodePoolDeleteRequest, NodePoolInfo, PcrPolicyAck,
+    QuotaAck, QuotaRequest, QuotaResponse, RegisterNodeEkRequest, RegisterNodeEkResponse,
     RemoveNodeTaintRequest, RevokeNodeEkRequest, SagRuleAck, ScaleWorkloadRequest, SecretAck,
     SecretAclChange, SetNodeTaintsRequest, SetPcrPolicyRequest, StoreSecretRequest,
     UpsertSagRuleRequest, WorkloadSpecAck,
 };
-use fleetos_core::proto::workload::{CronWorkload, WorkloadSpec};
-use fleetos_core::spiffe::SpiffeId;
+use fleetos_core::proto::workload::CronWorkload;
+use fleetos_core::proto::workload::WorkloadSpec;
+use fleetos_core::spiffe::{SpiffeId, WorkloadRole};
+use fleetos_core::tenant::TenantId;
 use rand::Rng;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -38,6 +43,7 @@ pub struct AdminServiceImpl {
     delegated_key_ttl_secs: u64,
     svid_refresh_fraction: f64,
     node_eks: fjall::Keyspace,
+    disruption_guard: Arc<dyn DisruptionGuard>,
 }
 
 /// Admission hardening (G-12): identifiers must be DNS-label-shaped so they
@@ -123,6 +129,7 @@ impl AdminServiceImpl {
         delegated_key_ttl_secs: u64,
         node_eks: fjall::Keyspace,
         svid_refresh_fraction: f64,
+        disruption_guard: Arc<dyn DisruptionGuard>,
     ) -> Self {
         Self {
             storage,
@@ -136,6 +143,7 @@ impl AdminServiceImpl {
             delegated_key_ttl_secs,
             node_eks,
             svid_refresh_fraction,
+            disruption_guard,
         }
     }
 
@@ -1161,16 +1169,128 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(NodeAck { accepted: true }))
     }
 
-    async fn evict_node(&self, request: Request<NodeId>) -> Result<Response<NodeAck>, Status> {
+    async fn evict_node(
+        &self,
+        request: Request<EvictNodeRequest>,
+    ) -> Result<Response<NodeAck>, Status> {
         self.verify_caller(&request)?;
         self.require_cluster_admin_write(&request)?;
         let node_svid = request.get_ref().node_svid.clone();
+        let force = request.get_ref().force;
         let audit = self.build_audit_context(&request, &node_svid);
         let _req = request.into_inner();
 
+        let node_spiffe: SpiffeId = node_svid
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("invalid node_svid: {}", e)))?;
+
+        // CR-CTRL-6: consult DisruptionGuard per (workload, role) group unless forced.
+        if !force {
+            let placements = self
+                .storage
+                .get_placements_for_node(&node_spiffe)
+                .map_err(|e| Status::internal(format!("storage error: {}", e)))?;
+
+            // Group by (tenant, service, role).
+            let mut groups: BTreeMap<(String, String, String), Vec<Placement>> = BTreeMap::new();
+            for p in &placements {
+                groups
+                    .entry((p.tenant_id.clone(), p.service.clone(), p.role.clone()))
+                    .or_default()
+                    .push(p.clone());
+            }
+
+            let mut partial_evictions: Vec<Placement> = Vec::new();
+            let mut all_allowed = true;
+
+            for ((tenant, service, role), group_placements) in &groups {
+                let count = group_placements.len() as u32;
+                let guard_result = (|| {
+                    let tenant_id = TenantId::new(tenant.clone()).ok()?;
+                    let role_typed = WorkloadRole::try_from(role.as_str()).ok()?;
+                    Some(self.disruption_guard.allow_disruption(
+                        &tenant_id,
+                        service,
+                        &role_typed,
+                        count,
+                        DisruptionTarget::Eviction,
+                    ))
+                })();
+
+                match guard_result {
+                    Some(Ok(())) => {} // allowed
+                    Some(Err(denied)) => {
+                        all_allowed = false;
+                        // Partial allowance: disrupt up to current_healthy - min_available.
+                        let partial = denied.current_healthy.saturating_sub(denied.min_available);
+                        let evict_count = (group_placements.len() as u32).min(partial);
+                        for p in group_placements.iter().take(evict_count as usize) {
+                            partial_evictions.push(p.clone());
+                        }
+                    }
+                    None => {
+                        // Fail-closed: couldn't type tenant/role.
+                        all_allowed = false;
+                    }
+                }
+            }
+
+            if !all_allowed {
+                // Cordon the node so no new pods land there.
+                self.raft
+                    .client_write(crate::raft::AuditedCommand {
+                        cmd: crate::raft::FleetosCommand::SetNodeSchedulable {
+                            node_id: node_svid.clone(),
+                            schedulable: false,
+                        },
+                        audit: Some(audit.clone()),
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+                // Partial drain: remove the allowed placements so they reschedule elsewhere.
+                for p in &partial_evictions {
+                    self.raft
+                        .client_write(crate::raft::AuditedCommand {
+                            cmd: crate::raft::FleetosCommand::RemovePlacement {
+                                pod_id: p.pod_id.clone(),
+                            },
+                            audit: Some(audit.clone()),
+                        })
+                        .await
+                        .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+                    let freed = crate::scheduler::ordinal::OrdinalAssignment {
+                        tenant_id: p.tenant_id.clone(),
+                        service: p.service.clone(),
+                        role: p.role.clone(),
+                        ordinal: p.ordinal,
+                        current_pod_id: None,
+                        current_node_id: None,
+                    };
+                    self.raft
+                        .client_write(crate::raft::AuditedCommand {
+                            cmd: crate::raft::FleetosCommand::RecordOrdinalAssignment {
+                                record: freed,
+                            },
+                            audit: Some(audit.clone()),
+                        })
+                        .await
+                        .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+                }
+
+                tracing::warn!(
+                    node_id = %node_svid,
+                    partial_evictions = partial_evictions.len(),
+                    total_placements = placements.len(),
+                    "node cordoned, partial drain applied, retry eviction later"
+                );
+                return Ok(Response::new(NodeAck { accepted: false }));
+            }
+        }
+
+        // All groups allowed (or forced): full eviction.
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let svid_expires_at_unix = now + self.node_ttl_secs as i64;
-
         self.raft
             .client_write(crate::raft::AuditedCommand {
                 cmd: crate::raft::FleetosCommand::EvictNode {
@@ -1181,8 +1301,7 @@ impl AdminService for AdminServiceImpl {
             })
             .await
             .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
-
-        tracing::info!(node_id = %node_svid, "node evicted via admin");
+        tracing::info!(node_id = %node_svid, force = force, "node evicted via admin");
         Ok(Response::new(NodeAck { accepted: true }))
     }
     async fn set_quota(
@@ -1966,6 +2085,7 @@ mod tests {
 
 #[cfg(test)]
 mod delegated_key_authz_tests {
+
     use super::*;
 
     const NODE_ID: &str = "spiffe://fleet.example.internal/ns/system/node/agent-1";
@@ -2179,6 +2299,7 @@ mod delegated_key_authz_tests {
             14400,
             keyspaces.node_eks.clone(),
             0.75,
+            Arc::new(crate::disruption::NoopDisruptionGuard),
         )
     }
 

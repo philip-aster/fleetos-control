@@ -15,10 +15,8 @@ use fleetos_control::ca::CaService;
 use fleetos_control::config::{AttestationMode, ClusterMode, ControlConfig};
 use fleetos_control::controllers::leader::{ControllerFactory, LeaderGate};
 use fleetos_control::controllers::{
-    CronController, WorkloadController,
-    hpa_controller::{HpaController, PermissiveDisruptionGuard},
-    node_controller::NodeController,
-    pod_controller::PodController,
+    CronController, WorkloadController, hpa_controller::HpaController,
+    node_controller::NodeController, pod_controller::PodController,
 };
 use fleetos_control::dummy_ip::allocator::DummyIpAllocator;
 use fleetos_control::provisioning::control_pool::ControlPoolManager;
@@ -453,12 +451,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // --- CR-CTRL-6: Disruption guard (budget-backed, shared by HPA + admin) ---
+    let disruption_guard: Arc<dyn fleetos_control::disruption::DisruptionGuard> = Arc::new(
+        fleetos_control::disruption::BudgetBackedDisruptionGuard::new(storage_engine.clone()),
+    );
+
     // --- CR-CTRL-8: HPA controller (leader-gated; consumes MetricsStore) ---
     let hpa_controller = Arc::new(HpaController::new(
         storage_engine.clone(),
         metrics_store.clone(),
         raft_handle.raft.clone(),
-        Arc::new(PermissiveDisruptionGuard),
+        disruption_guard.clone(),
     ));
 
     // --- Phase 8: Controller factory and leader gate ---
@@ -654,6 +657,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.svid.delegated_key_ttl_secs,
         keyspaces.node_eks.clone(),
         config.svid.refresh_fraction,
+        disruption_guard.clone(),
     );
 
     let dc_addr: std::net::SocketAddr = config.listeners.data_control.parse()?;

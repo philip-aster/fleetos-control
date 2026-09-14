@@ -2,8 +2,8 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-`fleetos-control` is the control-plane brain of FleetOS, a Rust-based
-container and MicroVM orchestrator designed to replace other orchestrators.
+`fleetos-control` is the control-plane brain of FleetOS - a lightweight, zero-dependency 
+control plane with a Raft-backed design.
 
 FleetOS is a **dark overlay**: control nodes never expose inbound scrape or
 management endpoints. Every listener is mTLS-only with SPIFFE identity,
@@ -82,7 +82,8 @@ allocated `MonotonicVersion`.
 | `ca/` | Dual root CAs, SVID signing (`rcgen`), URI NameConstraints, delegated key issuance, SVID renewal (G-5), `CaService` gRPC |
 | `attestation/` | Nonce manager (rate-capped), join-token store, PCR policies, EK certificate chain validation (SHA-256-pinned manufacturer roots), `AttestationService` gRPC |
 | `admin/` | `AdminService` gRPC — the only surface for `fleetctl-proxy` and operators |
-| `controllers/` | Leader-gated workload / pod / node / cron reconcilers |
+| `controllers/` | Leader-gated workload / pod / node / cron / hpa reconcilers |
+| `disruption/` | Disruption budget model consulted by `EvictNode`/drain |
 | `scheduler/` | Filter+score engine (capacity, anti-affinity, topology spread, bin-packing), read-only ordinal tracker |
 | `policy/` | SAG → eBPF entry compilation, precedence, port validation, fingerprint wrapper, staleness |
 | `watch/` | `BroadcastHub` + gRPC streams: PolicyService, WatchService, SchedulerService, RouterAssignmentService, SecretService, WorkloadStatusService, DelegationService |
@@ -122,7 +123,7 @@ allocated `MonotonicVersion`.
   SVID in the revoked set — one Raft entry. The revoked set is broadcast via
   `WatchSag`, and every mTLS listener rejects revoked peers fail-closed.
 
-### Degraded mode: delegated signing (CR-16)
+### Degraded mode: delegated signing 
 
 When the control plane is unreachable, a hosting node can renew workload
 SVIDs locally with a delegated signing key:
@@ -164,6 +165,7 @@ replay protection.
 | Workload | Expands `WorkloadSpec` → `PodSpec`s, schedules them, records ordinal assignments and placements via Raft. Unconditionally overwrites the six trusted fields (`tenant_id`, `workload_id`, `role`, `image`, `ordinal`, `pod_id`) — caller-submitted values are a tenant-isolation bypass. |
 | Pod | Detects dead pods (missing placement, `live=false`, or stale status report) and replaces them **in place** via `ReassignPodId`; frees ordinal slots on scale-down. |
 | Node | Heartbeat-lease death detection → eviction cascade (delegations + placements + SVID revocation, atomic). |
+| HPA | Metrics-based autoscaling |
 | Cron | Evaluates cron schedules against replicated checkpoints (G-11); triggers runs atomically with checkpoint advance — no double-trigger or lost runs across failover. |
 
 ## Scheduling
@@ -190,6 +192,13 @@ Outbound-only, poll-based client to an externally implemented
 tokens are minted fresh per reconcile cycle. CONTROL pools drive openraft
 membership changes directly, with a quorum guard (G-15) that refuses voter
 removals that would break the cluster.
+
+## Disruption Budgets
+CR-CTRL-6: Disruption budget model consulted by `EvictNode`/drain.
+- `DisruptionGuard` trait with `NoopDisruptionGuard` (permissive default)
+- `BudgetBackedDisruptionGuard` — enforces min_available budgets
+- Partial-allow arithmetic for graceful degradation
+- Force flag for emergency override.
 
 ## Telemetry
 
@@ -248,6 +257,7 @@ Invariants are locked by dedicated tests in `tests/`:
 | `template_overwrite.rs` | The six trusted fields are unconditionally overwritten |
 | `fingerprint_of_only.rs` | `of_with_ordinal` never appears in this crate |
 | `port_range_rejection.rs` | `uint32` ports > 65535 are rejected, not truncated |
+| `disruption_budget.rs` | With unit and determinism tests |
 | `delegation_revocation.rs`, `atomic_broadcast.rs`, `secret_rotation_event.rs`, `svid_rotation_events.rs` | Revocation one-to-many; broadcast atomicity; rotation events carry the target identity |
 | `ebpf_abi_layouts.rs` | eBPF ABI layouts match `fleetos-ebpf-common` exactly |
 
