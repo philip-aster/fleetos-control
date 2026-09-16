@@ -217,6 +217,10 @@ pub enum FleetosCommand {
         key: String,
         effect: String,
     },
+
+    ApplyManifests {
+        updates: Vec<ManifestUpdate>,
+    },
 }
 
 /// Wraps a `FleetosCommand` with optional audit context so the audit record
@@ -236,6 +240,13 @@ impl AuditedCommand {
     pub fn system(cmd: FleetosCommand) -> Self {
         Self { cmd, audit: None }
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManifestUpdate {
+    pub target_keyspace: String, // e.g., "app_workloads"
+    pub target_key: Vec<u8>,
+    pub new_record_bytes: Vec<u8>,
 }
 
 /// Application-level response returned after applying a command.

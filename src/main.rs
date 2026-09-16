@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! `fleetos-control` entrypoint.
 //!
 //! Full integration: Raft cluster, dual CAs, gRPC servers, leader-gated controllers.

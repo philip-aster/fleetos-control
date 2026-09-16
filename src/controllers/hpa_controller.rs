@@ -357,6 +357,7 @@ impl HpaController {
             tenant_id: record.tenant_id.clone(),
             workload_id: record.workload_id.clone(),
             spec_bytes: new_spec.encode_to_vec(),
+            last_applied_bytes: vec![],
         };
         let audit = AuditContext {
             request_id: String::new(),
@@ -692,6 +693,7 @@ mod tests {
             tenant_id: spec.tenant_id.clone(),
             workload_id: spec.workload_id.clone(),
             spec_bytes: spec.encode_to_vec(),
+            last_applied_bytes: vec![],
         };
         let key = format!("{}:{}", spec.tenant_id, spec.workload_id);
         let value = postcard::to_allocvec(&spec_record).unwrap();

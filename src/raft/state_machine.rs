@@ -304,6 +304,27 @@ impl FjallStateMachine {
                 Ok(ChangeKind::SchedulingUpdate)
             }
 
+            FleetosCommand::ApplyManifests { updates } => {
+                for update in updates {
+                    let ks = match update.target_keyspace.as_str() {
+                        "workloads" => &self.keyspaces.workloads,
+                        "tenants" => &self.keyspaces.tenants,
+                        "sag_rules" => &self.keyspaces.sag_rules,
+                        "secrets" => &self.keyspaces.secrets,
+                        "node_pools" => &self.keyspaces.node_pools,
+                        "dummy_ips" => &self.keyspaces.dummy_ips,
+                        "ordinals" => &self.keyspaces.ordinals,
+                        "placements" => &self.keyspaces.placements,
+                        _ => {
+                            tracing::warn!(keyspace = %update.target_keyspace, "unknown target_keyspace in ApplyManifests");
+                            continue;
+                        }
+                    };
+                    batch.insert(ks, &update.target_key, &update.new_record_bytes);
+                }
+                Ok(ChangeKind::SchedulingUpdate)
+            }
+
             FleetosCommand::RevokeNodeEk { ek_fingerprint } => {
                 if let Some(bytes) = self
                     .keyspaces
@@ -1013,6 +1034,7 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::ActivateNodeEk { .. } => "ActivateNodeEk",
         FleetosCommand::SetNodeTaints { .. } => "SetNodeTaints",
         FleetosCommand::RemoveNodeTaint { .. } => "RemoveNodeTaint",
+        FleetosCommand::ApplyManifests { .. } => "ApplyManifests",
         FleetosCommand::RevokeNodeEk { .. } => "RevokeNodeEk",
     }
 }

@@ -39,6 +39,7 @@ async fn store_secret_broadcasts_rotation_with_target_spiffe_id() {
         key: "db-password".to_owned(),
         envelope_bytes: vec![1, 2, 3],
         acl_bytes: vec![4, 5, 6],
+        last_applied_bytes: vec![],
     };
 
     sm.apply(vec![make_entry(

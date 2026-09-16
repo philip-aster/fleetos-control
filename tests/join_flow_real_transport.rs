@@ -365,6 +365,7 @@ async fn propose_tenant(donor: &TestNode, tenant_id: &str, base: u32) {
             record: TenantRecord {
                 tenant_id: tenant_id.to_owned(),
                 created_at: 1_700_000_000,
+                last_applied_bytes: vec![],
             },
             block: fleetos_control::dummy_ip::allocator::TenantBlock {
                 tenant_id: tenant_id.to_owned(),

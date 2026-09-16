@@ -437,6 +437,142 @@ impl AdminServiceImpl {
         }
         Ok(false)
     }
+
+    fn process_manifest(
+        &self,
+        manifest: &fleetos_core::proto::apply::Manifest,
+    ) -> Result<
+        (
+            fleetos_core::proto::apply::ApplyResult,
+            Option<crate::raft::ManifestUpdate>,
+        ),
+        Status,
+    > {
+        use crate::apply::MergeOutcome;
+        use fleetos_core::proto::fleetos::manifest::Spec;
+
+        let target_keyspace = match manifest.kind.as_str() {
+            "Workload" => "workloads",
+            "Tenant" => "tenants",
+            "SagRule" => "sag_rules",
+            "Secret" => "secrets",
+            "NodePool" => "node_pools",
+            _ => {
+                return Ok((
+                    fleetos_core::proto::apply::ApplyResult {
+                        kind: manifest.kind.clone(),
+                        name: manifest.name.clone(),
+                        tenant_id: manifest.tenant_id.clone(),
+                        status: fleetos_core::proto::apply::ApplyStatus::Invalid as i32,
+                        conflicts: vec![],
+                    },
+                    None,
+                ));
+            }
+        };
+
+        let target_key = match manifest.kind.as_str() {
+            "Workload" => format!("{}:{}", manifest.tenant_id, manifest.name).into_bytes(),
+            "Tenant" => manifest.name.clone().into_bytes(),
+            "SagRule" => manifest.name.clone().into_bytes(),
+            "Secret" => format!("secret:{}", manifest.name).into_bytes(),
+            "NodePool" => manifest.name.clone().into_bytes(),
+            _ => vec![],
+        };
+
+        let ks = match target_keyspace {
+            "workloads" => &self.storage.workloads,
+            "tenants" => &self.storage.tenants,
+            "sag_rules" => &self.storage.sags,
+            "secrets" => &self.storage.secrets,
+            "node_pools" => &self.storage.node_pools,
+            _ => return Err(Status::internal("unknown keyspace")),
+        };
+
+        let live_bytes = ks
+            .get(&target_key)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
+
+        let last_applied_bytes = Vec::new();
+
+        let outcome = match manifest.kind.as_str() {
+            "Workload" => {
+                if let Some(Spec::Workload(w)) = &manifest.spec {
+                    crate::apply::merge::merge_workload(w, &live_bytes, &last_applied_bytes)
+                } else {
+                    MergeOutcome::Unchanged
+                }
+            }
+            "Tenant" => {
+                if let Some(Spec::Tenant(t)) = &manifest.spec {
+                    crate::apply::merge::merge_tenant(t, &live_bytes, &last_applied_bytes)
+                } else {
+                    MergeOutcome::Unchanged
+                }
+            }
+            "SagRule" => {
+                if let Some(Spec::SagRule(s)) = &manifest.spec {
+                    crate::apply::merge::merge_sag_rule(s, &live_bytes, &last_applied_bytes)
+                } else {
+                    MergeOutcome::Unchanged
+                }
+            }
+            "Secret" => {
+                if let Some(Spec::Secret(s)) = &manifest.spec {
+                    crate::apply::merge::merge_secret(s, &live_bytes, &last_applied_bytes)
+                } else {
+                    MergeOutcome::Unchanged
+                }
+            }
+            "NodePool" => {
+                if let Some(Spec::NodePool(n)) = &manifest.spec {
+                    crate::apply::merge::merge_node_pool(n, &live_bytes, &last_applied_bytes)
+                } else {
+                    MergeOutcome::Unchanged
+                }
+            }
+            _ => MergeOutcome::Unchanged,
+        };
+
+        let update = match &outcome {
+            MergeOutcome::Updated(bytes) => Some(crate::raft::ManifestUpdate {
+                target_keyspace: target_keyspace.to_string(),
+                target_key,
+                new_record_bytes: bytes.clone(),
+            }),
+            _ => None,
+        };
+
+        let (status, conflicts) = match outcome {
+            MergeOutcome::Updated(_) => {
+                let s = if manifest.tenant_id.is_empty() && manifest.kind == "Tenant" {
+                    fleetos_core::proto::apply::ApplyStatus::Created as i32
+                } else {
+                    fleetos_core::proto::apply::ApplyStatus::Applied as i32
+                };
+                (s, vec![])
+            }
+            MergeOutcome::Unchanged => (
+                fleetos_core::proto::apply::ApplyStatus::Unchanged as i32,
+                vec![],
+            ),
+            MergeOutcome::Conflicted(c) => {
+                (fleetos_core::proto::apply::ApplyStatus::Conflict as i32, c)
+            }
+        };
+
+        let apply_result = fleetos_core::proto::apply::ApplyResult {
+            kind: manifest.kind.clone(),
+            name: manifest.name.clone(),
+            tenant_id: manifest.tenant_id.clone(),
+            status,
+            conflicts,
+        };
+
+        Ok((apply_result, update))
+    }
 }
 
 #[tonic::async_trait]
@@ -476,6 +612,7 @@ impl AdminService for AdminServiceImpl {
         let record = crate::raft::records::TenantRecord {
             tenant_id: tenant_id.clone(),
             created_at: now,
+            last_applied_bytes: vec![],
         };
 
         // Single atomic Raft entry: tenant record + dummy-IP block (E12c).
@@ -539,6 +676,7 @@ impl AdminService for AdminServiceImpl {
             tenant_id: spec.tenant_id.clone(),
             workload_id: spec.workload_id.clone(),
             spec_bytes: prost::Message::encode_to_vec(&spec),
+            last_applied_bytes: vec![],
         };
 
         self.raft
@@ -782,6 +920,7 @@ impl AdminService for AdminServiceImpl {
         let record = crate::raft::records::SagRuleRecord {
             rule_id: rule_id.clone(),
             rule_bytes,
+            last_applied_bytes: vec![],
         };
 
         self.raft
@@ -872,6 +1011,7 @@ impl AdminService for AdminServiceImpl {
             key: req.key.clone(),
             envelope_bytes,
             acl_bytes,
+            last_applied_bytes: vec![],
         };
 
         self.raft
@@ -1664,6 +1804,7 @@ impl AdminService for AdminServiceImpl {
             memory_mb: req.memory_mb,
             disk_gb: req.disk_gb,
             region_hint: req.region_hint.clone(),
+            last_applied_bytes: vec![],
         };
 
         // Propose through Raft.
@@ -2062,6 +2203,91 @@ impl AdminService for AdminServiceImpl {
             .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
         tracing::info!(node_id = %req.node_id, key = %req.key, "node taint removed via raft");
         Ok(Response::new(NodeAck { accepted: true }))
+    }
+
+    // --- CR-CTRL-10: Declarative Apply API ---
+    async fn apply(
+        &self,
+        request: Request<fleetos_core::proto::apply::ApplyRequest>,
+    ) -> Result<Response<fleetos_core::proto::apply::ApplyResponse>, Status> {
+        self.verify_caller(&request)?;
+
+        let req = request.get_ref();
+        let manifest_list = req
+            .manifest_list
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("manifest_list is required"))?;
+        let dry_run = req.dry_run;
+
+        let mut results = Vec::new();
+        let mut updates = Vec::new();
+        let mut any_conflict = false;
+        let mut any_invalid = false;
+
+        for manifest in &manifest_list.manifests {
+            if manifest.api_version != "fleetos.dev/v1alpha1" {
+                results.push(fleetos_core::proto::apply::ApplyResult {
+                    kind: manifest.kind.clone(),
+                    name: manifest.name.clone(),
+                    tenant_id: manifest.tenant_id.clone(),
+                    status: fleetos_core::proto::apply::ApplyStatus::Invalid as i32,
+                    conflicts: vec![],
+                });
+                any_invalid = true;
+                continue;
+            }
+
+            // Authz gate per manifest
+            if !manifest.tenant_id.is_empty() {
+                if self
+                    .require_tenant_write(&request, &manifest.tenant_id)
+                    .is_err()
+                {
+                    any_invalid = true;
+                    continue; // Skip unauthorized manifests silently or mark invalid
+                }
+            } else {
+                if self.require_cluster_admin_write(&request).is_err() {
+                    any_invalid = true;
+                    continue;
+                }
+            }
+
+            let (apply_result, update) = self.process_manifest(manifest)?;
+
+            if let Some(upd) = update {
+                updates.push(upd);
+            }
+
+            if apply_result.status == fleetos_core::proto::apply::ApplyStatus::Conflict as i32 {
+                any_conflict = true;
+            }
+
+            results.push(apply_result);
+        }
+
+        if any_invalid || any_conflict || dry_run || updates.is_empty() {
+            return Ok(Response::new(fleetos_core::proto::apply::ApplyResponse {
+                applied: false,
+                version: 0,
+                results,
+            }));
+        }
+
+        let audit = self.build_audit_context(&request, "apply");
+        self.raft
+            .client_write(crate::raft::AuditedCommand {
+                cmd: crate::raft::FleetosCommand::ApplyManifests { updates },
+                audit: Some(audit),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("raft proposal failed: {}", e)))?;
+
+        Ok(Response::new(fleetos_core::proto::apply::ApplyResponse {
+            applied: true,
+            version: 0, // State machine assigns the true version on commit
+            results,
+        }))
     }
 }
 

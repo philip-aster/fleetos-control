@@ -39,6 +39,9 @@ pub struct NodeRecord {
 pub struct TenantRecord {
     pub tenant_id: String,
     pub created_at: i64,
+    /// CR-CTRL-10: Serialized manifest bytes from the last declarative apply.
+    /// Used as the "last-applied" baseline for three-way merges. Empty if created via RPC.
+    pub last_applied_bytes: Vec<u8>,
 }
 
 /// A submitted workload specification.
@@ -51,6 +54,9 @@ pub struct WorkloadSpecRecord {
     pub tenant_id: String,
     pub workload_id: String,
     pub spec_bytes: Vec<u8>,
+    /// CR-CTRL-10: Serialized `ManifestWorkloadSpec` from the last declarative apply.
+    /// Used as the "last-applied" baseline for three-way merges. Empty if created via RPC.
+    pub last_applied_bytes: Vec<u8>,
 }
 
 /// A submitted cron workload.
@@ -70,6 +76,8 @@ pub struct CronWorkloadRecord {
 pub struct SagRuleRecord {
     pub rule_id: String,
     pub rule_bytes: Vec<u8>,
+    /// CR-CTRL-10: Serialized `ManifestSagRuleSpec` from the last declarative apply.
+    pub last_applied_bytes: Vec<u8>,
 }
 
 /// A secret to store. The leader performs envelope encryption and ACL construction
@@ -82,6 +90,8 @@ pub struct SecretRecord {
     pub envelope_bytes: Vec<u8>,
     /// postcard-encoded `secrets::acl::SecretAcl`.
     pub acl_bytes: Vec<u8>,
+    /// CR-CTRL-10: Serialized `ManifestSecretSpec` from the last declarative apply.
+    pub last_applied_bytes: Vec<u8>,
 }
 
 /// A revoked node SVID (G-4 / CR-5). Stored keyed by SPIFFE ID string.

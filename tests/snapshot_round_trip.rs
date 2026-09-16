@@ -47,6 +47,7 @@ async fn snapshot_round_trip_preserves_state() {
     let tenant = TenantRecord {
         tenant_id: "tenant-1".to_owned(),
         created_at: 1000,
+        last_applied_bytes: vec![],
     };
     let block = fleetos_control::dummy_ip::allocator::TenantBlock {
         tenant_id: "tenant-1".to_owned(),

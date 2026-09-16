@@ -194,7 +194,7 @@ membership changes directly, with a quorum guard (G-15) that refuses voter
 removals that would break the cluster.
 
 ## Disruption Budgets
-CR-CTRL-6: Disruption budget model consulted by `EvictNode`/drain.
+Disruption budget model consulted by `EvictNode`/drain.
 - `DisruptionGuard` trait with `NoopDisruptionGuard` (permissive default)
 - `BudgetBackedDisruptionGuard` — enforces min_available budgets
 - Partial-allow arithmetic for graceful degradation

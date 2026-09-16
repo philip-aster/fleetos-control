@@ -97,6 +97,9 @@ pub struct NodePoolRecord {
     pub memory_mb: u32,
     pub disk_gb: u32,
     pub region_hint: String,
+    /// CR-CTRL-10: Serialized `ManifestNodePoolSpec` from the last declarative apply.
+    /// Used as the "last-applied" baseline for three-way merges. Empty if created via RPC.
+    pub last_applied_bytes: Vec<u8>,
 }
 
 /// The bootstrap payload passed to provisioned nodes.

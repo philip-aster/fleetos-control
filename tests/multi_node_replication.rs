@@ -217,6 +217,7 @@ fn tenant_record(id: &str) -> TenantRecord {
     TenantRecord {
         tenant_id: id.to_owned(),
         created_at: 1000,
+        last_applied_bytes: vec![],
     }
 }
 

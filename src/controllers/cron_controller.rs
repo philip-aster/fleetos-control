@@ -70,6 +70,7 @@ impl CronController {
             tenant_id: spec.tenant_id.clone(),
             workload_id: spec.workload_id.clone(),
             spec_bytes: prost::Message::encode_to_vec(&spec),
+            last_applied_bytes: vec![],
         };
         let checkpoint = CronCheckpointRecord {
             tenant_id: cron.tenant_id.clone(),
