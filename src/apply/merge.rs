@@ -21,6 +21,8 @@ fn conflict(path: &str, live: &str, manifest: &str, last: &str) -> FieldConflict
     }
 }
 
+// src/apply/merge.rs
+
 pub fn merge_workload(
     manifest: &ManifestWorkloadSpec,
     live_bytes: &[u8],
@@ -31,10 +33,12 @@ pub fn merge_workload(
     } else {
         WorkloadSpec::decode(live_bytes).unwrap_or_default()
     };
-    let last: WorkloadSpec = if last_applied_bytes.is_empty() {
-        WorkloadSpec::default()
+
+    // FIX: Decode as ManifestWorkloadSpec, not WorkloadSpec
+    let last: ManifestWorkloadSpec = if last_applied_bytes.is_empty() {
+        ManifestWorkloadSpec::default()
     } else {
-        WorkloadSpec::decode(last_applied_bytes).unwrap_or_default()
+        ManifestWorkloadSpec::decode(last_applied_bytes).unwrap_or_default()
     };
 
     let mut conflicts = Vec::new();
@@ -42,22 +46,24 @@ pub fn merge_workload(
 
     // 1. Image
     if let Some(ref img) = manifest.image {
-        if live.image != last.image && live.image != *img {
-            conflicts.push(conflict("image", &live.image, img, &last.image));
+        let last_img = last.image.clone().unwrap_or_default();
+        if live.image != last_img && live.image != *img {
+            conflicts.push(conflict("image", &live.image, img, &last_img));
         } else if live.image != *img {
             live.image = img.clone();
             changed = true;
         }
     }
 
-    // 2. Replicas (map fields are always present in proto3, empty = absent)
+    // 2. Replicas
     if !manifest.replicas.is_empty() {
-        if live.replicas != last.replicas && live.replicas != manifest.replicas {
+        let last_replicas = last.replicas.clone();
+        if live.replicas != last_replicas && live.replicas != manifest.replicas {
             conflicts.push(conflict(
                 "replicas",
                 &format!("{:?}", live.replicas),
                 &format!("{:?}", manifest.replicas),
-                &format!("{:?}", last.replicas),
+                &format!("{:?}", last_replicas),
             ));
         } else if live.replicas != manifest.replicas {
             live.replicas = manifest.replicas.clone();
@@ -68,21 +74,18 @@ pub fn merge_workload(
     // 3. PodSpec (Invariant: explicitly strip/ignore trusted fields)
     if let Some(ref manifest_pod) = manifest.pod_spec {
         let mut live_pod = live.pod_spec.unwrap_or_default();
-        let last_pod = last.pod_spec.unwrap_or_default();
-
-        // Trusted fields (tenant_id, workload_id, role, image, ordinal, pod_id)
-        // are NEVER merged from the manifest. The controller assigns them.
+        let last_pod = last.pod_spec.clone().unwrap_or_default();
 
         // Resources
         if manifest_pod.resources.is_some() {
-            if live_pod.resources != last_pod.resources
-                && live_pod.resources != manifest_pod.resources
+            let last_resources = last_pod.resources.clone();
+            if live_pod.resources != last_resources && live_pod.resources != manifest_pod.resources
             {
                 conflicts.push(conflict(
                     "pod_spec.resources",
                     &format!("{:?}", live_pod.resources),
                     &format!("{:?}", manifest_pod.resources),
-                    &format!("{:?}", last_pod.resources),
+                    &format!("{:?}", last_resources),
                 ));
             } else if live_pod.resources != manifest_pod.resources {
                 live_pod.resources = manifest_pod.resources.clone();
@@ -92,12 +95,13 @@ pub fn merge_workload(
 
         // Env
         if !manifest_pod.env.is_empty() {
-            if live_pod.env != last_pod.env && live_pod.env != manifest_pod.env {
+            let last_env = last_pod.env.clone();
+            if live_pod.env != last_env && live_pod.env != manifest_pod.env {
                 conflicts.push(conflict(
                     "pod_spec.env",
                     &format!("{:?}", live_pod.env),
                     &format!("{:?}", manifest_pod.env),
-                    &format!("{:?}", last_pod.env),
+                    &format!("{:?}", last_env),
                 ));
             } else if live_pod.env != manifest_pod.env {
                 live_pod.env = manifest_pod.env.clone();
@@ -107,12 +111,13 @@ pub fn merge_workload(
 
         // Labels
         if !manifest_pod.labels.is_empty() {
-            if live_pod.labels != last_pod.labels && live_pod.labels != manifest_pod.labels {
+            let last_labels = last_pod.labels.clone();
+            if live_pod.labels != last_labels && live_pod.labels != manifest_pod.labels {
                 conflicts.push(conflict(
                     "pod_spec.labels",
                     &format!("{:?}", live_pod.labels),
                     &format!("{:?}", manifest_pod.labels),
-                    &format!("{:?}", last_pod.labels),
+                    &format!("{:?}", last_labels),
                 ));
             } else if live_pod.labels != manifest_pod.labels {
                 live_pod.labels = manifest_pod.labels.clone();
@@ -125,12 +130,13 @@ pub fn merge_workload(
 
     // 4. Placement
     if let Some(p) = manifest.placement {
-        if live.placement != last.placement && live.placement != p {
+        let last_placement = last.placement.unwrap_or_default();
+        if live.placement != last_placement && live.placement != p {
             conflicts.push(conflict(
                 "placement",
                 &live.placement.to_string(),
                 &p.to_string(),
-                &last.placement.to_string(),
+                &last_placement.to_string(),
             ));
         } else if live.placement != p {
             live.placement = p;
@@ -140,12 +146,13 @@ pub fn merge_workload(
 
     // 5. Autoscaling
     if manifest.autoscaling.is_some() {
-        if live.autoscaling != last.autoscaling && live.autoscaling != manifest.autoscaling {
+        let last_autoscaling = last.autoscaling.clone();
+        if live.autoscaling != last_autoscaling && live.autoscaling != manifest.autoscaling {
             conflicts.push(conflict(
                 "autoscaling",
                 &format!("{:?}", live.autoscaling),
                 &format!("{:?}", manifest.autoscaling),
-                &format!("{:?}", last.autoscaling),
+                &format!("{:?}", last_autoscaling),
             ));
         } else if live.autoscaling != manifest.autoscaling {
             live.autoscaling = manifest.autoscaling.clone();
@@ -156,7 +163,6 @@ pub fn merge_workload(
     if !conflicts.is_empty() {
         return MergeOutcome::Conflicted(conflicts);
     }
-
     if changed {
         MergeOutcome::Updated(live.encode_to_vec())
     } else {

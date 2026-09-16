@@ -1171,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "fleetos-core"
-version = "0.1.8-rc-2"
+version = "0.1.8-rc-1"
 dependencies = [
  "async-trait",
  "blake3",
