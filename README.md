@@ -61,10 +61,10 @@ atomic batch.
 
 ### State machine
 
-`FjallStateMachine` applies ~30 command variants (tenants, workloads, cron,
-SAG rules, secrets + ACLs, nodes, evictions, delegations, dummy-IP
-allocations, ordinals, placements, SVID versions, EK registry, PCR policies,
-operator grants, quotas, workload status, audit-bearing proposals). After
+`FjallStateMachine` applies ~40 command variants (tenants, workloads, cron, SAG rules, 
+secrets + ACLs, nodes, evictions, delegations, dummy-IP allocations, ordinals, placements, 
+SVID versions, EK registry, PCR policies, operator grants, quotas, workload status, node taints, 
+declarative manifest batches, audit-bearing proposals). After
 each commit it publishes `SagUpdateEvent`, `ScheduleUpdateEvent`,
 `RouteUpdateEvent`, and `WatchEvent`s into the `BroadcastHub`, which feeds
 the gRPC watch streams.
@@ -82,6 +82,7 @@ allocated `MonotonicVersion`.
 | `ca/` | Dual root CAs, SVID signing (`rcgen`), URI NameConstraints, delegated key issuance, SVID renewal (G-5), `CaService` gRPC |
 | `attestation/` | Nonce manager (rate-capped), join-token store, PCR policies, EK certificate chain validation (SHA-256-pinned manufacturer roots), `AttestationService` gRPC |
 | `admin/` | `AdminService` gRPC — the only surface for `fleetctl-proxy` and operators |
+| `apply/` | Server-side three-way merge engine for declarative `fleetctl apply` |
 | `controllers/` | Leader-gated workload / pod / node / cron / hpa reconcilers |
 | `disruption/` | Disruption budget model consulted by `EvictNode`/drain |
 | `scheduler/` | Filter+score engine (capacity, anti-affinity, topology spread, bin-packing), read-only ordinal tracker |
@@ -155,7 +156,7 @@ replay protection.
 | Listener | Auth | Services |
 |---|---|---|
 | Data/Control (`listeners.data_control`) | mTLS with **optional** client auth (pre-SVID join flow); unauthenticated reachability rejected fail-closed per service | `PolicyService` (WatchSag), `WatchService` (WatchEvents), `SchedulerService` (WatchSchedule), `RouterAssignmentService` (WatchRoutes), `SecretService` (FetchSecret), `WorkloadStatusService`, `AttestationService`, `CaService`, `DelegationService` |
-| Admin (`listeners.admin`) | Strict mTLS, Admin trust domain, `ctrl`/`operator` kinds only | `AdminService` — tenants, workloads, cron, SAG rules, secrets + ACLs, delegated-key override, node cordon/evict, quotas, node pools, EK register/revoke, PCR policies, operator JIT grants, audit log, join tokens, cluster status |
+| Admin ( `listeners.admin` )|Strict mTLS, Admin trust domain,  `ctrl` / `operator`  kinds only| `AdminService`  — tenants, workloads, cron, SAG rules, secrets + ACLs, delegated-key override, node cordon/evict, quotas, node pools, EK register/revoke, PCR policies, operator JIT grants, audit log, join tokens, cluster status, declarative Apply |
 | Raft (`listeners.raft`) | Strict mTLS, `control` kind only | `RaftTransport` — AppendEntries, Vote, InstallSnapshot, RequestJoin |
 
 ## Controllers
@@ -193,12 +194,65 @@ tokens are minted fresh per reconcile cycle. CONTROL pools drive openraft
 membership changes directly, with a quorum guard (G-15) that refuses voter
 removals that would break the cluster.
 
-## Disruption Budgets
-Disruption budget model consulted by `EvictNode`/drain.
-- `DisruptionGuard` trait with `NoopDisruptionGuard` (permissive default)
-- `BudgetBackedDisruptionGuard` — enforces min_available budgets
-- Partial-allow arithmetic for graceful degradation
-- Force flag for emergency override.
+## Disruption Budgets (CR-CTRL-6)
+
+Workloads declare per-role disruption budgets via `DisruptionBudget` in the
+WorkloadSpec. The `BudgetBackedDisruptionGuard` is the structural seam
+consulted by every disruptive mutation: HPA scale-down, node eviction/drain,
+and workload deletion.
+
+Semantics:
+- A budget declares `min_available` OR `max_unavailable` (mutually exclusive;
+  setting both is rejected at admission). Either may be an absolute count or
+  a percentage of the role's desired replica count.
+- `max_unavailable` is normalized to `min_available = desired - max_unavailable`
+  so the guard has one code path. Percentages round UP for `min_available`
+  and DOWN for `max_unavailable` (fail-closed on ambiguity).
+- No budget declared for a role ⇒ unbounded disruption allowed.
+- Partial-allow arithmetic: when a full eviction is denied, the guard computes
+  `current_healthy - min_available` and allows that many pods to be disrupted.
+- `force` flag bypasses the guard for emergency operations.
+
+The guard evaluates against committed state at proposal time; because all
+disruptions are proposed through the leader and serialized by the Raft log,
+budget checks are linearizable for free — no separate in-memory lock.
+
+## Declarative Apply
+
+`fleetctl apply` semantics over the existing RPC surface. The `Apply` RPC on
+AdminService accepts a versioned `ManifestList`, performs a server-side
+three-way merge against live state and the last-applied baseline, and commits
+the result atomically through Raft.
+
+Three-way merge (`src/apply/merge.rs`):
+- **Live state**: the current committed record in the keyspace.
+- **Last-applied baseline**: the serialized manifest from the previous
+  successful apply, stored as `last_applied_bytes` on each record
+  (`#[serde(default)]` for backward compatibility).
+- **Manifest**: the incoming desired state, with `optional` presence tracking
+  so "field absent in manifest" means "do not touch", never "clear to default".
+
+Conflict detection: if `live[field] != last_applied[field]` AND the manifest
+sets a new value for that field, a `FieldConflict` is reported and the entire
+batch is rejected. All conflicts in the batch are reported, not just the first.
+
+System-owned field exclusion: the merge engine never merges trusted fields
+(`tenant_id`, `workload_id`, `role`, `image`, `ordinal`, `pod_id` in PodSpec).
+These are controller-assigned; any manifest-supplied values are ignored.
+
+Atomicity: all manifests in a single `ApplyRequest` commit in one Raft entry
+(`FleetosCommand::ApplyManifests`). If any manifest conflicts, none are applied.
+
+Idempotency: apply-twice-is-no-op. A second apply of the same manifest returns
+`UNCHANGED` with `version = 0` — the state machine does not bump
+`MonotonicVersion` on an all-UNCHANGED batch, so watch streams see no change.
+
+`dry_run`: computes the merge and reports conflicts without committing.
+
+Gating and validation: `api_version` must be `fleetos.dev/v1alpha1`; unknown
+`kind` values are rejected fail-closed. Per-manifest authz enforces
+cluster-admin write for cluster-scoped objects and tenant-scoped write for
+tenant objects.
 
 ## Telemetry
 
@@ -257,9 +311,10 @@ Invariants are locked by dedicated tests in `tests/`:
 | `template_overwrite.rs` | The six trusted fields are unconditionally overwritten |
 | `fingerprint_of_only.rs` | `of_with_ordinal` never appears in this crate |
 | `port_range_rejection.rs` | `uint32` ports > 65535 are rejected, not truncated |
-| `disruption_budget.rs` | With unit and determinism tests |
+| `disruption_budget.rs` | Budget normalization (max_unavailable → min_available, percentage rounding), guard behavior, partial-allow arithmetic, determinism |
 | `delegation_revocation.rs`, `atomic_broadcast.rs`, `secret_rotation_event.rs`, `svid_rotation_events.rs` | Revocation one-to-many; broadcast atomicity; rotation events carry the target identity |
 | `ebpf_abi_layouts.rs` | eBPF ABI layouts match `fleetos-ebpf-common` exactly |
+| `server_side_apply.rs` | Apply-twice idempotency, conflict rejection, atomic multi-object apply, system-owned field exclusion, no-op version stability |
 
 ## License
 
