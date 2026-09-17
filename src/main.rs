@@ -340,11 +340,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let peer_cert_der = peer_certs.first().ok_or_else(|| {
                                 std::io::Error::new(std::io::ErrorKind::PermissionDenied, "empty cert chain")
                             })?;
-                            let spiffe_uri = fleetos_control::tls::mtls::extract_spiffe_uri_san(peer_cert_der)
+                            let spiffe_id = fleetos_core::spiffe::extract_spiffe_id(peer_cert_der)
                                 .map_err(|e| {
-                                    tracing::warn!(addr = %addr, error = %e, "raft SPIFFE extraction failed");
+                                    tracing::warn!(addr = %addr, error = %e, "SPIFFE extraction failed");
                                     std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
                                 })?;
+                            let spiffe_uri = spiffe_id.to_string(); // Adapter for validate_peer_identity
                             fleetos_control::tls::trust_domains::validate_peer_identity(
                                 &spiffe_uri,
                                 fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
@@ -700,11 +701,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let (_, server_conn) = tls_stream.get_ref();
                             let spiffe_id = match server_conn.peer_certificates().and_then(|c| c.first()) {
                                 Some(peer_cert_der) => {
-                                    let spiffe_uri = fleetos_control::tls::mtls::extract_spiffe_uri_san(peer_cert_der)
+                                    let id = fleetos_core::spiffe::extract_spiffe_id(peer_cert_der)
                                         .map_err(|e| {
                                             tracing::warn!(addr = %addr, error = %e, "SPIFFE extraction failed");
-                                            std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+                                            std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string())
                                         })?;
+                                    let spiffe_uri = id.to_string();
                                     fleetos_control::tls::trust_domains::validate_peer_identity(
                                         &spiffe_uri,
                                         fleetos_control::tls::trust_domains::TrustDomainRole::DataControl,
@@ -713,8 +715,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         tracing::warn!(addr = %addr, spiffe = %spiffe_uri, error = %e, "peer identity rejected");
                                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
                                     })?;
-                                    let id: SpiffeId = spiffe_uri.parse()
-                                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                                     tracing::debug!(addr = %addr, spiffe = %id, "peer authenticated");
                                     if fleetos_control::revocation::is_svid_revoked(&revoked_ks, &id.to_string()) {
                                         tracing::warn!(addr = %addr, spiffe = %id, "peer SVID is revoked");
@@ -859,11 +859,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .ok_or_else(|| {
                                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, "empty cert chain")
                                     })?;
-                                let spiffe_uri = fleetos_control::tls::mtls::extract_spiffe_uri_san(peer_cert_der)
+                                let spiffe_id = fleetos_core::spiffe::extract_spiffe_id(peer_cert_der)
                                     .map_err(|e| {
                                         tracing::warn!(addr = %addr, error = %e, "SPIFFE extraction failed");
-                                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+                                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string())
                                     })?;
+                                let spiffe_uri = spiffe_id.to_string();
                                 fleetos_control::tls::trust_domains::validate_peer_identity(
                                     &spiffe_uri,
                                     fleetos_control::tls::trust_domains::TrustDomainRole::Admin,
@@ -872,10 +873,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     tracing::warn!(addr = %addr, spiffe = %spiffe_uri, error = %e, "peer identity rejected");
                                     std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
                                 })?;
-                                let spiffe_id: SpiffeId = spiffe_uri.parse()
-                                    .map_err(|e| {
-                                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                                    })?;
                                 tracing::debug!(addr = %addr, spiffe = %spiffe_id, "admin peer authenticated");
                                 if fleetos_control::revocation::is_svid_revoked(&revoked_ks, &spiffe_id.to_string()) {
                                     tracing::warn!(addr = %addr, spiffe = %spiffe_id, "admin peer SVID is revoked");

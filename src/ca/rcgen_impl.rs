@@ -1,6 +1,5 @@
 //! X.509 certificate signing implementation using `rcgen` + `rustls`.
 use super::CaError;
-use super::oid;
 use crate::ca::Arc;
 use fleetos_core::spiffe::SpiffeId;
 use rcgen::string::Ia5String;
@@ -174,16 +173,16 @@ pub fn sign_svid(
     if let Some(ref role) = params.role {
         leaf_params
             .custom_extensions
-            .push(oid::role_extension(role));
+            .push(fleetos_core::spiffe::role_extension(role));
     }
     if let Some(ordinal) = params.ordinal {
         leaf_params
             .custom_extensions
-            .push(oid::ordinal_extension(ordinal));
+            .push(fleetos_core::spiffe::ordinal_extension(ordinal));
     }
     leaf_params
         .custom_extensions
-        .push(oid::degraded_extension(params.degraded));
+        .push(fleetos_core::spiffe::degraded_extension(params.degraded));
 
     // Generate a fresh keypair for the leaf.
     let leaf_key_pair = KeyPair::generate().map_err(|e| CaError::KeyGeneration(e.to_string()))?;
@@ -300,7 +299,7 @@ pub fn sign_csr(
     // longer carries it — see build_csr contract).
     final_params
         .custom_extensions
-        .push(oid::degraded_extension(false));
+        .push(fleetos_core::spiffe::degraded_extension(false));
 
     let cert = final_params
         .signed_by(&csr_params.public_key, &issuer)

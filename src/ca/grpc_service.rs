@@ -11,6 +11,8 @@
 //!   single-use attestation grant — written by `submit_quote` on successful
 //!   attestation — exists for exactly the CSR's SPIFFE ID.
 //! Anything else is rejected fail-closed with PERMISSION_DENIED.
+use crate::ca::key_issuance::VerifiedPlacement;
+
 use super::SvidGrantRecord;
 use super::key_issuance::{PlacementVerifier, StoragePlacementVerifier};
 use super::rcgen_impl;
@@ -65,10 +67,11 @@ impl CaServiceImpl {
         &self,
         csr_spiffe_id: &str,
         caller: Option<&SpiffeId>,
+        csr_ordinal: Option<u32>,
     ) -> Result<Option<Vec<u8>>, Status> {
         match caller {
             Some(caller_id) => {
-                self.authorize_authenticated(csr_spiffe_id, caller_id)?;
+                self.authorize_authenticated(csr_spiffe_id, caller_id, csr_ordinal)?;
                 Ok(None) // pubkey comes from existing SvidRecord
             }
             None => {
@@ -84,19 +87,23 @@ impl CaServiceImpl {
         &self,
         csr_spiffe_id: &str,
         caller_id: &SpiffeId,
-    ) -> Result<(), Status> {
+        csr_ordinal: Option<u32>,
+    ) -> Result<VerifiedPlacement, Status> {
         // (a) Self-renewal.
         if caller_id.to_string() == csr_spiffe_id {
-            return Ok(());
+            return Ok(VerifiedPlacement { role: None });
         }
+
         // (b) Hosting node renewing a workload SVID it hosts.
         if caller_id.kind == IdKind::Node {
             let target: SpiffeId = csr_spiffe_id.parse().map_err(|e| {
                 Status::invalid_argument(format!("CSR SPIFFE ID is malformed: {}", e))
             })?;
             let verifier = StoragePlacementVerifier::new(self.placements_keyspace.clone());
+
+            // Pass the exact ordinal from the CSR to prevent cross-ordinal minting
             return verifier
-                .verify_placement(caller_id, &target, None)
+                .verify_placement(caller_id, &target, csr_ordinal)
                 .map_err(|e| {
                     Status::permission_denied(format!(
                         "caller {} is not authorized to sign {}: {}",
@@ -104,6 +111,7 @@ impl CaServiceImpl {
                     ))
                 });
         }
+
         Err(Status::permission_denied(format!(
             "caller {} cannot sign a CSR for {}",
             caller_id, csr_spiffe_id
@@ -184,7 +192,7 @@ impl CaService for CaServiceImpl {
         let caller = request
             .extensions()
             .get::<crate::tls::PeerConnectInfo>()
-            .and_then(|info| info.spiffe_id.clone());
+            .and_then(|info| info.spiffe_id.clone()); // FIX: Removed .ok_or_else()
 
         let req = request.into_inner();
         if req.csr_der.is_empty() {
@@ -195,8 +203,10 @@ impl CaService for CaServiceImpl {
         let spiffe_id = rcgen_impl::extract_spiffe_id_from_csr(&req.csr_der)
             .map_err(|e| Status::invalid_argument(format!("CSR validation failed: {}", e)))?;
 
+        let csr_ordinal = fleetos_core::spiffe::extract_ordinal(&req.csr_der);
+
         // M-3 / CR-6: bind issuance to the caller, fail-closed.
-        let grant_pubkey = self.authorize_issuance(&spiffe_id, caller.as_ref())?;
+        let grant_pubkey = self.authorize_issuance(&spiffe_id, caller.as_ref(), csr_ordinal)?;
 
         // Load the current SVID record for this SpiffeId.
         let (current_version, existing_pubkey) = match self
@@ -466,8 +476,11 @@ mod tests {
     #[tokio::test]
     async fn unauthenticated_csr_without_grant_is_rejected() {
         let (_db, service) = test_service("no-grant").await;
-        let result = service
-            .authorize_issuance("spiffe://fleet.example.internal/ns/system/control/c1", None);
+        let result = service.authorize_issuance(
+            "spiffe://fleet.example.internal/ns/system/control/c1",
+            None,
+            None,
+        );
         assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
 
@@ -476,9 +489,12 @@ mod tests {
         let (_db, service) = test_service("grant-single-use").await;
         let id = "spiffe://fleet.example.internal/ns/system/control/c1";
         write_grant(&service, id, 300);
-        assert!(service.authorize_issuance(id, None).is_ok());
+        assert!(service.authorize_issuance(id, None, None).is_ok());
         assert_eq!(
-            service.authorize_issuance(id, None).unwrap_err().code(),
+            service
+                .authorize_issuance(id, None, None)
+                .unwrap_err()
+                .code(),
             tonic::Code::PermissionDenied
         );
     }
@@ -489,7 +505,10 @@ mod tests {
         let id = "spiffe://fleet.example.internal/ns/system/control/c1";
         write_grant(&service, id, -1);
         assert_eq!(
-            service.authorize_issuance(id, None).unwrap_err().code(),
+            service
+                .authorize_issuance(id, None, None)
+                .unwrap_err()
+                .code(),
             tonic::Code::PermissionDenied
         );
         assert!(
@@ -511,7 +530,8 @@ mod tests {
             service
                 .authorize_issuance(
                     "spiffe://fleet.example.internal/ns/system/node/agent-1",
-                    Some(&caller)
+                    Some(&caller),
+                    None,
                 )
                 .is_ok()
         );
@@ -526,6 +546,7 @@ mod tests {
         let result = service.authorize_issuance(
             "spiffe://fleet.example.internal/ns/tenant-1/sa/db",
             Some(&caller),
+            None,
         );
         assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
@@ -539,6 +560,7 @@ mod tests {
         let result = service.authorize_issuance(
             "spiffe://fleet.example.internal/ns/tenant-1/sa/db",
             Some(&caller),
+            None,
         );
         assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
@@ -570,7 +592,8 @@ mod tests {
             service
                 .authorize_issuance(
                     "spiffe://fleet.example.internal/ns/tenant-1/sa/db",
-                    Some(&node)
+                    Some(&node),
+                    None,
                 )
                 .is_ok()
         );

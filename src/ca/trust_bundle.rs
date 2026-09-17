@@ -3,11 +3,6 @@ use super::CaError;
 use super::rcgen_impl;
 use rcgen::KeyPair;
 
-use std::sync::Arc;
-
-use rustls::pki_types::{CertificateDer, UnixTime};
-use rustls::server::WebPkiClientVerifier;
-
 /// A trust bundle for a single trust domain.
 pub struct TrustBundle {
     pub trust_domain: String,
@@ -99,69 +94,18 @@ impl TrustBundle {
     /// URI outside this trust domain), and `Err` for operational failures
     /// (malformed roots, verifier construction, broken system clock).
     pub fn validate_svid(&self, cert_der: &[u8]) -> Result<bool, CaError> {
-        // Ensure a process-level crypto provider is installed. `main` installs
-        // one at startup, but tests (and any other caller) may not.
-        // `install_default` is a no-op if one is already installed.
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = vec![self.current_cert_der.clone()];
+        if let Some(prev) = &self.previous {
+            roots.push(prev.cert_der.clone());
         }
-
-        // 1. Build a root store from this bundle's roots (current + previous,
-        //    so SVIDs issued before a rotation still validate mid-overlap).
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store
-            .add(CertificateDer::from(self.current_cert_der.as_slice()))
-            .map_err(|e| CaError::TrustBundle(format!("invalid root certificate: {}", e)))?;
-        if let Some(ref previous) = self.previous {
-            root_store
-                .add(CertificateDer::from(previous.cert_der.as_slice()))
-                .map_err(|e| {
-                    CaError::TrustBundle(format!("invalid previous root certificate: {}", e))
-                })?;
-        }
-
-        // 2. Build the webpki-backed verifier.
-        let verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
-            .build()
-            .map_err(|e| CaError::TrustBundle(format!("failed to build verifier: {}", e)))?;
-
-        // Fail-closed if the system clock is before the unix epoch: `now`
-        // collapses to epoch 0, every certificate appears not-yet-valid,
-        // and validation returns Ok(false).
-        let now = UnixTime::since_unix_epoch(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default(),
-        );
-
-        // 3. Validate the chain: signature, validity window, basic
-        //    constraints, NameConstraints. SVIDs are signed directly by the
-        //    root, so there are no intermediates.
-        if verifier
-            .verify_client_cert(&CertificateDer::from(cert_der), &[], now)
-            .is_err()
-        {
-            return Ok(false);
-        }
-
-        // 4. Verify the SPIFFE URI SAN belongs to this trust domain.
-        //    (webpki validates the chain to the anchor, not URI contents.)
-        let spiffe_uri = match crate::tls::mtls::extract_spiffe_uri_san(cert_der) {
-            Ok(uri) => uri,
-            Err(_) => return Ok(false),
+        let core_bundle = fleetos_core::spiffe::TrustBundle {
+            trust_domain: self.trust_domain.clone(),
+            roots,
         };
-        let expected_prefix = format!("spiffe://{}/", self.trust_domain);
-        if !spiffe_uri.starts_with(&expected_prefix) {
-            return Ok(false);
+        match fleetos_core::spiffe::validate_svid(cert_der, &core_bundle) {
+            Ok(_id) => Ok(true),
+            Err(_) => Ok(false),
         }
-
-        tracing::debug!(
-            trust_domain = %self.trust_domain,
-            spiffe_uri = %spiffe_uri,
-            "SVID validated"
-        );
-
-        Ok(true)
     }
 
     /// Serialize this trust bundle into a persistable record.

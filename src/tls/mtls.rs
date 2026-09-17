@@ -2,14 +2,12 @@
 
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
-use rustls::{ClientConfig, ServerConfig};
-use x509_parser::prelude::*;
-
-use parking_lot::RwLock;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use rustls::{ClientConfig, ServerConfig};
 
 use super::TlsError;
 use super::trust_domains::TrustDomainRole;
@@ -106,90 +104,6 @@ pub fn build_client_config(mtls: &MtlsConfig) -> Result<ClientConfig, TlsError> 
         .map_err(|e| TlsError::Rustls(format!("failed to build client config: {}", e)))?;
 
     Ok(config)
-}
-
-/// Extract the SPIFFE URI SAN from a DER-encoded certificate.
-///
-/// Properly parses the X.509 structure using `x509-parser`:
-/// 1. Parse the DER certificate
-/// 2. Find the SubjectAltName extension (OID 2.5.29.17)
-/// 3. Iterate GeneralNames looking for URI entries
-/// 4. Return the first URI that starts with "spiffe://"
-///
-/// A SPIFFE-compliant certificate has exactly one URI SAN containing the SPIFFE ID.
-pub fn extract_spiffe_uri_san(cert_der: &[u8]) -> Result<String, TlsError> {
-    // Parse the DER-encoded certificate.
-    let (_, cert) = parse_x509_certificate(cert_der)
-        .map_err(|e| TlsError::Certificate(format!("failed to parse certificate: {}", e)))?;
-
-    // Find the SubjectAlternativeName extension.
-    let san_ext = cert
-        .extensions()
-        .iter()
-        .find(|ext| {
-            matches!(
-                ext.parsed_extension(),
-                &ParsedExtension::SubjectAlternativeName(_)
-            )
-        })
-        .ok_or(TlsError::NoSpiffeSan)?;
-
-    // Extract the parsed SubjectAlternativeName.
-    let san = match san_ext.parsed_extension() {
-        ParsedExtension::SubjectAlternativeName(san) => san,
-        _ => return Err(TlsError::NoSpiffeSan),
-    };
-
-    // Iterate GeneralNames looking for a URI entry with "spiffe://" prefix.
-    for general_name in &san.general_names {
-        if let GeneralName::URI(uri) = general_name {
-            if uri.starts_with("spiffe://") {
-                return Ok(uri.to_string());
-            }
-        }
-    }
-
-    Err(TlsError::NoSpiffeSan)
-}
-
-/// Extract all SPIFFE URI SANs from a DER-encoded certificate.
-///
-/// Used for validation — a well-formed SVID should have exactly one,
-/// but we return all for completeness.
-pub fn extract_all_spiffe_uri_sans(cert_der: &[u8]) -> Result<Vec<String>, TlsError> {
-    let (_, cert) = parse_x509_certificate(cert_der)
-        .map_err(|e| TlsError::Certificate(format!("failed to parse certificate: {}", e)))?;
-
-    let san_ext = cert
-        .extensions()
-        .iter()
-        .find(|ext| {
-            matches!(
-                ext.parsed_extension(),
-                &ParsedExtension::SubjectAlternativeName(_)
-            )
-        })
-        .ok_or(TlsError::NoSpiffeSan)?;
-
-    let san = match san_ext.parsed_extension() {
-        ParsedExtension::SubjectAlternativeName(san) => san,
-        _ => return Err(TlsError::NoSpiffeSan),
-    };
-
-    let mut uris = Vec::new();
-    for general_name in &san.general_names {
-        if let GeneralName::URI(uri) = general_name {
-            if uri.starts_with("spiffe://") {
-                uris.push(uri.to_string());
-            }
-        }
-    }
-
-    if uris.is_empty() {
-        Err(TlsError::NoSpiffeSan)
-    } else {
-        Ok(uris)
-    }
 }
 
 /// Hot-swappable server certificate resolver for SVID renewal (G-5).

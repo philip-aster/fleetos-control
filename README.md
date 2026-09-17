@@ -14,10 +14,11 @@ a gRPC dial to the cloud provider's provisioning shim.
 
 | Crate | Role |
 |---|---|
-| `fleetos-core` | Frozen primitives: SPIFFE identity, BLAKE3 fingerprints, SAG policy schema, proto definitions, attestation contracts. This crate builds against it and never redefines its types. |
-| `fleetos-ebpf` / `fleetos-ebpf-common` | Frozen kernel enforcement plane and shared eBPF ABI layouts (`EbpfPolicyKey`, `DummyIpRouteValue`, …). |
+| `fleetos-core` | Primitives: SPIFFE identity, BLAKE3 fingerprints, SAG policy schema, proto definitions, attestation contracts. This crate builds against it and never redefines its types. |
+| `fleetos-ebpf` / `fleetos-ebpf-common` | Kernel enforcement plane and shared eBPF ABI layouts (`EbpfPolicyKey`, `DummyIpRouteValue`, …). |
 | **`fleetos-control`** | **This crate** — the replicated control plane. |
-| `fleetos-agent` | Per-node executor: runs workloads, enforces eBPF policy, attests, fetches secrets, acquires delegated keys. |
+| `fleetos-agent` | Per-node executor: runs workloads, enforces eBPF policy, attests, fetches secrets, acquires delegated keys |
+| `fleetos-policy-compiler` | Canonical SAG -> eBPF policy compiler shared by fleetos-control and fleetos-agent. |
 | `fleetos-router` / `fleetos-gateway` | Identity-aware routing and egress. |
 | `fleetctl-proxy` | The only Admin-API client (operator-facing). |
 
@@ -111,7 +112,7 @@ allocated `MonotonicVersion`.
   control verifies the quote signature and PCR policy before signing the
   node SVID. EK manufacturer roots are pinned by SHA-256 fingerprint; a
   swapped `.der` fails `cargo test`.
-- **Insecure mode is fenced (R-1):** the join-token-only path fabricates no
+- **Insecure mode is fenced:** the join-token-only path fabricates no
   quote in production builds — it is compiled out under
   `--features production`, and a production binary refuses to boot with
   `mode = "insecure"` unless `allow_insecure_attestation = true` is set
@@ -166,7 +167,7 @@ replay protection.
 | Workload | Expands `WorkloadSpec` → `PodSpec`s, schedules them, records ordinal assignments and placements via Raft. Unconditionally overwrites the six trusted fields (`tenant_id`, `workload_id`, `role`, `image`, `ordinal`, `pod_id`) — caller-submitted values are a tenant-isolation bypass. |
 | Pod | Detects dead pods (missing placement, `live=false`, or stale status report) and replaces them **in place** via `ReassignPodId`; frees ordinal slots on scale-down. |
 | Node | Heartbeat-lease death detection → eviction cascade (delegations + placements + SVID revocation, atomic). |
-| HPA | Metrics-based autoscaling |
+| HPA | Leader-gated controller that consumes PodMetrics from the leader-local `MetricsStore` (CR-CORE-9 ingestion), computes desired replicas against the workload's `AutoscalingPolicy`, and proposes `ScaleWorkload` through Raft. The policy is declarative and read-only here; an absent policy or `enabled == false` is a hard stop (fail-closed). |
 | Cron | Evaluates cron schedules against replicated checkpoints (G-11); triggers runs atomically with checkpoint advance — no double-trigger or lost runs across failover. |
 
 ## Scheduling
@@ -194,7 +195,7 @@ tokens are minted fresh per reconcile cycle. CONTROL pools drive openraft
 membership changes directly, with a quorum guard (G-15) that refuses voter
 removals that would break the cluster.
 
-## Disruption Budgets (CR-CTRL-6)
+## Disruption Budgets
 
 Workloads declare per-role disruption budgets via `DisruptionBudget` in the
 WorkloadSpec. The `BudgetBackedDisruptionGuard` is the structural seam

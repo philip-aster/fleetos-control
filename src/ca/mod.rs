@@ -7,11 +7,9 @@
 //! Both CAs are independent root keypairs with separate trust bundles.
 //! A compromise of one does not compromise the other.
 
-pub mod delegated;
 pub mod grpc_service;
 pub mod key_issuance;
 pub mod name_constraints;
-pub mod oid;
 pub mod rcgen_impl;
 pub mod renewal;
 pub mod trust_bundle;

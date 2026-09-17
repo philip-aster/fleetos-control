@@ -7,7 +7,8 @@ use parking_lot::RwLock;
 use super::CaError;
 use super::trust_bundle::TrustBundle;
 
-use fleetos_core::spiffe::DelegatedSigningKey;
+use fleetos_core::spiffe::{DelegatedSigningKey, WorkloadRole};
+
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -35,7 +36,7 @@ pub fn issue_delegated_key(
     placement_verifier: &dyn PlacementVerifier,
 ) -> Result<DelegatedKeyBundle, CaError> {
     // Step 1: Verify placement (security-critical).
-    placement_verifier.verify_placement(
+    let verified = placement_verifier.verify_placement(
         &request.node_id,
         &request.target_svid_id,
         request.target_ordinal,
@@ -103,6 +104,13 @@ pub fn issue_delegated_key(
         .map_err(CaError::Rcgen)?;
 
     // Step 6: Build the DelegatedSigningKey
+    let target_role = match verified.role {
+        Some(r) => Some(
+            WorkloadRole::try_from(r.as_str())
+                .map_err(|e| CaError::Validation(format!("invalid role from placement: {}", e)))?,
+        ),
+        None => None,
+    };
     let expires_at = issued_at + time::Duration::seconds(request.ttl_secs as i64);
     let delegated_key = DelegatedSigningKey {
         node_id: request.node_id.clone(),
@@ -112,6 +120,7 @@ pub fn issue_delegated_key(
         expires_at_unix: expires_at.unix_timestamp() as u64,
         signing_key: Zeroizing::new(delegated_key_pair.serialize_der()),
         intermediate_cert_der: intermediate_cert.der().to_vec(),
+        target_role,
     };
 
     // Step 7: Serialize the DelegatedSigningKey.
@@ -127,10 +136,12 @@ pub fn issue_delegated_key(
         expires_at_unix: u64,
         signing_key: &'a [u8],
         intermediate_cert_der: &'a [u8],
+        target_role: Option<&'a str>,
     }
 
     let node_id_str = delegated_key.node_id.to_string();
     let target_svid_str = delegated_key.target_svid_id.to_string();
+    let target_role_str_ref = delegated_key.target_role.as_ref().map(|r| r.as_str());
 
     let shadow = DelegatedSigningKeyShadow {
         node_id: &node_id_str,
@@ -140,6 +151,7 @@ pub fn issue_delegated_key(
         expires_at_unix: delegated_key.expires_at_unix,
         signing_key: &delegated_key.signing_key,
         intermediate_cert_der: &delegated_key.intermediate_cert_der,
+        target_role: target_role_str_ref,
     };
 
     let key_bytes = postcard::to_allocvec(&shadow).map_err(CaError::Serialization)?;
@@ -158,6 +170,10 @@ pub fn issue_delegated_key(
     })
 }
 
+pub struct VerifiedPlacement {
+    pub role: Option<String>,
+}
+
 /// Trait for verifying that a workload is placed on a specific node.
 pub trait PlacementVerifier {
     fn verify_placement(
@@ -165,7 +181,7 @@ pub trait PlacementVerifier {
         node_id: &SpiffeId,
         target_svid_id: &SpiffeId,
         target_ordinal: Option<u32>,
-    ) -> Result<(), CaError>;
+    ) -> Result<VerifiedPlacement, CaError>;
 }
 
 /// Placement verifier backed by fjall storage.
@@ -187,7 +203,7 @@ impl PlacementVerifier for StoragePlacementVerifier {
         node_id: &SpiffeId,
         target_svid_id: &SpiffeId,
         target_ordinal: Option<u32>,
-    ) -> Result<(), CaError> {
+    ) -> Result<VerifiedPlacement, CaError> {
         // Query the placements keyspace to verify that target_svid_id/target_ordinal
         // is actually scheduled on node_id.
 
@@ -223,7 +239,12 @@ impl PlacementVerifier for StoragePlacementVerifier {
             );
 
             if candidate == *target_svid_id {
-                return Ok(());
+                let role = if placement.role.is_empty() {
+                    None
+                } else {
+                    Some(placement.role.clone())
+                };
+                return Ok(VerifiedPlacement { role });
             }
         }
 
@@ -257,6 +278,7 @@ mod tests {
         expires_at_unix: u64,
         signing_key: Vec<u8>,
         intermediate_cert_der: Vec<u8>,
+        target_role: Option<String>,
     }
 
     /// Test-only verifier that always passes placement, so these tests
@@ -268,8 +290,10 @@ mod tests {
             _node_id: &SpiffeId,
             _target_svid_id: &SpiffeId,
             _target_ordinal: Option<u32>,
-        ) -> Result<(), CaError> {
-            Ok(())
+        ) -> Result<VerifiedPlacement, CaError> {
+            Ok(VerifiedPlacement {
+                role: Some("replica".to_owned()),
+            })
         }
     }
 
@@ -331,27 +355,85 @@ mod tests {
     /// signer stamps degraded=true plus role/ordinal.
     #[test]
     fn delegated_intermediate_still_signs_end_entity_svids() {
-        let key = issue_and_deserialize();
+        let key_mirror = issue_and_deserialize();
 
-        let csr_params = crate::ca::rcgen_impl::SvidParams {
-            spiffe_id: "spiffe://fleet.example.internal/ns/tenant-1/sa/db".to_owned(),
-            kind: crate::ca::rcgen_impl::SvidKind::Workload,
-            role: None,      // not embedded in CSR; passed to the signer below
-            ordinal: None,   // not embedded in CSR; passed to the signer below
-            degraded: false, // signer stamps degraded=true on the delegated path
-            ttl_secs: 3600,
+        let node_id: SpiffeId = key_mirror.node_id.parse().unwrap();
+        let target_svid_id: SpiffeId = key_mirror.target_svid_id.parse().unwrap();
+        let target_role = key_mirror
+            .target_role
+            .map(|r| WorkloadRole::try_from(r.as_str()).unwrap());
+
+        let core_key = fleetos_core::spiffe::DelegatedSigningKey {
+            node_id,
+            target_svid_id: target_svid_id.clone(),
+            target_ordinal: key_mirror.target_ordinal,
+            target_role,
+            issued_at_unix: key_mirror.issued_at_unix,
+            expires_at_unix: key_mirror.expires_at_unix,
+            signing_key: zeroize::Zeroizing::new(key_mirror.signing_key),
+            intermediate_cert_der: key_mirror.intermediate_cert_der.clone(),
         };
-        let csr = crate::ca::rcgen_impl::build_csr(&csr_params).unwrap();
 
-        let signed = crate::ca::delegated::sign_with_delegated_key(
-            &csr.csr_der,
-            key.signing_key.as_slice(),
-            &key.intermediate_cert_der,
-            Some("replica"),
-            Some(0),
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let csr = fleetos_core::spiffe::ca::build_csr(&target_svid_id, &leaf_key).unwrap();
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+        let leaf_der = fleetos_core::spiffe::ca::sign_svid_delegated(
+            &core_key,
+            &csr.der,
+            std::time::Duration::from_secs(3600),
+            now,
         )
         .expect("end-entity signing under a pathLen=0 intermediate must succeed");
-        assert!(!signed.is_empty());
+
+        assert!(!leaf_der.is_empty());
+
+        let spiffe_id = fleetos_core::spiffe::extract_spiffe_id(&leaf_der).unwrap();
+        assert_eq!(spiffe_id, target_svid_id);
+        assert!(fleetos_core::spiffe::is_degraded(&leaf_der));
+
+        let extracted_role = fleetos_core::spiffe::extract_role(&leaf_der).unwrap();
+        assert_eq!(extracted_role.as_str(), "replica");
+
+        let extracted_ordinal = fleetos_core::spiffe::extract_ordinal(&leaf_der).unwrap();
+        assert_eq!(extracted_ordinal, 0);
+
+        // Verify the leaf chains to the intermediate (pathLen=0 regression).
+        // We use x509-parser directly rather than validate_svid because the
+        // intermediate carries URI NameConstraints (spiffe://) that webpki
+        // cannot match; the pathLen=0 property is what this test covers.
+        let (_, leaf_cert) =
+            x509_parser::parse_x509_certificate(&leaf_der).expect("leaf cert must parse");
+        let (_, int_cert) = x509_parser::parse_x509_certificate(&key_mirror.intermediate_cert_der)
+            .expect("intermediate cert must parse");
+        assert_eq!(
+            leaf_cert.issuer(),
+            int_cert.subject(),
+            "leaf issuer must match intermediate subject"
+        );
+        leaf_cert
+            .verify_signature(Some(&int_cert.subject_pki))
+            .expect("leaf signature must verify against intermediate");
+        // Confirm pathLen=0 is present on the intermediate.
+        let bc_ext = int_cert
+            .extensions()
+            .iter()
+            .find(|e| matches!(e.parsed_extension(), ParsedExtension::BasicConstraints(_)))
+            .expect("intermediate must carry BasicConstraints");
+        if let ParsedExtension::BasicConstraints(bc) = bc_ext.parsed_extension() {
+            assert!(bc.ca, "intermediate must be a CA");
+            assert_eq!(bc.path_len_constraint, Some(0), "pathLen must be 0");
+        }
+        // The leaf must NOT be a CA (end-entity).
+        if let Some(ext) = leaf_cert
+            .extensions()
+            .iter()
+            .find(|e| matches!(e.parsed_extension(), ParsedExtension::BasicConstraints(_)))
+        {
+            if let ParsedExtension::BasicConstraints(bc) = ext.parsed_extension() {
+                assert!(!bc.ca, "leaf must not be a CA");
+            }
+        }
     }
 
     /// The postcard wire layout must round-trip through the mirror with every
@@ -372,5 +454,6 @@ mod tests {
             request.ttl_secs,
             "expiry must be exactly issued_at + ttl_secs"
         );
+        assert_eq!(key.target_role, Some("replica".to_owned())); // Pins placement->key binding
     }
 }
