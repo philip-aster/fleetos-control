@@ -43,3 +43,5 @@ pub const TENANT_QUOTA_KEYSPACE: &str = "app_tenant_quotas";
 pub const CONTROL_ADDRESS_KEYSPACE: &str = "app_control_addresses";
 pub const NODE_EK_KEYSPACE: &str = "app_node_eks";
 pub const PENDING_ACTIVATION_KEYSPACE: &str = "app_pending_activations";
+
+pub const VPA_RECOMMENDATION_KEYSPACE: &str = "app_vpa_recommendations";

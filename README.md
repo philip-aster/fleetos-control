@@ -70,7 +70,7 @@ each commit it publishes `SagUpdateEvent`, `ScheduleUpdateEvent`,
 `RouteUpdateEvent`, and `WatchEvent`s into the `BroadcastHub`, which feeds
 the gRPC watch streams.
 
-Every command can carry an `AuditContext` (G-2/G-3): the audit record is
+Every command can carry an `AuditContext`: the audit record is
 written in the **same batch** as the mutation it describes, keyed by the
 allocated `MonotonicVersion`.
 
@@ -80,11 +80,11 @@ allocated `MonotonicVersion`.
 |---|---|
 | `raft/` | openraft config, fjall log storage, state machine, snapshot builder, TLS transport, `RaftTransport` server |
 | `storage/` | fjall database + keyspace initialization, composite key schemas, `VersionedState` (MonotonicVersion) |
-| `ca/` | Dual root CAs, SVID signing (`rcgen`), URI NameConstraints, delegated key issuance, SVID renewal (G-5), `CaService` gRPC |
+| `ca/` | Dual root CAs, SVID signing (`rcgen`), URI NameConstraints, delegated key issuance, SVID renewal, `CaService` gRPC |
 | `attestation/` | Nonce manager (rate-capped), join-token store, PCR policies, EK certificate chain validation (SHA-256-pinned manufacturer roots), `AttestationService` gRPC |
 | `admin/` | `AdminService` gRPC — the only surface for `fleetctl-proxy` and operators |
 | `apply/` | Server-side three-way merge engine for declarative `fleetctl apply` |
-| `controllers/` | Leader-gated workload / pod / node / cron / hpa reconcilers |
+| `controllers/` | Leader-gated workload / pod / node / cron / hpa / vpa reconcilers |
 | `disruption/` | Disruption budget model consulted by `EvictNode`/drain |
 | `scheduler/` | Filter+score engine (capacity, anti-affinity, topology spread, bin-packing), read-only ordinal tracker |
 | `policy/` | SAG → eBPF entry compilation, precedence, port validation, fingerprint wrapper, staleness |
@@ -120,7 +120,7 @@ allocated `MonotonicVersion`.
 - **SVID lifecycle:** short TTLs (default 1 h), versioned per SPIFFE ID
   through Raft (`UpsertSvidVersion`). Control renews its own SVIDs at 50 %
   of TTL by hot-swapping dynamic TLS resolvers without dropping connections.
-- **Revocation (G-4 / CR-5):** evicting a node atomically marks it evicted,
+- **Revocation:** evicting a node atomically marks it evicted,
   revokes **all** its delegations, removes its placements, and records its
   SVID in the revoked set — one Raft entry. The revoked set is broadcast via
   `WatchSag`, and every mTLS listener rejects revoked peers fail-closed.
@@ -167,8 +167,9 @@ replay protection.
 | Workload | Expands `WorkloadSpec` → `PodSpec`s, schedules them, records ordinal assignments and placements via Raft. Unconditionally overwrites the six trusted fields (`tenant_id`, `workload_id`, `role`, `image`, `ordinal`, `pod_id`) — caller-submitted values are a tenant-isolation bypass. |
 | Pod | Detects dead pods (missing placement, `live=false`, or stale status report) and replaces them **in place** via `ReassignPodId`; frees ordinal slots on scale-down. |
 | Node | Heartbeat-lease death detection → eviction cascade (delegations + placements + SVID revocation, atomic). |
-| HPA | Leader-gated controller that consumes PodMetrics from the leader-local `MetricsStore` (CR-CORE-9 ingestion), computes desired replicas against the workload's `AutoscalingPolicy`, and proposes `ScaleWorkload` through Raft. The policy is declarative and read-only here; an absent policy or `enabled == false` is a hard stop (fail-closed). |
-| Cron | Evaluates cron schedules against replicated checkpoints (G-11); triggers runs atomically with checkpoint advance — no double-trigger or lost runs across failover. |
+| HPA | Leader-gated controller that consumes PodMetrics from the leader-local `MetricsStore`, computes desired replicas against the workload's `AutoscalingPolicy`, and proposes `ScaleWorkload` through Raft. The policy is declarative and read-only here; an absent policy or `enabled == false` is a hard stop (fail-closed). |
+| VPA | CR-CTRL-11 vertical autoscaler: consumes PodMetrics from the leader-local `MetricsStore` and computes recommended per-pod footprints (vcpus + memory) against the workload's `VerticalAutoscalingPolicy` — one target per dimension, each dimension sized by its own metric (no max-across step; that's HPA's). `OFF` mode replicates recommendations only (`UpsertVpaRecommendation`, snapshot-included `app_vpa_recommendations` keyspace); `RECREATE` applies via `ResizeWorkload` plus ordinal-preserving replacement of stale pods. Anti-thrash: ±deadband while both dimensions are in band, stabilization window on shrinks only (grows are immediate). Replacements route through the `DisruptionGuard` under `DisruptionTarget::VerticalResize`; grows pre-check tenant quotas; HPA↔VPA mutual exclusion (CPU↔CPU, memory↔memory) is enforced at admission and runtime. |
+| Cron | Evaluates cron schedules against replicated checkpoints; triggers runs atomically with checkpoint advance — no double-trigger or lost runs across failover. |
 
 ## Scheduling
 
@@ -192,14 +193,14 @@ tenant/placement state they belong to.
 Outbound-only, poll-based client to an externally implemented
 `ProvisioningService` shim. Node pools are Raft-replicated records; join
 tokens are minted fresh per reconcile cycle. CONTROL pools drive openraft
-membership changes directly, with a quorum guard (G-15) that refuses voter
+membership changes directly, with a quorum guard that refuses voter
 removals that would break the cluster.
 
 ## Disruption Budgets
 
 Workloads declare per-role disruption budgets via `DisruptionBudget` in the
 WorkloadSpec. The `BudgetBackedDisruptionGuard` is the structural seam
-consulted by every disruptive mutation: HPA scale-down, node eviction/drain,
+consulted by every disruptive mutation: HPA/VPA scale-down, node eviction/drain,
 and workload deletion.
 
 Semantics:
@@ -278,8 +279,7 @@ See `control.example.toml`. Key sections: `cluster` (`bootstrap` vs `join`
 mode), `trust_domains`, `svid` TTL policy (owned here, not in
 `fleetos-core`), `dummy_ip`, `secrets` (master key path), `attestation`
 (mode + join-token TTL + the production opt-in), `tpm` backend, `listeners`,
-`health` lease timings, `raft` tuning, `operators` (CR-8 JIT bootstrap
-admins), `provisioning`, `telemetry`, `graceful_shutdown`.
+`health` lease timings, `raft` tuning, `operators`, `provisioning`, `telemetry`, `graceful_shutdown`.
 
 ## Build, run, test
 

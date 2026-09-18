@@ -249,3 +249,22 @@ pub struct NodeTaint {
     pub effect: String,
     pub time_added_unix: i64,
 }
+
+/// A replicated VPA recommendation for a workload (CR-CTRL-11).
+///
+/// Written by the VPA controller when the recommendation changes (deadband
+/// suppresses churn). Keyed by `{tenant_id}:{workload_id}` in the
+/// `app_vpa_recommendations` keyspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpaRecommendationRecord {
+    pub tenant_id: String,
+    pub workload_id: String,
+    pub recommended_vcpus: u32,
+    pub recommended_memory_mb: u32,
+    pub current_vcpus: u32,
+    pub current_memory_mb: u32,
+    /// Unix timestamp captured by the leader before proposal (determinism).
+    pub computed_at_unix: i64,
+    /// "OFF" | "RECREATE" — the mode active when this recommendation was computed.
+    pub mode: String,
+}

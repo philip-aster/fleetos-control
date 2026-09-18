@@ -82,6 +82,24 @@ impl WorkloadController {
                         role_str,
                         ordinal,
                     )?;
+                    if let Some(assignment) = &existing {
+                        if assignment.current_pod_id.is_some() {
+                            // Slot occupied: only skip if the placement actually exists.
+                            // A missing placement (e.g., VPA removed it) means this
+                            // ordinal must be re-scheduled, not skipped.
+                            let placement_exists = cluster_state.placements.iter().any(|p| {
+                                p.tenant_id == spec.tenant_id
+                                    && p.service == spec.workload_id
+                                    && p.role == *role_str
+                                    && p.ordinal == ordinal
+                            });
+                            if placement_exists {
+                                continue;
+                            }
+                        }
+                        // Freed slot (current_pod_id: None) or missing placement:
+                        // fall through to scheduling.
+                    }
                     if existing.is_some() {
                         continue;
                     }

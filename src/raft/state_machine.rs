@@ -192,6 +192,27 @@ impl FjallStateMachine {
                 Ok(ChangeKind::SchedulingUpdate)
             }
 
+            FleetosCommand::ResizeWorkload { record } => {
+                // Replace the stored spec with the updated footprint.
+                // Unlike ScaleWorkload, we do NOT prune placements here — the VPA
+                // controller drives stale-pod replacement separately (Orchestrator
+                // guardrail #3: intermediate state is handled gracefully).
+                let key = format!("{}:{}", record.tenant_id, record.workload_id);
+                let value = postcard::to_allocvec(record).map_err(ser_err)?;
+                batch.insert(&self.keyspaces.workloads, key.as_bytes(), value.as_slice());
+                Ok(ChangeKind::SchedulingUpdate)
+            }
+            FleetosCommand::UpsertVpaRecommendation { record } => {
+                let key = format!("{}:{}", record.tenant_id, record.workload_id);
+                let value = postcard::to_allocvec(record).map_err(ser_err)?;
+                batch.insert(
+                    &self.keyspaces.vpa_recommendations,
+                    key.as_bytes(),
+                    value.as_slice(),
+                );
+                Ok(ChangeKind::SchedulingUpdate)
+            }
+
             FleetosCommand::SetTenantQuota { record } => {
                 let value = postcard::to_allocvec(record).map_err(ser_err)?;
                 batch.insert(
@@ -1027,6 +1048,8 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::RevokeOperatorAccess { .. } => "RevokeOperatorAccess",
         FleetosCommand::DeleteWorkload { .. } => "DeleteWorkload",
         FleetosCommand::ScaleWorkload { .. } => "ScaleWorkload",
+        FleetosCommand::ResizeWorkload { .. } => "ResizeWorkload",
+        FleetosCommand::UpsertVpaRecommendation { .. } => "UpsertVpaRecommendation",
         FleetosCommand::SetTenantQuota { .. } => "SetTenantQuota",
         FleetosCommand::RegisterControlAddress { .. } => "RegisterControlAddress",
         FleetosCommand::UpsertSvidVersion { .. } => "UpsertSvidVersion",

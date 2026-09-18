@@ -806,6 +806,7 @@ mod tests {
             keyspaces.operator_grants.clone(),
             keyspaces.workload_status.clone(),
             keyspaces.tenant_quotas.clone(),
+            keyspaces.vpa_recommendations.clone(),
         ));
         let metrics = MetricsStore::new(keyspaces.placements.clone());
         (raft, keyspaces, storage, metrics)

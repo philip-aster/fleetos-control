@@ -35,6 +35,8 @@ pub const EVENT_TYPES: &[&str] = &[
     "Evicting",
     "GracePeriodExpired",
     "FailedScheduling",
+    "Resizing",
+    "Resized",
 ];
 
 pub fn is_valid_event_type(event_type: &str) -> bool {

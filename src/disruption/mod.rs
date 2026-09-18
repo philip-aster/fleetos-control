@@ -31,6 +31,8 @@ pub enum DisruptionTarget {
     ScaleDown,
     /// Workload deletion (scale-to-zero).
     Delete,
+    /// VPA vertical resize (replaces pods at a new footprint).
+    VerticalResize,
 }
 
 /// Why a disruption was denied. Carries enough state for the caller to

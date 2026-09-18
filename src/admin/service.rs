@@ -669,6 +669,45 @@ impl AdminService for AdminServiceImpl {
         if let Some(pod_spec) = spec.pod_spec.as_ref() {
             validate_init_containers(pod_spec)?;
         }
+
+        // CR-CTRL-11: validate VerticalAutoscalingPolicy at admission.
+        if let Some(vpa) = spec.vertical_autoscaling.as_ref() {
+            if vpa.enabled {
+                let cpu_active = vpa.target_cpu_utilization_percent > 0;
+                let mem_active = vpa.target_memory_utilization_percent > 0;
+                if !cpu_active && !mem_active {
+                    return Err(Status::invalid_argument(
+                        "vertical_autoscaling enabled but no active targets",
+                    ));
+                }
+                if vpa.min_vcpus > vpa.max_vcpus {
+                    return Err(Status::invalid_argument(
+                        "vertical_autoscaling min_vcpus > max_vcpus",
+                    ));
+                }
+                if vpa.min_memory_bytes > vpa.max_memory_bytes {
+                    return Err(Status::invalid_argument(
+                        "vertical_autoscaling min_memory > max_memory",
+                    ));
+                }
+                // HPA conflict rule: CPU↔CPU, memory↔memory mutual exclusion.
+                if let Some(hpa) = spec.autoscaling.as_ref() {
+                    if hpa.enabled {
+                        if cpu_active && hpa.target_cpu_millicores > 0 {
+                            return Err(Status::invalid_argument(
+                                "vertical_autoscaling CPU target conflicts with HPA CPU target",
+                            ));
+                        }
+                        if mem_active && hpa.target_memory_bytes > 0 {
+                            return Err(Status::invalid_argument(
+                                "vertical_autoscaling memory target conflicts with HPA memory target",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // CR-7: enforce tenant quota before storing the workload.
         self.check_tenant_quota(&spec.tenant_id, &spec)?;
 
@@ -689,6 +728,37 @@ impl AdminService for AdminServiceImpl {
 
         tracing::info!(tenant_id = %spec.tenant_id, workload_id = %spec.workload_id, "workload spec submitted via raft");
         Ok(Response::new(WorkloadSpecAck { accepted: true }))
+    }
+
+    async fn get_vpa_status(
+        &self,
+        request: Request<fleetos_core::proto::admin::GetVpaStatusRequest>,
+    ) -> Result<Response<fleetos_core::proto::admin::GetVpaStatusResponse>, Status> {
+        self.verify_caller(&request)?;
+        self.require_read_access(&request)?;
+        let req = request.into_inner();
+        validate_identifier(&req.tenant_id, "tenant_id")?;
+        validate_identifier(&req.workload_id, "workload_id")?;
+
+        let rec = self
+            .storage
+            .get_vpa_recommendation(&req.tenant_id, &req.workload_id)
+            .map_err(|e| Status::internal(format!("VPA recommendation lookup failed: {}", e)))?;
+
+        let recommendation = rec.map(|r| fleetos_core::proto::admin::VpaRecommendation {
+            tenant_id: r.tenant_id,
+            workload_id: r.workload_id,
+            recommended_vcpus: r.recommended_vcpus,
+            recommended_memory_mb: r.recommended_memory_mb,
+            current_vcpus: r.current_vcpus,
+            current_memory_mb: r.current_memory_mb,
+            computed_at_unix: r.computed_at_unix as u64,
+            mode: r.mode,
+        });
+
+        Ok(Response::new(
+            fleetos_core::proto::admin::GetVpaStatusResponse { recommendation },
+        ))
     }
 
     async fn list_nodes(
@@ -2498,6 +2568,7 @@ mod delegated_key_authz_tests {
             keyspaces.operator_grants.clone(),
             keyspaces.workload_status.clone(),
             keyspaces.tenant_quotas.clone(),
+            keyspaces.vpa_recommendations.clone(),
         ));
         let bundle =
             crate::ca::trust_bundle::TrustBundle::generate_root("fleet.example.internal").unwrap();

@@ -35,6 +35,7 @@ pub struct StorageEngine {
     pub operator_grants: Keyspace,
     pub workload_status: Keyspace,
     pub tenant_quotas: Keyspace,
+    pub vpa_recommendations: Keyspace,
 }
 
 impl StorageEngine {
@@ -64,6 +65,7 @@ impl StorageEngine {
         operator_grants: Keyspace,
         workload_status: Keyspace,
         tenant_quotas: Keyspace,
+        vpa_recommendations: Keyspace,
     ) -> Self {
         Self {
             version,
@@ -90,6 +92,7 @@ impl StorageEngine {
             operator_grants,
             workload_status,
             tenant_quotas,
+            vpa_recommendations,
         }
     }
 
@@ -367,5 +370,28 @@ impl StorageEngine {
         }
 
         Ok((total_cpu, total_memory, workload_count))
+    }
+
+    /// Get the VPA recommendation for a workload (CR-CTRL-11).
+    pub fn get_vpa_recommendation(
+        &self,
+        tenant_id: &str,
+        workload_id: &str,
+    ) -> Result<Option<crate::raft::records::VpaRecommendationRecord>, crate::storage::StorageError>
+    {
+        let key = format!("{}:{}", tenant_id, workload_id);
+        match self
+            .vpa_recommendations
+            .get(key.as_bytes())
+            .map_err(crate::storage::StorageError::Storage)?
+        {
+            Some(bytes) => {
+                let record: crate::raft::records::VpaRecommendationRecord =
+                    postcard::from_bytes(&bytes)
+                        .map_err(crate::storage::StorageError::Serialization)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
     }
 }

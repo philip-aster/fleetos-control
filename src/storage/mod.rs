@@ -134,6 +134,9 @@ pub fn init_keyspaces(db: &Database) -> Result<Keyspaces, StorageError> {
         pending_activations: db
             .keyspace(tables::PENDING_ACTIVATION_KEYSPACE, opts)
             .map_err(StorageError::Open)?,
+        vpa_recommendations: db
+            .keyspace(tables::VPA_RECOMMENDATION_KEYSPACE, opts)
+            .map_err(StorageError::Open)?,
     })
 }
 
@@ -174,6 +177,7 @@ pub struct Keyspaces {
     pub control_addresses: fjall::Keyspace,
     pub node_eks: fjall::Keyspace,
     pub pending_activations: fjall::Keyspace,
+    pub vpa_recommendations: fjall::Keyspace,
 }
 
 impl Keyspaces {
@@ -214,6 +218,10 @@ impl Keyspaces {
             (tables::CRON_CHECKPOINT_KEYSPACE, &self.cron_checkpoints),
             (tables::CONTROL_ADDRESS_KEYSPACE, &self.control_addresses),
             (tables::NODE_EK_KEYSPACE, &self.node_eks),
+            (
+                tables::VPA_RECOMMENDATION_KEYSPACE,
+                &self.vpa_recommendations,
+            ),
         ]
     }
 }

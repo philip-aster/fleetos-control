@@ -49,6 +49,17 @@ pub enum FleetosCommand {
     ScaleWorkload {
         record: records::WorkloadSpecRecord,
     },
+    /// Update a workload's resource footprint (CR-CTRL-11 VPA RECREATE mode).
+    /// The state machine replaces the stored spec; the VPA controller then
+    /// drives replacement of stale pods through the ordinal-preserving path.
+    ResizeWorkload {
+        record: records::WorkloadSpecRecord,
+    },
+    /// Upsert the VPA recommendation for a workload (CR-CTRL-11).
+    /// Written only when the recommendation changes (deadband suppresses churn).
+    UpsertVpaRecommendation {
+        record: records::VpaRecommendationRecord,
+    },
     /// Set or replace the resource quota for a tenant (CR-7).
     SetTenantQuota {
         record: records::TenantQuotaRecord,

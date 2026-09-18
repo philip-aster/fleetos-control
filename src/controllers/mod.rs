@@ -16,6 +16,7 @@ pub mod hpa_controller;
 pub mod leader;
 pub mod node_controller;
 pub mod pod_controller;
+pub mod vpa_controller;
 pub mod workload_controller;
 
 pub use cron_controller::CronController;

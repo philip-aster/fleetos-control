@@ -18,7 +18,7 @@ use fleetos_control::config::{AttestationMode, ClusterMode, ControlConfig};
 use fleetos_control::controllers::leader::{ControllerFactory, LeaderGate};
 use fleetos_control::controllers::{
     CronController, WorkloadController, hpa_controller::HpaController,
-    node_controller::NodeController, pod_controller::PodController,
+    node_controller::NodeController, pod_controller::PodController, vpa_controller::VpaController,
 };
 use fleetos_control::dummy_ip::allocator::DummyIpAllocator;
 use fleetos_control::provisioning::control_pool::ControlPoolManager;
@@ -236,6 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyspaces.operator_grants.clone(),
         keyspaces.workload_status.clone(),
         keyspaces.tenant_quotas.clone(),
+        keyspaces.vpa_recommendations.clone(),
     ));
 
     // JoinHandles for the gRPC listeners, awaited during graceful shutdown.
@@ -467,6 +468,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         disruption_guard.clone(),
     ));
 
+    let vpa_controller = Arc::new(VpaController::new(
+        storage_engine.clone(),
+        metrics_store.clone(),
+        raft_handle.raft.clone(),
+        disruption_guard.clone(),
+        pod_event_emitter.clone(),
+    ));
+
     // --- Phase 8: Controller factory and leader gate ---
     let controller_factory = Arc::new(FleetosControllerFactory {
         workload_controller: workload_controller.clone(),
@@ -474,6 +483,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_controller: node_controller.clone(),
         cron_controller: cron_controller.clone(),
         hpa_controller: hpa_controller.clone(),
+        vpa_controller: vpa_controller.clone(),
         storage_engine: storage_engine.clone(),
         node_lease_timeout_secs: config.health.node_lease_timeout_secs,
         node_check_interval_secs: config.health.node_check_interval_secs,
@@ -1476,6 +1486,7 @@ struct FleetosControllerFactory {
     node_controller: Arc<NodeController>,
     cron_controller: Arc<CronController>,
     hpa_controller: Arc<HpaController>,
+    vpa_controller: Arc<VpaController>,
     storage_engine: Arc<fleetos_control::storage::StorageEngine>,
     node_lease_timeout_secs: i64,
     node_check_interval_secs: u64,
@@ -1732,6 +1743,19 @@ impl ControllerFactory for FleetosControllerFactory {
                 interval.tick().await;
                 if let Err(e) = hpa.evaluate().await {
                     tracing::warn!(error = %e, "HPA evaluation cycle failed");
+                }
+            }
+        });
+
+        // VPA controller (CR-CTRL-11): evaluate vertical autoscaling every 30s.
+        let vpa = self.vpa_controller.clone();
+        join_set.spawn(async move {
+            tracing::info!("VPA controller started");
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(e) = vpa.evaluate().await {
+                    tracing::warn!(error = %e, "VPA evaluation cycle failed");
                 }
             }
         });
