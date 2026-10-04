@@ -3,15 +3,14 @@
 //! The state machine's publish path AND the watch services' initial frame both
 //! call these builders, so the frame and the deltas can never diverge
 //! (single-canonical-builder principle). All reads are over committed state.
-
-use fjall::Keyspace;
-use prost::Message;
-
 use crate::delegation::DelegationRecord;
 use crate::raft::records::{RevokedSvidRecord, WorkloadSpecRecord};
 use crate::scheduler::Placement;
 use crate::watch::router_assignment::RouteEntryRecord;
 use crate::watch::scheduler_stream::WorkloadAssignmentRecord;
+use fjall::Keyspace;
+use prost::Message;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Snapshot of SAG rules + revocation sets (for `SagUpdate`).
 pub struct SagSnapshot {
@@ -34,7 +33,6 @@ pub fn build_sag_snapshot(
         rules_bytes.extend_from_slice(&(rule_bytes.len() as u32).to_le_bytes());
         rules_bytes.extend_from_slice(rule_bytes);
     }
-
     let mut revoked_delegation_ids: Vec<Vec<u8>> = Vec::new();
     for guard in revoked_delegations.prefix(Vec::<u8>::new()) {
         let Ok(value) = guard.value() else { continue };
@@ -42,7 +40,6 @@ pub fn build_sag_snapshot(
             revoked_delegation_ids.push(record.delegation_id.into_bytes());
         }
     }
-
     let mut revoked_spiffe_ids: Vec<String> = Vec::new();
     for guard in revoked_svids.prefix(Vec::<u8>::new()) {
         let Ok(value) = guard.value() else { continue };
@@ -50,7 +47,6 @@ pub fn build_sag_snapshot(
             revoked_spiffe_ids.push(record.spiffe_id);
         }
     }
-
     SagSnapshot {
         rules_bytes,
         revoked_delegation_ids,
@@ -58,8 +54,42 @@ pub fn build_sag_snapshot(
     }
 }
 
-/// Build the postcard-encoded `Vec<WorkloadAssignmentRecord>` for a
-/// `ScheduleUpdate`, expanding the full `PodSpec` per placement (CR-CTRL-4).
+/// CORE-WI-5: build an index of `(tenant, service) -> set of source SPIFFE URIs`
+/// from the committed SAG rules.
+///
+/// For every SAG rule `from -> to`, the `from` service is a source that depends
+/// on the `to` destination. The index maps each destination to the set of full
+/// SPIFFE URIs of its sources. `BTreeSet` guarantees deterministic ordering
+/// across replicas. Self-referential rules (`A -> A`) naturally include the
+/// destination in its own source set; non-self-referential destinations do not
+/// appear in their own set.
+fn compute_source_index(
+    sag_rules: &Keyspace,
+    data_trust_domain: &str,
+) -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut index: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for guard in sag_rules.prefix(Vec::<u8>::new()) {
+        let Ok(value) = guard.value() else { continue };
+        let Ok(rule) = fleetos_core::proto::state::SagRule::decode(value.as_ref()) else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (&rule.from, &rule.to) else {
+            continue;
+        };
+        let source_svid = format!(
+            "spiffe://{}/ns/{}/sa/{}",
+            data_trust_domain, from.tenant, from.service_name
+        );
+        index
+            .entry((to.tenant.clone(), to.service_name.clone()))
+            .or_default()
+            .insert(source_svid);
+    }
+    index
+}
+
+/// Build the postcard-encoded  `Vec<WorkloadAssignmentRecord>`  for a
+///  `ScheduleUpdate` , expanding the full  `PodSpec`  per placement (CR-CTRL-4).
 pub fn build_schedule_snapshot(
     placements: &Keyspace,
     workloads: &Keyspace,
@@ -71,7 +101,6 @@ pub fn build_schedule_snapshot(
         let Ok(placement) = postcard::from_bytes::<Placement>(value.as_ref()) else {
             continue;
         };
-        // Compute canonical hostname (Directive A.1)
         let hostname = fleetos_core::naming::dummy_ip_hostname(
             &placement.service,
             &placement.role,
@@ -79,7 +108,6 @@ pub fn build_schedule_snapshot(
             data_trust_domain,
         )
         .unwrap_or_default();
-
         let spec = lookup_workload_spec(workloads, &placement.tenant_id, &placement.service);
         let (runtime, image, pod_spec_bytes) = match spec {
             Some(spec) => {
@@ -113,12 +141,17 @@ pub fn build_schedule_snapshot(
     postcard::to_allocvec(&records).unwrap_or_default()
 }
 
-/// Build the postcard-encoded `Vec<RouteEntryRecord>` for a `RouteUpdate`.
+/// Build the postcard-encoded  `Vec<RouteEntryRecord>`  for a  `RouteUpdate` .
+///
+/// CORE-WI-5: also derives `source_spiffe_ids` per route from the committed
+/// SAG rules via `compute_source_index`.
 pub fn build_routes_snapshot(
     placements: &Keyspace,
     dummy_ips: &Keyspace,
+    sag_rules: &Keyspace,
     data_trust_domain: &str,
 ) -> Vec<u8> {
+    let source_index = compute_source_index(sag_rules, data_trust_domain);
     let mut records: Vec<RouteEntryRecord> = Vec::new();
     for guard in placements.prefix(Vec::<u8>::new()) {
         let Ok(value) = guard.value() else { continue };
@@ -141,11 +174,16 @@ pub fn build_routes_snapshot(
             "spiffe://{}/ns/{}/sa/{}",
             data_trust_domain, placement.tenant_id, placement.service
         );
+        let source_spiffe_ids = source_index
+            .get(&(placement.tenant_id.clone(), placement.service.clone()))
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
         records.push(RouteEntryRecord {
             destination_svid,
             destination_role: placement.role.clone(),
             target_agent_svid: placement.node_id.to_string(),
             dummy_ip,
+            source_spiffe_ids,
         });
     }
     postcard::to_allocvec(&records).unwrap_or_default()

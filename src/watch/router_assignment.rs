@@ -10,7 +10,11 @@
 //!
 //! `RouteEntry.dummy_ip` is emitted as the canonical u32 value; the
 //! big-endian eBPF-map conversion is agent-side (`HostOrderIpv4::from_network`).
-
+//!
+//! CORE-WI-5: `RouteEntry.source_spiffe_ids` carries the set of service
+//! SPIFFE URIs that depend on this route (derived from SAG rules), so agents
+//! can compute `router_connected` from outbound dependencies rather than
+//! destination membership.
 use super::broadcast::BroadcastHub;
 use fleetos_core::proto::state::{RouteEntry, RouteUpdate, RouterAssignmentService, WatchRequest};
 use std::pin::Pin;
@@ -26,6 +30,8 @@ pub struct RouteEntryRecord {
     pub destination_role: String,
     pub target_agent_svid: String,
     pub dummy_ip: u32,
+    /// CORE-WI-5: full SPIFFE URIs of services that depend on this route.
+    pub source_spiffe_ids: Vec<String>,
 }
 
 /// The RouterAssignmentService gRPC implementation.
@@ -33,6 +39,8 @@ pub struct RouterAssignmentServiceImpl {
     hub: Arc<BroadcastHub>,
     placements: fjall::Keyspace,
     dummy_ips: fjall::Keyspace,
+    /// CORE-WI-5: SAG rules keyspace, used to derive per-route source sets.
+    sag_rules: fjall::Keyspace,
     versioned_state: crate::storage::version::VersionedState,
     data_trust_domain: String,
 }
@@ -42,6 +50,7 @@ impl RouterAssignmentServiceImpl {
         hub: Arc<BroadcastHub>,
         placements: fjall::Keyspace,
         dummy_ips: fjall::Keyspace,
+        sag_rules: fjall::Keyspace,
         versioned_state: crate::storage::version::VersionedState,
         data_trust_domain: String,
     ) -> Self {
@@ -49,6 +58,7 @@ impl RouterAssignmentServiceImpl {
             hub,
             placements,
             dummy_ips,
+            sag_rules,
             versioned_state,
             data_trust_domain,
         }
@@ -67,13 +77,12 @@ impl RouterAssignmentService for RouterAssignmentServiceImpl {
         // ORDERING (adjudication Q6): subscribe FIRST, then read committed
         // state, then yield frame one, then stream deltas.
         let mut rx = self.hub.subscribe_routes();
-
         let routes_bytes = super::snapshot::build_routes_snapshot(
             &self.placements,
             &self.dummy_ips,
+            &self.sag_rules,
             &self.data_trust_domain,
         );
-
         let frame_one = match deserialize_routes(&routes_bytes) {
             Ok(routes) => RouteUpdate {
                 version: self.versioned_state.current_version().get(),
@@ -84,7 +93,6 @@ impl RouterAssignmentService for RouterAssignmentServiceImpl {
                 return Err(Status::internal("failed to build initial routes frame"));
             }
         };
-
         let stream = async_stream::stream! {
             yield Ok(frame_one);
             loop {
@@ -128,6 +136,7 @@ fn deserialize_routes(bytes: &[u8]) -> Result<Vec<RouteEntry>, super::WatchError
             destination_role: r.destination_role,
             target_agent_svid: r.target_agent_svid,
             dummy_ip: r.dummy_ip,
+            source_spiffe_ids: r.source_spiffe_ids,
         })
         .collect())
 }

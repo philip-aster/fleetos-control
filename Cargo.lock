@@ -1111,7 +1111,7 @@ checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 
 [[package]]
 name = "fleetos-control"
-version = "0.1.4-rc-1"
+version = "0.1.4-rc.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1171,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "fleetos-core"
-version = "0.2.0-rc-4"
+version = "0.2.1-rc.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1182,6 +1182,7 @@ dependencies = [
  "der 0.8.1",
  "ecdsa",
  "p256",
+ "postcard",
  "prost",
  "rand 0.10.2",
  "rcgen",
@@ -1199,7 +1200,6 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tss-esapi",
- "vsock",
  "x25519-dalek",
  "x509-cert",
  "x509-parser",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "fleetos-ebpf-common"
-version = "0.1.3-rc-2"
+version = "0.1.3-rc-3"
 dependencies = [
  "bytemuck",
  "fleetos-core",
@@ -1944,15 +1944,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "memoffset"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
-dependencies = [
- "autocfg",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1980,19 +1971,6 @@ name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
-
-[[package]]
-name = "nix"
-version = "0.31.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
-dependencies = [
- "bitflags",
- "cfg-if",
- "cfg_aliases",
- "libc",
- "memoffset",
-]
 
 [[package]]
 name = "nom"
@@ -4066,16 +4044,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vsock"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba782755fc073877e567c2253c0be48e4aa9a254c232d36d3985dfae0bd5205"
-dependencies = [
- "libc",
- "nix",
-]
 
 [[package]]
 name = "walkdir"

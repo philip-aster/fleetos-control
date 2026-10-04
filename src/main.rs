@@ -588,6 +588,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             broadcast_hub.clone(),
             keyspaces.placements.clone(),
             keyspaces.dummy_ips.clone(),
+            keyspaces.sag_rules.clone(),
             versioned_state.clone(),
             config.trust_domains.data_control.clone(),
         );

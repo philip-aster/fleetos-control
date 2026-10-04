@@ -902,6 +902,9 @@ impl FjallStateMachine {
             }
             ChangeKind::SagUpdate | ChangeKind::RevokedDelegations => {
                 self.publish_sag_update(version);
+                // CORE-WI-5: SAG changes alter per-route source sets; republish
+                // routes so agents refresh `router_connected` dependencies.
+                self.publish_route_update(version);
             }
             ChangeKind::SecretRotation { target_spiffe_id } => {
                 self.broadcast_hub
@@ -924,8 +927,6 @@ impl FjallStateMachine {
                 self.publish_schedule_update(version);
                 self.publish_route_update(version);
             }
-            // ClusterMembership, TrustBundleRotation, DummyIpUpdate don't have
-            // dedicated watch streams in the current proto schema.
             _ => {}
         }
     }
@@ -965,6 +966,7 @@ impl FjallStateMachine {
         let routes_bytes = crate::watch::snapshot::build_routes_snapshot(
             &self.keyspaces.placements,
             &self.keyspaces.dummy_ips,
+            &self.keyspaces.sag_rules,
             &self.data_trust_domain,
         );
         self.broadcast_hub
