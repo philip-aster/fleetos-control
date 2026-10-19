@@ -510,6 +510,34 @@ impl FjallStateMachine {
                 batch.insert(&self.keyspaces.nodes, node_id.as_bytes(), value.as_slice());
                 Ok(ChangeKind::SchedulingUpdate)
             }
+            FleetosCommand::NodeHeartbeat {
+                node_id,
+                last_heartbeat,
+            } => {
+                // Read-modify-write: refresh last_heartbeat on the existing NodeRecord.
+                // The service layer rejects unknown/evicted nodes before proposing,
+                // but the state machine is defensive: no-op if the record is absent.
+                let record = match self
+                    .keyspaces
+                    .nodes
+                    .get(node_id.as_bytes())
+                    .map_err(read_err)?
+                {
+                    Some(bytes) => {
+                        let mut r: records::NodeRecord =
+                            postcard::from_bytes(&bytes).map_err(ser_err)?;
+                        r.last_heartbeat = *last_heartbeat;
+                        r
+                    }
+                    None => return Ok(ChangeKind::ClusterMembership), // defensive no-op
+                };
+                let value = postcard::to_allocvec(&record).map_err(ser_err)?;
+                batch.insert(&self.keyspaces.nodes, node_id.as_bytes(), value.as_slice());
+                // Heartbeat is a liveness refresh, not a scheduling/policy change.
+                // ClusterMembership falls through to `_ => {}` in publish_event,
+                // so no watch streams are republished.
+                Ok(ChangeKind::ClusterMembership)
+            }
             FleetosCommand::EvictNode {
                 node_id,
                 svid_expires_at_unix,
@@ -1029,6 +1057,7 @@ fn command_action(cmd: &FleetosCommand) -> &'static str {
         FleetosCommand::EvictNode { .. } => "EvictNode",
         FleetosCommand::PruneExpiredRevokedSvids { .. } => "PruneExpiredRevokedSvids",
         FleetosCommand::SetNodeSchedulable { .. } => "SetNodeSchedulable",
+        FleetosCommand::NodeHeartbeat { .. } => "NodeHeartbeat",
         FleetosCommand::IssueDelegation { .. } => "IssueDelegation",
         FleetosCommand::RevokeDelegation { .. } => "RevokeDelegation",
         FleetosCommand::UpsertSagRule { .. } => "UpsertSagRule",

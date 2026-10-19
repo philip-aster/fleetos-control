@@ -573,6 +573,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status_service = fleetos_control::watch::status_service::WorkloadStatusServiceImpl::new(
         raft_handle.raft.clone(),
         metrics_store,
+        keyspaces.nodes.clone(),
     );
     let watch_service =
         fleetos_control::watch::watch_service::WatchServiceImpl::new(broadcast_hub.clone());

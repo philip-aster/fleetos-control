@@ -108,6 +108,15 @@ pub enum FleetosCommand {
         node_id: String,
         schedulable: bool,
     },
+    /// Refresh a node's liveness heartbeat (CORE-WI-6 / Ruling I).
+    ///
+    /// The leader stamps `last_heartbeat` with its own receipt clock before
+    /// proposing — never the state machine, never the agent's `observed_at_unix`.
+    /// This keeps application deterministic across replicas.
+    NodeHeartbeat {
+        node_id: String,
+        last_heartbeat: i64,
+    },
     // --- Delegations (degraded mode) ---
     /// Upsert into active_delegations. Covers both issuance and refresh (a refresh
     /// is an upsert with recomputed issued_at / expires_at / refresh_at).
